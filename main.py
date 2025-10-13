@@ -1,81 +1,68 @@
 from flask import Flask, request, jsonify
-import alpaca_trade_api as tradeapi
 import os
+import alpaca_trade_api as tradeapi
 
 app = Flask(__name__)
 
-# ========================================
-# 🔑 Alpaca API Keys (from Railway environment variables)
-# ========================================
-ALPACA_API_KEY = os.getenv("ALPACA_API_KEY")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = "https://paper-api.alpaca.markets"  # Paper trading endpoint
+# === Alpaca environment variables ===
+API_KEY = os.getenv("APCA_API_KEY_ID")
+SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
-# Initialize API
-api = tradeapi.REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
+# === Initialize Alpaca client ===
+try:
+    api = tradeapi.REST(API_KEY, SECRET_KEY, BASE_URL, api_version='v2')
+    account = api.get_account()
+    print(f"✅ Connected to Alpaca account: {account.id}")
+except Exception as e:
+    print(f"⚠️ Error connecting to Alpaca: {e}")
 
+# === Home route (test page) ===
+@app.route('/', methods=['GET'])
+def home():
+    return "Webhook is running ✅"
 
-# ========================================
-# 🚀 Webhook Route
-# ========================================
+# === Webhook endpoint ===
 @app.route('/webhook', methods=['POST'])
 def webhook():
     try:
         data = request.get_json()
 
-        symbol = data.get('symbol', 'BTC/USD')     # default to BTC
-        action = data.get('action', '').lower()
-        qty = float(data.get('qty', 0.001))        # default 0.001 BTC
-        order_type = data.get('type', 'market')    # can be 'market' or 'limit'
-        limit_price = data.get('limit_price', None)
+        # Example: handle TradingView alerts
+        if data and 'side' in data and 'symbol' in data:
+            symbol = data['symbol']
+            side = data['side'].lower()
+            qty = float(data.get('qty', 0.001))  # default test quantity
 
-        print(f"🔔 Webhook received: {action.upper()} {symbol} qty={qty} type={order_type}")
+            if side == 'buy':
+                api.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side='buy',
+                    type='market',
+                    time_in_force='gtc'
+                )
+                return jsonify({'status': 'ok', 'message': f'Buy order placed for {qty} {symbol}'}), 200
 
-        if action not in ['buy', 'sell']:
-            return jsonify({"status": "error", "message": "Invalid action. Use 'buy' or 'sell'."}), 400
+            elif side == 'sell':
+                api.submit_order(
+                    symbol=symbol,
+                    qty=qty,
+                    side='sell',
+                    type='market',
+                    time_in_force='gtc'
+                )
+                return jsonify({'status': 'ok', 'message': f'Sell order placed for {qty} {symbol}'}), 200
 
-        # ========== Place Order ==========
-        if order_type == 'limit' and limit_price:
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=action,
-                type='limit',
-                time_in_force='day',
-                limit_price=float(limit_price),
-                extended_hours=True
-            )
-            print(f"✅ {action.upper()} LIMIT order placed for {symbol} at {limit_price}")
-            return jsonify({"status": "success", "message": f"{action.upper()} LIMIT order placed at {limit_price}"})
-
-        else:
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side=action,
-                type='market',
-                time_in_force='gtc',
-                extended_hours=True
-            )
-            print(f"✅ {action.upper()} MARKET order placed for {symbol} ({qty})")
-            return jsonify({"status": "success", "message": f"{action.upper()} MARKET order placed for {symbol} ({qty})"})
+        return jsonify({'status': 'ignored', 'message': 'Invalid or missing fields'}), 400
 
     except Exception as e:
-        print(f"❌ Error processing webhook: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        print(f"Webhook error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 
-# ========================================
-# 🏠 Root Route
-# ========================================
-@app.route('/')
-def home():
-    return "TradingView → Railway → Alpaca Webhook (extended hours enabled) ✅"
-
-
-# ========================================
-# 🧠 Main Entry Point
-# ========================================
+# === Run app ===
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+
 
