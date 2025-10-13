@@ -1,3 +1,4 @@
 flask
-alpaca-trade-api
 gunicorn
+alpaca-trade-api
+
