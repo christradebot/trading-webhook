@@ -6,58 +6,56 @@ app = Flask(__name__)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Webhook is running with Alpaca crypto test ✅"
+    return "Webhook is running ✅ Connected to Alpaca /v2"
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.get_json()
-    print("Received data:", data)
+    print("Received:", data)
 
     if not data:
-        return jsonify({"status": "error", "message": "No JSON data received"}), 400
+        return jsonify({"status": "error", "message": "No JSON payload"}), 400
 
     try:
-        # --- Use Alpaca's Crypto endpoint for 24/7 testing ---
-        api = tradeapi.REST(
-            os.environ.get("APCA_API_KEY_ID"),
-            os.environ.get("APCA_API_SECRET_KEY"),
-            "https://paper-api.alpaca.markets/v1beta1/crypto",
-            api_version="v2"
-        )
-
         side = data.get("side", "buy")
         symbol = data.get("symbol", "BTC/USD")
         order_type = data.get("type", "market")
         notional = float(data.get("notional", 1))
+        time_in_force = data.get("time_in_force", "gtc")
 
-        print(f"Submitting {side} order for {symbol} (notional: {notional})...")
+        base_url = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets/v2")
+
+        api = tradeapi.REST(
+            os.environ.get("APCA_API_KEY_ID"),
+            os.environ.get("APCA_API_SECRET_KEY"),
+            base_url,
+            api_version="v2"
+        )
 
         order = api.submit_order(
             symbol=symbol,
             side=side,
             type=order_type,
             notional=notional,
-            time_in_force="gtc"  # works for crypto
+            time_in_force=time_in_force
         )
 
-        print("Order submitted successfully:", order)
         return jsonify({
             "status": "success",
-            "message": "✅ Alpaca crypto order test successful!",
-            "symbol": symbol,
-            "side": side,
+            "message": f"✅ {symbol} order sent successfully!",
             "order_id": order.id
         }), 200
 
     except Exception as e:
-        print("Error submitting order:", e)
+        print("Error:", e)
         return jsonify({
             "status": "error",
-            "message": f"❌ Alpaca crypto order test failed: {str(e)}"
+            "message": f"❌ Alpaca order test failed: {str(e)}"
         }), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 
