@@ -4,48 +4,62 @@ import alpaca_trade_api as tradeapi
 
 app = Flask(__name__)
 
-@app.route('/', methods=['GET'])
+@app.route("/", methods=["GET"])
 def home():
     return "Webhook is running with Alpaca test ✅"
 
-@app.route('/order', methods=['POST'])
-def create_order():
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    data = request.get_json()
+    print("Received data:", data)
+
+    # Validate data
+    if not data:
+        return jsonify({"status": "error", "message": "No JSON data received"}), 400
+
     try:
-        data = request.get_json()
+        # Initialize Alpaca client
+        api = tradeapi.REST(
+            os.environ.get("APCA_API_KEY_ID"),
+            os.environ.get("APCA_API_SECRET_KEY"),
+            os.environ.get("APCA_API_BASE_URL"),
+            api_version="v2"
+        )
+
         side = data.get("side", "buy")
         symbol = data.get("symbol", "BTC/USD")
-        type_ = data.get("type", "market")
-        notional = data.get("notional", 2)
+        order_type = data.get("type", "market")
+        notional = data.get("notional", 1)
 
-        # Load Alpaca credentials from Railway environment
-        key_id = os.getenv("APCA_API_KEY_ID")
-        secret_key = os.getenv("APCA_API_SECRET_KEY")
-        base_url = os.getenv("APCA_API_BASE_URL")
+        print(f"Submitting {side} order for {symbol} ({notional})...")
 
-        if not key_id or not secret_key or not base_url:
-            raise ValueError("Missing Alpaca environment variables")
-
-        api = tradeapi.REST(key_id, secret_key, base_url, api_version='v2')
-
+        # Submit order to Alpaca
         order = api.submit_order(
             symbol=symbol,
             side=side,
-            type=type_,
+            type=order_type,
             notional=notional
         )
 
+        print("Order submitted successfully:", order)
         return jsonify({
-            "status": "ok",
-            "message": "Order sent to Alpaca ✅",
-            "alpaca_response": order._raw
+            "status": "success",
+            "message": "✅ Alpaca order test successful!",
+            "symbol": symbol,
+            "side": side,
+            "order_id": order.id
         }), 200
 
     except Exception as e:
-        print(f"Error: {e}")
-        return jsonify({"status": "error", "message": str(e)}), 400
+        print("Error submitting order:", e)
+        return jsonify({
+            "status": "error",
+            "message": f"❌ Alpaca order test failed: {str(e)}"
+        }), 500
 
 if __name__ == "__main__":
-    app.run(host='0.0.0.0', port=5000)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 
