@@ -23,7 +23,8 @@ def webhook():
         notional = float(data.get("notional", 1))
         time_in_force = data.get("time_in_force", "gtc")
 
-        base_url = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets/v2")
+        # Use your base API URL (no /v2 here!)
+        base_url = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
         api = tradeapi.REST(
             os.environ.get("APCA_API_KEY_ID"),
@@ -31,6 +32,8 @@ def webhook():
             base_url,
             api_version="v2"
         )
+
+        print(f"Placing {side.upper()} order for {symbol} at {base_url}/v2/orders")
 
         order = api.submit_order(
             symbol=symbol,
