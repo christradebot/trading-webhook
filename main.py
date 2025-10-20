@@ -1,171 +1,172 @@
-# === main.py (with 20 EMA proximity filter) ===
-# © Chris / Athena 2025
+# © Chris / Athena
+# main.py — TradingView → Alpaca Webhook Bridge (EMA20 Logic + Synthetic Stops)
 
 from flask import Flask, request, jsonify
-from alpaca_trade_api.rest import REST, APIError
-import os, json, time
+from alpaca_trade_api.rest import REST, TimeFrame
+import os, json, math, datetime, time
 
 app = Flask(__name__)
 
-#────────────────────────────────────────────
-# Environment Config
-#────────────────────────────────────────────
+#──────────────────────────────
+# Environment Variables
+#──────────────────────────────
 ALPACA_KEY_ID     = os.environ.get("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "chrisbot1501")
+WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "mysecret")
 
-api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
+api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
 
-#────────────────────────────────────────────
-# Parameters
-#────────────────────────────────────────────
-LIMIT_ONLY_MODE   = True
-PRICE_TICK_BUFFER = 0.003
-HARD_STOP_PCT     = 0.05
-TRAIL_TP_PCT      = 0.10
-EMA_PROXIMITY_PCT = 0.03      # within 3% of 20 EMA
+#──────────────────────────────
+# Helpers
+#──────────────────────────────
+def round_price(symbol, price):
+    """Round price to valid increments for Alpaca (avoids sub-penny errors)."""
+    if price < 1:
+        return round(price, 4)
+    elif price < 10:
+        return round(price, 3)
+    else:
+        return round(price, 2)
 
-#────────────────────────────────────────────
-def log(msg): print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+def percent_diff(a, b):
+    """Calculate percentage difference between two prices."""
+    return abs((a - b) / b) * 100
 
-def get_nbbo(symbol):
-    try:
-        q = api.get_latest_quote(symbol)
-        return float(q.bid_price or 0), float(q.ask_price or 0)
-    except Exception as e:
-        log(f"❌ NBBO error {symbol}: {e}")
-        return 0, 0
+#──────────────────────────────
+# Flask Routes
+#──────────────────────────────
+@app.get("/ping")
+def ping():
+    return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
 
-def get_live_price(symbol):
-    try:
-        t = api.get_latest_trade(symbol)
-        return float(t.price or 0)
-    except Exception as e:
-        log(f"❌ Price error {symbol}: {e}")
-        return 0
-
-def cancel_open_orders(symbol):
-    try:
-        for o in api.list_orders(status="open"):
-            if o.symbol == symbol:
-                api.cancel_order(o.id)
-                log(f"🧹 Cancelled open {symbol}")
-    except Exception as e:
-        log(f"❌ Cancel error {symbol}: {e}")
-
-#────────────────────────────────────────────
-# Buy / Sell
-#────────────────────────────────────────────
-def submit_buy_limit(symbol, qty, ref_price):
-    cancel_open_orders(symbol)
-    bid, ask = get_nbbo(symbol)
-    base = ref_price or ask or bid
-    if base <= 0:
-        log(f"⚠️ Invalid base price for {symbol}")
-        return
-    limit_price = round(base * (1 + PRICE_TICK_BUFFER), 4)
-    try:
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side="buy",
-            type="limit",
-            time_in_force="day",
-            limit_price=str(limit_price),
-            extended_hours=True
-        )
-        log(f"🟢 BUY {symbol} limit @{limit_price}")
-    except Exception as e:
-        log(f"❌ BUY submit error {symbol}: {e}")
-
-def submit_sell_limit(symbol, qty, ref_price):
-    cancel_open_orders(symbol)
-    bid, ask = get_nbbo(symbol)
-    base = bid or ref_price
-    if base <= 0:
-        log(f"⚠️ Invalid base price for {symbol}")
-        return
-    limit_price = round(base * (1 - PRICE_TICK_BUFFER), 4)
-    try:
-        api.submit_order(
-            symbol=symbol,
-            qty=qty,
-            side="sell",
-            type="limit",
-            time_in_force="day",
-            limit_price=str(limit_price),
-            extended_hours=True
-        )
-        log(f"🛑 SELL {symbol} limit @{limit_price}")
-    except Exception as e:
-        log(f"❌ SELL submit error {symbol}: {e}")
-
-#────────────────────────────────────────────
-# Synthetic Monitor
-#────────────────────────────────────────────
-def monitor_position(symbol, entry_price, qty):
-    peak = entry_price
-    while True:
-        time.sleep(2)
-        current = get_live_price(symbol)
-        if not current: continue
-        peak = max(peak, current)
-        drawdown = (peak - current) / peak
-        loss = (entry_price - current) / entry_price
-        if drawdown >= TRAIL_TP_PCT:
-            log(f"💰 TP hit {symbol} ({drawdown*100:.1f}%)")
-            submit_sell_limit(symbol, qty, current)
-            break
-        if loss >= HARD_STOP_PCT:
-            log(f"🛑 STOP hit {symbol} ({loss*100:.1f}%)")
-            submit_sell_limit(symbol, qty, current)
-            break
-
-#────────────────────────────────────────────
-# Webhook Endpoint
-#────────────────────────────────────────────
 @app.post("/tv")
 def tv():
     data = request.get_json(silent=True) or {}
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify(error="Invalid secret"), 403
 
-    event  = data.get("event", "").upper()
-    symbol = data.get("ticker", "")
-    qty    = float(data.get("qty", 100))
+    print("🚀 TradingView Alert:", json.dumps(data, indent=2))
+    action = data.get("action", "").upper()
+    symbol = data.get("ticker", "").upper()
     price  = float(data.get("price", 0))
-    ema20  = float(data.get("ema20", 0))  # now read from alert JSON
 
-    log(f"🚀 TradingView Alert: {event} {symbol} price={price} ema20={ema20}")
+    # safely parse ema20 — handles strings like '{{plot("EMA 20")}}'
+    try:
+        ema20 = float(data.get("ema20", 0))
+    except (ValueError, TypeError):
+        ema20 = 0.0
 
-    # ───── 20 EMA proximity check for BUYs ─────
-    if event == "BUY":
-        if ema20 > 0:
-            dist = abs(price - ema20) / ema20
-            if dist > EMA_PROXIMITY_PCT:
-                log(f"⚠️ Skipping BUY {symbol}: too far from EMA20 ({dist*100:.2f}%)")
-                return jsonify({"skipped": True}), 200
-        submit_buy_limit(symbol, qty, price)
-        monitor_position(symbol, price, qty)
+    #──────────────────────────────
+    # EMA Proximity Filter (max 3%)
+    #──────────────────────────────
+    if ema20 > 0:
+        dist = percent_diff(price, ema20)
+        if dist > 3:
+            print(f"⛔ Skipping {symbol}: {dist:.2f}% away from EMA20 ({ema20})")
+            return jsonify(ignored=True, reason="too far from EMA20")
 
-    elif event in ["SELL", "EXIT"]:
-        submit_sell_limit(symbol, qty, price)
+    qty = 100  # test quantity — adjust later if needed
+    tp_mult = 1.10  # 10% trailing take profit
+    sl_mult = 0.95  # 5% stop loss
 
-    else:
-        log(f"⚠️ Unknown event: {event}")
+    try:
+        #──────────────────────────────
+        # BUY ENTRY LOGIC
+        #──────────────────────────────
+        if action == "BUY":
+            limit_price = round_price(symbol, price)
+            print(f"📈 BUY {symbol} @ {limit_price}")
 
-    return jsonify(status="ok"), 200
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="buy",
+                type="limit",
+                limit_price=limit_price,
+                time_in_force="day",
+                extended_hours=True  # ✅ allows premarket execution
+            )
 
-#────────────────────────────────────────────
-@app.get("/ping")
-def ping():
-    return jsonify(ok=True, ema_check=EMA_PROXIMITY_PCT)
+            # Synthetic TP & SL (trailing style)
+            tp_price = round_price(symbol, price * tp_mult)
+            sl_price = round_price(symbol, price * sl_mult)
 
-#────────────────────────────────────────────
+            print(f"💰 Synthetic TP: {tp_price} | 🛑 Stop: {sl_price}")
+            monitor_trade(symbol, price, tp_price, sl_price)
+
+        #──────────────────────────────
+        # EXIT / TAKE PROFIT
+        #──────────────────────────────
+        elif action in ["EXIT", "SELL", "TP"]:
+            print(f"🔻 EXIT signal for {symbol}")
+            close_position(symbol)
+
+        else:
+            print("⚠️ Unknown action in alert.")
+            return jsonify(ok=False, reason="unknown action")
+
+    except Exception as e:
+        print(f"❌ ERROR processing {symbol}: {e}")
+        return jsonify(error=str(e)), 500
+
+    return jsonify(ok=True)
+
+#──────────────────────────────
+# Synthetic Exit Management
+#──────────────────────────────
+def monitor_trade(symbol, entry_price, tp_price, sl_price):
+    """
+    Lightweight synthetic monitor (pre-market safe)
+    Checks every few seconds and executes exits manually.
+    """
+    print(f"🕒 Monitoring {symbol}... (synthetic TP/SL active)")
+
+    for _ in range(60):  # up to ~5 min loop
+        try:
+            barset = api.get_bars(symbol, TimeFrame.Minute, limit=1)
+            if not barset:
+                time.sleep(5)
+                continue
+
+            current_price = float(barset[-1].c)
+            if current_price >= tp_price:
+                print(f"✅ TP hit {symbol} ({current_price})")
+                close_position(symbol)
+                return
+            elif current_price <= sl_price:
+                print(f"🛑 Stop hit {symbol} ({current_price})")
+                close_position(symbol)
+                return
+        except Exception as e:
+            print(f"⚠️ Monitor error: {e}")
+
+        time.sleep(5)
+
+def close_position(symbol):
+    """Safely closes any open position."""
+    try:
+        pos = api.get_position(symbol)
+        if pos and float(pos.qty) > 0:
+            qty = abs(float(pos.qty))
+            print(f"💥 Closing {symbol}, {qty} shares")
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side="sell",
+                type="market",
+                time_in_force="day",
+                extended_hours=True
+            )
+    except Exception as e:
+        print(f"⚠️ Close error: {e}")
+
+#──────────────────────────────
+# Run Server
+#──────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=8080)
+
 
 
 
