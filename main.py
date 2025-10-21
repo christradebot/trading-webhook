@@ -1,44 +1,212 @@
-# © Chris / Athena
-# main.py — TradingView → Alpaca Webhook Bridge (EMA20 Logic + Synthetic Stops)
+# === main.py ===
+# © Chris / Athena 2025
+# HMA-only execution bot: limit-only entries/exits around HMA with ±2% buffer
 
 from flask import Flask, request, jsonify
-from alpaca_trade_api.rest import REST, TimeFrame
-import os, json, math, datetime, time
+from alpaca_trade_api.rest import REST, TimeFrame, APIError
+import os, json, time, math
+from statistics import fmean
 
 app = Flask(__name__)
 
-#──────────────────────────────
-# Environment Variables
-#──────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
+# ENV / API
+# ──────────────────────────────────────────────────────────────────────────────
 ALPACA_KEY_ID     = os.environ.get("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "mysecret")
+WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "chrisbot1501")
 
-api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
+api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
 
-#──────────────────────────────
-# Helpers
-#──────────────────────────────
-def round_price(symbol, price):
-    """Round price to valid increments for Alpaca (avoids sub-penny errors)."""
-    if price < 1:
-        return round(price, 4)
-    elif price < 10:
-        return round(price, 3)
-    else:
-        return round(price, 2)
+# ──────────────────────────────────────────────────────────────────────────────
+# PARAMETERS
+# ──────────────────────────────────────────────────────────────────────────────
+HMA_LEN              = 14
+ENTRY_BUFFER_PCT     = float(os.environ.get("ENTRY_BUFFER_PCT", "0.02"))  # 2%
+EXIT_BUFFER_PCT      = float(os.environ.get("EXIT_BUFFER_PCT",  "0.02"))  # 2%
+CHASE_REPRICES       = int(os.environ.get("CHASE_REPRICES", "8"))         # short chase to avoid worker timeouts
+CHASE_SLEEP_SEC      = float(os.environ.get("CHASE_SLEEP_SEC", "1.5"))
+AGG_EXIT_EXTRA_PCT   = float(os.environ.get("AGG_EXIT_EXTRA_PCT", "0.01"))# extra 1% under bid for aggressive exit
+LOG_PREFIX           = "[HMA]"
 
-def percent_diff(a, b):
-    """Calculate percentage difference between two prices."""
-    return abs((a - b) / b) * 100
+# ──────────────────────────────────────────────────────────────────────────────
+# UTILITIES
+# ──────────────────────────────────────────────────────────────────────────────
+def log(msg): print(f"{LOG_PREFIX} {time.strftime('%H:%M:%S')}  {msg}", flush=True)
 
-#──────────────────────────────
-# Flask Routes
-#──────────────────────────────
+def round_price(p: float) -> float:
+    if p < 1:   return round(p, 4)
+    if p < 10:  return round(p, 3)
+    return round(p, 2)
+
+def get_nbbo(symbol):
+    try:
+        q = api.get_latest_quote(symbol)
+        bid = float(q.bid_price) if q and q.bid_price else None
+        ask = float(q.ask_price) if q and q.ask_price else None
+        return bid, ask
+    except Exception as e:
+        log(f"NBBO error {symbol}: {e}")
+        return None, None
+
+def get_last(symbol):
+    try:
+        t = api.get_latest_trade(symbol)
+        return float(t.price) if t and t.price else None
+    except Exception as e:
+        log(f"Last trade error {symbol}: {e}")
+        return None
+
+# HMA calculation: HMA(n) = WMA( 2*WMA(price, n/2) - WMA(price, n), sqrt(n) )
+def wma(values, length):
+    if length <= 0 or len(values) < length: return None
+    weights = list(range(1, length+1))
+    window  = values[-length:]
+    return sum(v*w for v, w in zip(window, weights)) / sum(weights)
+
+def hull_ma(prices, n):
+    if len(prices) < n: return None
+    n2  = int(max(1, n/2))
+    nsq = int(max(1, round(math.sqrt(n))))
+    wma_n   = wma(prices, n)
+    wma_n2  = wma(prices, n2)
+    if wma_n is None or wma_n2 is None: return None
+    series  = [2*wma_n2 - wma_n]
+    # For simplicity we just use the latest value to compute final WMA:
+    return wma(prices + [series[-1]], nsq) or series[-1]
+
+def get_hma_live(symbol, bars=120):
+    # minute bars; increase if you want more stability
+    try:
+        bars_list = api.get_bars(symbol, TimeFrame.Minute, limit=bars)
+        closes = [float(b.c) for b in bars_list] if bars_list else []
+        h = hull_ma(closes, HMA_LEN) if closes else None
+        return h
+    except Exception as e:
+        log(f"HMA fetch error {symbol}: {e}")
+        return None
+
+def cancel_open_orders(symbol):
+    try:
+        for o in api.list_orders(status="open"):
+            if o.symbol == symbol:
+                api.cancel_order(o.id)
+                log(f"🧹 Cancelled open order: {symbol}")
+    except Exception as e:
+        log(f"Cancel error {symbol}: {e}")
+
+def get_position_qty(symbol) -> float:
+    try:
+        pos = api.get_position(symbol)
+        return float(pos.qty)
+    except APIError:
+        return 0.0
+    except Exception as e:
+        log(f"Position error {symbol}: {e}")
+        return 0.0
+
+# ──────────────────────────────────────────────────────────────────────────────
+# CORE: LIMIT-ONLY ENTRIES & EXITS AROUND HMA
+# ──────────────────────────────────────────────────────────────────────────────
+def place_buy_near_hma(symbol, qty, hma_hint=None):
+    """
+    LIMIT buy at ~HMA*(1+ENTRY_BUFFER_PCT).
+    Short, safe chase (few reprices) to avoid worker timeouts.
+    """
+    cancel_open_orders(symbol)
+    for i in range(CHASE_REPRICES):
+        hma_live = get_hma_live(symbol) or hma_hint
+        bid, ask = get_nbbo(symbol)
+        last     = get_last(symbol)
+        if not hma_live or not (bid or ask or last):
+            time.sleep(CHASE_SLEEP_SEC)
+            continue
+
+        # Target buy limit slightly above HMA to favor a fill when price revisits HMA
+        limit = hma_live * (1.0 + ENTRY_BUFFER_PCT)
+        # To avoid overpaying massively if ask is much lower:
+        if ask: limit = max(limit, ask)  # ensures immediate execution if HMA <= ask
+        limit = round_price(limit)
+
+        try:
+            api.submit_order(
+                symbol=symbol, qty=qty, side="buy",
+                type="limit", limit_price=str(limit),
+                time_in_force="day", extended_hours=True
+            )
+            log(f"🟢 BUY {symbol} LMT @{limit}  (HMA={round_price(hma_live)})")
+        except Exception as e:
+            log(f"BUY submit error {symbol}: {e}")
+            break
+
+        # Check fill quickly; if not, cancel & reprice
+        time.sleep(CHASE_SLEEP_SEC)
+        if get_position_qty(symbol) > 0:
+            log(f"✅ Filled BUY {symbol}")
+            return True
+        cancel_open_orders(symbol)
+
+    log(f"⚠️ BUY chase ended {symbol} (no fill).")
+    return False
+
+def place_sell_near_hma(symbol, qty_hint=None, hma_hint=None, aggressive=False):
+    """
+    LIMIT sell at ~HMA*(1-EXIT_BUFFER_PCT).
+    If aggressive=True, push under bid a bit and reprice quickly to force an exit.
+    """
+    qty = qty_hint or get_position_qty(symbol)
+    if qty <= 0:
+        log(f"ℹ️ No position to close for {symbol}")
+        return True
+
+    cancel_open_orders(symbol)
+    for i in range(CHASE_REPRICES if aggressive else max(3, CHASE_REPRICES//2)):
+        hma_live = get_hma_live(symbol) or hma_hint
+        bid, ask = get_nbbo(symbol)
+        last     = get_last(symbol)
+        if not (bid or ask or last):
+            time.sleep(CHASE_SLEEP_SEC/2)
+            continue
+
+        if hma_live:
+            limit = hma_live * (1.0 - EXIT_BUFFER_PCT)
+        else:
+            # fallback to bid for safety
+            limit = (bid or last or 0) * (1.0 - (EXIT_BUFFER_PCT/2))
+
+        if aggressive and bid:
+            # push below bid a bit to speed the fill
+            limit = min(limit, bid * (1.0 - AGG_EXIT_EXTRA_PCT))
+
+        limit = round_price(limit)
+
+        try:
+            api.submit_order(
+                symbol=symbol, qty=qty, side="sell",
+                type="limit", limit_price=str(limit),
+                time_in_force="day", extended_hours=True
+            )
+            log(f"🛑 SELL {symbol} LMT @{limit}  (HMA={round_price(hma_live) if hma_live else 'n/a'})")
+        except Exception as e:
+            log(f"SELL submit error {symbol}: {e}")
+            break
+
+        time.sleep(CHASE_SLEEP_SEC)
+        if get_position_qty(symbol) <= 0:
+            log(f"✅ Position exited {symbol}")
+            return True
+        cancel_open_orders(symbol)
+
+    log(f"⚠️ SELL chase ended {symbol} (may still be holding).")
+    return False
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ──────────────────────────────────────────────────────────────────────────────
 @app.get("/ping")
 def ping():
-    return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
+    return jsonify(ok=True, mode="HMA-only", entry_buffer=ENTRY_BUFFER_PCT, exit_buffer=EXIT_BUFFER_PCT)
 
 @app.post("/tv")
 def tv():
@@ -46,126 +214,53 @@ def tv():
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify(error="Invalid secret"), 403
 
-    print("🚀 TradingView Alert:", json.dumps(data, indent=2))
-    action = data.get("action", "").upper()
-    symbol = data.get("ticker", "").upper()
-    price  = float(data.get("price", 0))
+    log(f"🚀 TradingView Alert:\n{json.dumps(data, indent=2)}")
 
-    # safely parse ema20 — handles strings like '{{plot("EMA 20")}}'
+    action  = (data.get("action") or data.get("event") or "").upper()
+    symbol  = (data.get("ticker") or "").upper()
+    qty     = float(data.get("quantity", 100))
+    # optional HMA from alert (preferred if you want exact chart TF)
     try:
-        ema20 = float(data.get("ema20", 0))
-    except (ValueError, TypeError):
-        ema20 = 0.0
+        hma_hint = float(data.get("hma", 0.0))
+    except (TypeError, ValueError):
+        hma_hint = 0.0
 
-    #──────────────────────────────
-    # EMA Proximity Filter (max 3%)
-    #──────────────────────────────
-    if ema20 > 0:
-        dist = percent_diff(price, ema20)
-        if dist > 3:
-            print(f"⛔ Skipping {symbol}: {dist:.2f}% away from EMA20 ({ema20})")
-            return jsonify(ignored=True, reason="too far from EMA20")
-
-    qty = 100  # test quantity — adjust later if needed
-    tp_mult = 1.10  # 10% trailing take profit
-    sl_mult = 0.95  # 5% stop loss
+    if not symbol or not action:
+        return jsonify(ok=False, reason="missing symbol/action"), 400
 
     try:
-        #──────────────────────────────
-        # BUY ENTRY LOGIC
-        #──────────────────────────────
         if action == "BUY":
-            limit_price = round_price(symbol, price)
-            print(f"📈 BUY {symbol} @ {limit_price}")
+            # avoid duplicate buys
+            if get_position_qty(symbol) > 0:
+                log(f"🔁 Already long {symbol}, skipping BUY.")
+                return jsonify(ok=True, skipped=True)
 
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side="buy",
-                type="limit",
-                limit_price=limit_price,
-                time_in_force="day",
-                extended_hours=True  # ✅ allows premarket execution
-            )
+            filled = place_buy_near_hma(symbol, qty, hma_hint=hma_hint if hma_hint > 0 else None)
+            return jsonify(ok=filled)
 
-            # Synthetic TP & SL (trailing style)
-            tp_price = round_price(symbol, price * tp_mult)
-            sl_price = round_price(symbol, price * sl_mult)
+        elif action in ("EXIT", "SELL", "TP"):
+            # standard exit near HMA
+            exited = place_sell_near_hma(symbol, qty_hint=None, hma_hint=hma_hint if hma_hint > 0 else None, aggressive=False)
+            return jsonify(ok=exited)
 
-            print(f"💰 Synthetic TP: {tp_price} | 🛑 Stop: {sl_price}")
-            monitor_trade(symbol, price, tp_price, sl_price)
-
-        #──────────────────────────────
-        # EXIT / TAKE PROFIT
-        #──────────────────────────────
-        elif action in ["EXIT", "SELL", "TP"]:
-            print(f"🔻 EXIT signal for {symbol}")
-            close_position(symbol)
+        elif action in ("PANIC", "AGGRESSIVE_EXIT"):
+            # aggressive emergency exit: deeper limit under bid, quick reprice loop
+            exited = place_sell_near_hma(symbol, qty_hint=None, hma_hint=None, aggressive=True)
+            return jsonify(ok=exited)
 
         else:
-            print("⚠️ Unknown action in alert.")
+            log(f"⚠️ Unknown action: {action}")
             return jsonify(ok=False, reason="unknown action")
 
     except Exception as e:
-        print(f"❌ ERROR processing {symbol}: {e}")
+        log(f"❌ Handler error {symbol}: {e}")
         return jsonify(error=str(e)), 500
 
-    return jsonify(ok=True)
-
-#──────────────────────────────
-# Synthetic Exit Management
-#──────────────────────────────
-def monitor_trade(symbol, entry_price, tp_price, sl_price):
-    """
-    Lightweight synthetic monitor (pre-market safe)
-    Checks every few seconds and executes exits manually.
-    """
-    print(f"🕒 Monitoring {symbol}... (synthetic TP/SL active)")
-
-    for _ in range(60):  # up to ~5 min loop
-        try:
-            barset = api.get_bars(symbol, TimeFrame.Minute, limit=1)
-            if not barset:
-                time.sleep(5)
-                continue
-
-            current_price = float(barset[-1].c)
-            if current_price >= tp_price:
-                print(f"✅ TP hit {symbol} ({current_price})")
-                close_position(symbol)
-                return
-            elif current_price <= sl_price:
-                print(f"🛑 Stop hit {symbol} ({current_price})")
-                close_position(symbol)
-                return
-        except Exception as e:
-            print(f"⚠️ Monitor error: {e}")
-
-        time.sleep(5)
-
-def close_position(symbol):
-    """Safely closes any open position."""
-    try:
-        pos = api.get_position(symbol)
-        if pos and float(pos.qty) > 0:
-            qty = abs(float(pos.qty))
-            print(f"💥 Closing {symbol}, {qty} shares")
-            api.submit_order(
-                symbol=symbol,
-                qty=qty,
-                side="sell",
-                type="market",
-                time_in_force="day",
-                extended_hours=True
-            )
-    except Exception as e:
-        print(f"⚠️ Close error: {e}")
-
-#──────────────────────────────
-# Run Server
-#──────────────────────────────
+# ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
+
 
 
 
