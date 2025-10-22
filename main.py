@@ -1,223 +1,271 @@
-# === main.py ===
-# © Chris / Athena 2025
-# HMA + MaMA Execution Bot — with Add-25-Share Scaling Logic
+# main.py
+# VWAP + MaMA Entry/Exit Bot for Alpaca + TradingView Webhooks
+# Spec:
+# - Long only. Entries at VWAP, upper VWAP band, or MaMA.
+# - Add 25 shares on new signals while in position.
+# - Exits only after EXIT_SIGNAL alert.
+# - All orders are LIMIT. Market exits allowed only during RTH.
+# - Hard stop = -10%. Exit always enforced.
 
+import os, json, time, math, datetime
+from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
-from alpaca_trade_api.rest import REST, TimeFrame, APIError
-import os, json, time, math
-
-app = Flask(__name__)
+from alpaca_trade_api.rest import REST
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ENV / API
+# Config / Environment
 # ──────────────────────────────────────────────────────────────────────────────
 ALPACA_KEY_ID     = os.environ.get("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "chrisbot1501")
 
-api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
+NY = ZoneInfo("America/New_York")
+CHECK_INTERVAL_SEC = 20
+EXIT_TIMEOUT_SEC   = 10 * 60
+ENTRY_BUFFER_PCT   = 0.03     # ±3% tolerance to consider alternate level
+HARD_STOP_PCT      = 0.10
+ADDON_QTY          = 25
+BASE_QTY           = 100
+
+app = Flask(__name__)
+api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PARAMETERS
+# Utility helpers
 # ──────────────────────────────────────────────────────────────────────────────
-HMA_LEN              = 14
-ENTRY_BUFFER_PCT     = float(os.environ.get("ENTRY_BUFFER_PCT", "0.02"))  # 2%
-EXIT_BUFFER_PCT      = float(os.environ.get("EXIT_BUFFER_PCT",  "0.02"))  # 2%
-CHASE_REPRICES       = int(os.environ.get("CHASE_REPRICES", "8"))
-CHASE_SLEEP_SEC      = float(os.environ.get("CHASE_SLEEP_SEC", "1.5"))
-AGG_EXIT_EXTRA_PCT   = float(os.environ.get("AGG_EXIT_EXTRA_PCT", "0.01"))
-ADD_SHARES_QTY       = int(os.environ.get("ADD_SHARES_QTY", "25"))
-LOG_PREFIX           = "[HMA]"
+def now_str():
+    return datetime.datetime.now(NY).strftime("%H:%M:%S")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# UTILITIES
-# ──────────────────────────────────────────────────────────────────────────────
-def log(msg): print(f"{LOG_PREFIX} {time.strftime('%H:%M:%S')}  {msg}", flush=True)
+def log(msg):
+    print(f"[{now_str()}] {msg}", flush=True)
 
-def round_price(p: float) -> float:
-    if p < 1:   return round(p, 4)
-    if p < 10:  return round(p, 3)
-    return round(p, 2)
+def is_rth(dt=None):
+    dt = dt or datetime.datetime.now(NY)
+    hhmm = dt.hour * 60 + dt.minute
+    return 9*60+30 <= hhmm < 16*60
 
-def get_nbbo(symbol):
+def round_to_tick(p):
+    t = 0.01 if p >= 1.0 else 0.0001
+    return math.floor(p / t) * t
+
+def get_last_trade(symbol):
     try:
-        q = api.get_latest_quote(symbol)
-        bid = float(q.bid_price) if q and q.bid_price else None
-        ask = float(q.ask_price) if q and q.ask_price else None
-        return bid, ask
-    except Exception as e:
-        log(f"NBBO error {symbol}: {e}")
-        return None, None
-
-def get_last(symbol):
-    try:
-        t = api.get_latest_trade(symbol)
-        return float(t.price) if t and t.price else None
-    except Exception as e:
-        log(f"Last trade error {symbol}: {e}")
+        return float(api.get_latest_trade(symbol).price)
+    except Exception:
         return None
 
-def get_position_qty(symbol) -> float:
+def get_best_bid(symbol):
+    try:
+        q = api.get_latest_quote(symbol)
+        return float(q.bid_price)
+    except Exception:
+        return None
+
+def get_position(symbol):
     try:
         pos = api.get_position(symbol)
-        return float(pos.qty)
-    except APIError:
-        return 0.0
-    except Exception as e:
-        log(f"Position error {symbol}: {e}")
-        return 0.0
+        return float(pos.qty), float(pos.avg_entry_price)
+    except Exception:
+        return 0.0, 0.0
 
 def cancel_open_orders(symbol):
     try:
         for o in api.list_orders(status="open"):
             if o.symbol == symbol:
                 api.cancel_order(o.id)
-                log(f"🧹 Cancelled open order: {symbol}")
+        log(f"🧹 Cancelled open orders for {symbol}")
     except Exception as e:
-        log(f"Cancel error {symbol}: {e}")
+        log(f"⚠️ Cancel error {symbol}: {e}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# CORE ORDER LOGIC
-# ──────────────────────────────────────────────────────────────────────────────
-def place_buy_near_ma(symbol, qty, hma_hint=None):
-    cancel_open_orders(symbol)
-    for i in range(CHASE_REPRICES):
-        bid, ask = get_nbbo(symbol)
-        last = get_last(symbol)
-        hma_live = hma_hint or last
-        if not (bid or ask or last):
-            time.sleep(CHASE_SLEEP_SEC)
-            continue
-
-        limit = hma_live * (1.0 + ENTRY_BUFFER_PCT)
-        if ask:
-            limit = max(limit, ask)
-        limit = round_price(limit)
-
-        try:
-            api.submit_order(
-                symbol=symbol, qty=qty, side="buy",
-                type="limit", limit_price=str(limit),
-                time_in_force="day", extended_hours=True
-            )
-            log(f"🟢 BUY {symbol} LMT @{limit}  (HMA≈{round_price(hma_live)})")
-        except Exception as e:
-            log(f"BUY submit error {symbol}: {e}")
-            break
-
-        time.sleep(CHASE_SLEEP_SEC)
-        if get_position_qty(symbol) >= qty:
-            log(f"✅ Filled BUY {symbol}")
-            return True
-        cancel_open_orders(symbol)
-
-    log(f"⚠️ BUY chase ended {symbol} (no fill).")
-    return False
-
-
-def place_sell_near_ma(symbol, qty_hint=None, hma_hint=None, aggressive=False):
-    qty = qty_hint or get_position_qty(symbol)
-    if qty <= 0:
-        log(f"ℹ️ No position to close for {symbol}")
-        return True
-
-    cancel_open_orders(symbol)
-    for i in range(CHASE_REPRICES if aggressive else max(3, CHASE_REPRICES // 2)):
-        bid, ask = get_nbbo(symbol)
-        last = get_last(symbol)
-        hma_live = hma_hint or last
-        if not (bid or ask or last):
-            time.sleep(CHASE_SLEEP_SEC / 2)
-            continue
-
-        limit = hma_live * (1.0 - EXIT_BUFFER_PCT)
-        if aggressive and bid:
-            limit = min(limit, bid * (1.0 - AGG_EXIT_EXTRA_PCT))
-        limit = round_price(limit)
-
-        try:
-            api.submit_order(
-                symbol=symbol, qty=qty, side="sell",
-                type="limit", limit_price=str(limit),
-                time_in_force="day", extended_hours=True
-            )
-            log(f"🛑 SELL {symbol} LMT @{limit}  (HMA≈{round_price(hma_live)})")
-        except Exception as e:
-            log(f"SELL submit error {symbol}: {e}")
-            break
-
-        time.sleep(CHASE_SLEEP_SEC)
-        if get_position_qty(symbol) <= 0:
-            log(f"✅ Position exited {symbol}")
-            return True
-        cancel_open_orders(symbol)
-
-    log(f"⚠️ SELL chase ended {symbol} (may still be holding).")
-    return False
-
-# ──────────────────────────────────────────────────────────────────────────────
-# ROUTES
-# ──────────────────────────────────────────────────────────────────────────────
-@app.get("/ping")
-def ping():
-    return jsonify(ok=True, mode="HMA+MaMA", add_shares=ADD_SHARES_QTY)
-
-@app.post("/tv")
-def tv():
-    data = request.get_json(silent=True) or {}
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify(error="Invalid secret"), 403
-
-    log(f"🚀 TradingView Alert:\n{json.dumps(data, indent=2)}")
-
-    action  = (data.get("action") or data.get("event") or "").upper()
-    symbol  = (data.get("ticker") or "").upper()
-    qty     = float(data.get("quantity", 100))
-    hma_hint = float(data.get("hma", 0.0)) if data.get("hma") else 0.0
-
-    if not symbol or not action:
-        return jsonify(ok=False, reason="missing symbol/action"), 400
-
+def submit_limit(side, symbol, qty, limit_price, extended):
+    limit_price = round_to_tick(limit_price)
     try:
-        # === BUY or ADD ===
-        if action == "BUY_SIGNAL":
-            current_qty = get_position_qty(symbol)
-            if current_qty > 0:
-                # already holding: add to position
-                log(f"➕ Already holding {symbol} ({current_qty} shares). Adding {ADD_SHARES_QTY} more.")
-                place_buy_near_ma(symbol, ADD_SHARES_QTY, hma_hint=hma_hint)
-                return jsonify(ok=True, added=ADD_SHARES_QTY)
-            else:
-                # open fresh 100-share position
-                log(f"🟢 Opening new position {symbol} ({qty} shares).")
-                place_buy_near_ma(symbol, qty, hma_hint=hma_hint)
-                return jsonify(ok=True, opened=qty)
-
-        # === EXIT ===
-        elif action in ("EXIT_SIGNAL", "SELL", "TP"):
-            log(f"🔻 Exit signal received for {symbol}.")
-            exited = place_sell_near_ma(symbol, hma_hint=hma_hint, aggressive=False)
-            return jsonify(ok=exited)
-
-        # === PANIC ===
-        elif action in ("PANIC", "AGGRESSIVE_EXIT"):
-            log(f"🚨 Panic exit received for {symbol}! Forcing aggressive liquidation.")
-            exited = place_sell_near_ma(symbol, hma_hint=hma_hint, aggressive=True)
-            return jsonify(ok=exited)
-
-        else:
-            log(f"⚠️ Unknown action: {action}")
-            return jsonify(ok=False, reason="unknown action")
-
+        o = api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side=side,
+            type="limit",
+            time_in_force="day",
+            limit_price=limit_price,
+            extended_hours=extended
+        )
+        log(f"📥 {side.upper()} {symbol} LMT @{limit_price}")
+        return o
     except Exception as e:
-        log(f"❌ Handler error {symbol}: {e}")
-        return jsonify(error=str(e)), 500
+        log(f"❌ {side.upper()} submit error {symbol}: {e}")
+        return None
 
+def submit_market_sell(symbol, qty):
+    try:
+        api.submit_order(symbol=symbol, qty=qty, side="sell", type="market", time_in_force="day")
+        log(f"💥 MARKET SELL {symbol}")
+    except Exception as e:
+        log(f"❌ MARKET SELL error {symbol}: {e}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry Logic (BUY)
+# ──────────────────────────────────────────────────────────────────────────────
+def handle_buy(symbol, base_level, upper_band, mama, action):
+    last = get_last_trade(symbol)
+    if not last:
+        log(f"🚫 No price for {symbol}")
+        return
+    qty, entry = get_position(symbol)
+    extended = not is_rth()
+
+    # Select target level
+    target = None
+    if action == "BUY_VWAP":
+        target = base_level
+    elif action == "BUY_UPPER":
+        target = upper_band
+    elif action == "BUY_MAMA":
+        target = mama
+
+    # If target invalid, fallback to nearest
+    levels = [v for v in [base_level, upper_band, mama] if v]
+    if not target and levels:
+        target = min(levels, key=lambda v: abs(v - last))
+
+    # If far (>3%) above chosen target → fallback lower
+    if last > target * (1 + ENTRY_BUFFER_PCT) and mama:
+        target = mama
+    elif last > target * (1 + ENTRY_BUFFER_PCT) and base_level:
+        target = base_level
+
+    limit_price = round_to_tick(target)
+
+    # Determine order size (base or addon)
+    if qty <= 0:
+        order_qty = BASE_QTY
+        log(f"🟢 Initial BUY {symbol} @{limit_price} qty={order_qty}")
+    else:
+        order_qty = ADDON_QTY
+        log(f"🟢 Add-on BUY {symbol} @{limit_price} qty={order_qty}")
+
+    submit_limit("buy", symbol, order_qty, limit_price, extended)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Exit Logic (EXIT_SIGNAL)
+# ──────────────────────────────────────────────────────────────────────────────
+def handle_exit(symbol, upper_band, mama):
+    qty, entry = get_position(symbol)
+    if qty <= 0:
+        log(f"ℹ️ No position to exit {symbol}")
+        return
+    cancel_open_orders(symbol)
+    extended = not is_rth()
+
+    last = get_last_trade(symbol)
+    if not last:
+        log(f"⚠️ No last price, using entry {entry}")
+        last = entry
+
+    # Choose nearest exit target
+    candidates = [v for v in [upper_band, mama] if v]
+    if candidates:
+        target = min(candidates, key=lambda v: abs(v - last))
+    else:
+        target = last
+
+    limit_price = round_to_tick(target)
+    log(f"🛑 EXIT {symbol} @{limit_price} target chosen")
+
+    # Place exit order
+    if is_rth():
+        submit_market_sell(symbol, qty)
+        log(f"✅ MARKET EXIT {symbol} (RTH)")
+    else:
+        submit_limit("sell", symbol, qty, limit_price, extended)
+        log(f"🔁 LIMIT EXIT {symbol} (EXT)")
+
+    # Enforce closure
+    start = time.time()
+    while time.time() - start < EXIT_TIMEOUT_SEC:
+        time.sleep(CHECK_INTERVAL_SEC)
+        q, _ = get_position(symbol)
+        if q <= 0:
+            log(f"✅ Position closed {symbol}")
+            return
+        # Hard stop check
+        l = get_last_trade(symbol)
+        if entry and l <= entry * (1 - HARD_STOP_PCT):
+            log(f"🚨 Hard stop hit {symbol}")
+            cancel_open_orders(symbol)
+            if is_rth():
+                submit_market_sell(symbol, q)
+            else:
+                bbid = get_best_bid(symbol) or l
+                lim = round_to_tick(bbid * 0.995)
+                submit_limit("sell", symbol, q, lim, True)
+            return
+
+    # Timeout enforcement
+    cancel_open_orders(symbol)
+    if is_rth():
+        submit_market_sell(symbol, qty)
+        log(f"⚠️ Timeout → MARKET EXIT {symbol}")
+    else:
+        bbid = get_best_bid(symbol) or last
+        lim = round_to_tick(bbid * 0.995)
+        submit_limit("sell", symbol, qty, lim, True)
+        log(f"⚠️ Timeout → FINAL LIMIT EXIT {symbol} @{lim}")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Panic Logic (manual or hard stop)
+# ──────────────────────────────────────────────────────────────────────────────
+def handle_panic(symbol):
+    qty, _ = get_position(symbol)
+    if qty <= 0:
+        log(f"ℹ️ No position to panic-exit {symbol}")
+        return
+    cancel_open_orders(symbol)
+    if is_rth():
+        submit_market_sell(symbol, qty)
+        log(f"🚨 PANIC EXIT {symbol} (market)")
+    else:
+        last = get_last_trade(symbol)
+        bbid = get_best_bid(symbol) or last
+        lim = round_to_tick(bbid * 0.99)
+        submit_limit("sell", symbol, qty, lim, True)
+        log(f"🚨 PANIC EXIT {symbol} (limit @{lim})")
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Webhook endpoint
+# ──────────────────────────────────────────────────────────────────────────────
+@app.route("/tv", methods=["POST"])
+def tv():
+    data = request.get_json(force=True)
+    if not data or data.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "forbidden"}), 403
+
+    action = str(data.get("action", "")).upper()
+    symbol = str(data.get("ticker", "")).upper()
+    vwap   = float(data.get("vwap", 0) or 0)
+    upper  = float(data.get("upper_band", 0) or 0)
+    mama   = float(data.get("mama", 0) or 0)
+
+    log(f"🚀 Alert Received:\n{json.dumps(data, indent=2)}")
+
+    if "BUY" in action:
+        handle_buy(symbol, vwap, upper, mama, action)
+    elif action == "EXIT_SIGNAL":
+        handle_exit(symbol, upper, mama)
+    elif action == "PANIC":
+        handle_panic(symbol)
+    else:
+        log(f"⚠️ Unknown action {action}")
+
+    return jsonify({"status": "ok"}), 200
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entrypoint
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
