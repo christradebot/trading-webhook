@@ -19,22 +19,24 @@ NY = ZoneInfo("America/New_York")
 TRADE_LOG_PATH = "/app/trade_log.json"
 
 #──────────────────────────────────────────────
-# UTILITY
+# UTILITIES
 #──────────────────────────────────────────────
 def ts(): return datetime.now(NY).strftime("[%H:%M:%S]")
 def round_tick(p): return round(float(p) + 1e-9, 2)
 def log(msg): print(f"{ts()} {msg}", flush=True)
 
 def safe_qty(sym):
-    try: return float(api.get_position(sym).qty)
-    except: return 0.0
+    try:
+        return float(api.get_position(sym).qty)
+    except:
+        return 0.0
 
 def cancel_all(sym):
     try:
         for o in api.list_orders(status="open"):
             if o.symbol == sym:
                 api.cancel_order(o.id)
-                log(f"🧹 Cancelled {sym} order {o.id}")
+                log(f"🧹 Cancelled open order {sym} ({o.id})")
     except Exception as e:
         log(f"⚠️ cancel_all error: {e}")
 
@@ -52,24 +54,13 @@ def submit_limit(side, sym, qty, px, extended):
         log(f"❌ {side.upper()} limit error {sym}: {e}")
         return None
 
-def submit_market(side, sym, qty):
-    try:
-        order = api.submit_order(
-            symbol=sym, side=side, qty=qty, type="market",
-            time_in_force="day"
-        )
-        log(f"📩 {side.upper()} MARKET {sym} x{qty}")
-        return order
-    except Exception as e:
-        log(f"❌ {side.upper()} market error {sym}: {e}")
-        return None
-
 #──────────────────────────────────────────────
-# JOURNAL + PNL
+# JOURNAL / PNL
 #──────────────────────────────────────────────
 def load_log():
     if not os.path.exists(TRADE_LOG_PATH):
-        with open(TRADE_LOG_PATH, "w") as f: json.dump([], f)
+        with open(TRADE_LOG_PATH, "w") as f:
+            json.dump([], f)
     with open(TRADE_LOG_PATH, "r") as f:
         return json.load(f)
 
@@ -102,29 +93,41 @@ def update_pnl(sym, entry_price, exit_price, qty):
     log(f"💰 EXIT {sym} | PnL={pnl_p:.2f}% | ${pnl_d:.2f}")
 
 #──────────────────────────────────────────────
-# HARD 2% STOP MONITOR
+# HARD STOP-LOSS (LIMIT-ONLY, FLOAT-SAFE)
 #──────────────────────────────────────────────
 def stop_monitor(sym, entry_price, stop_pct=0.02):
-    """Absolute 2% stop from entry (adjust stop_pct as needed)"""
+    """Unified limit-only stop-loss, valid pre/post-market."""
     try:
         threshold = round_tick(entry_price * (1 - stop_pct))
-        log(f"🛡️ Stop monitor started for {sym} | −{stop_pct*100:.1f}% stop @ {threshold}")
+        limit_px  = round_tick(threshold * 0.999)  # small buffer for fill
+        log(f"🛡️ Stop monitor active for {sym} | −{stop_pct*100:.1f}% stop @ {threshold}")
+
         while True:
             qty = safe_qty(sym)
             if qty <= 0:
                 return
+
             try:
                 q = api.get_latest_quote(sym)
-                last = q.bidprice or q.askprice or api.get_latest_trade(sym).price
-            except Exception:
+                bid = float(q.bidprice or 0)
+                ask = float(q.askprice or 0)
+                trade_px = float(api.get_latest_trade(sym).price or 0)
+
+                # select best available nonzero price
+                prices = [p for p in [bid, ask, trade_px] if p > 0]
+                last = max(prices) if prices else entry_price
+            except Exception as e:
+                log(f"⚠️ quote error {sym}: {e}")
                 last = entry_price
+
             if last <= threshold:
-                log(f"🛑 STOP TRIGGERED {sym}@{last} (−{stop_pct*100:.1f}%)")
-                submit_market("sell", sym, qty)
-                update_pnl(sym, entry_price, last, qty)
                 cancel_all(sym)
+                log(f"🛑 LIMIT STOP TRIGGERED {sym}@{last} (limit {limit_px})")
+                submit_limit("sell", sym, qty, limit_px, extended=True)
+                update_pnl(sym, entry_price, last, qty)
                 return
-            time.sleep(5)
+
+            time.sleep(3)
     except Exception as e:
         log(f"❌ stop_monitor error {sym}: {e}\n{traceback.format_exc()}")
 
@@ -141,18 +144,18 @@ def tv():
         action = data.get("action", "").upper()
         sym = data.get("ticker", "").upper()
         qty = float(data.get("quantity", 0))
-        extended = True  # allow pre/post-market
+        extended = True  # always allow extended hours
 
-        #──────────── SAFETY: close existing before new buy ────────────
+        #──────────── Ensure no duplicate trades ────────────
         existing_positions = [p.symbol for p in api.list_positions()]
         if sym in existing_positions:
-            log(f"⚠️ {sym} still open — emergency close before new trade")
+            log(f"⚠️ {sym} still open — closing before new trade")
             pos = api.get_position(sym)
             qty_open = float(pos.qty)
             last = float(pos.current_price)
             entry_px = float(pos.avg_entry_price)
             if qty_open > 0:
-                submit_market("sell", sym, qty_open)
+                submit_limit("sell", sym, qty_open, last * 0.999, extended=True)
                 update_pnl(sym, entry_px, last, qty_open)
                 cancel_all(sym)
                 time.sleep(1)
@@ -165,7 +168,6 @@ def tv():
 
             cancel_all(sym)
             submit_limit("buy", sym, qty, entry_price, extended)
-
             write_log({
                 "time": ts(),
                 "symbol": sym,
@@ -175,7 +177,6 @@ def tv():
             })
             log(f"✅ BUY triggered {sym}@{entry_price}")
 
-            # Start 2% stop-loss thread
             threading.Thread(target=stop_monitor, args=(sym, entry_price, 0.02), daemon=True).start()
             return jsonify(status="buy_sent"), 200
 
@@ -188,12 +189,11 @@ def tv():
             cancel_all(sym)
             submit_limit("sell", sym, qty, exit_price, extended)
 
-            # find entry
+            # find last BUY
             data_log = load_log()
             entries = [t for t in data_log if t["symbol"] == sym and t["action"] == "BUY"]
             entry_px = entries[-1]["entry_price"] if entries else exit_price
             update_pnl(sym, entry_px, exit_price, qty)
-
             log(f"🔔 EXIT triggered {sym}@{exit_price}")
             return jsonify(status="exit_sent"), 200
 
@@ -203,7 +203,9 @@ def tv():
         log(f"❌ Webhook error: {e}\n{traceback.format_exc()}")
         return jsonify(error="server_error"), 500
 
-
+#──────────────────────────────────────────────
+# MAIN ENTRYPOINT
+#──────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
 
