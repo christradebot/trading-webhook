@@ -102,25 +102,24 @@ def update_pnl(sym, entry_price, exit_price, qty):
     log(f"💰 EXIT {sym} | PnL={pnl_p:.2f}% | ${pnl_d:.2f}")
 
 #──────────────────────────────────────────────
-# HARD 10% STOP MONITOR
+# HARD 2% STOP MONITOR
 #──────────────────────────────────────────────
-def stop_monitor(sym, entry_price):
-    """Absolute -10% emergency stop from entry"""
+def stop_monitor(sym, entry_price, stop_pct=0.02):
+    """Absolute 2% stop from entry (adjust stop_pct as needed)"""
     try:
-        threshold = round_tick(entry_price * 0.90)
-        log(f"🛡️ Stop monitor started for {sym} @ {threshold} (-10%)")
+        threshold = round_tick(entry_price * (1 - stop_pct))
+        log(f"🛡️ Stop monitor started for {sym} | −{stop_pct*100:.1f}% stop @ {threshold}")
         while True:
             qty = safe_qty(sym)
             if qty <= 0:
                 return
             try:
-                bid = api.get_latest_quote(sym).bidprice
-                ask = api.get_latest_quote(sym).askprice
-                last = bid or ask or api.get_latest_trade(sym).price
+                q = api.get_latest_quote(sym)
+                last = q.bidprice or q.askprice or api.get_latest_trade(sym).price
             except Exception:
                 last = entry_price
             if last <= threshold:
-                log(f"🛑 HARD STOP {sym}@{last}")
+                log(f"🛑 STOP TRIGGERED {sym}@{last} (−{stop_pct*100:.1f}%)")
                 submit_market("sell", sym, qty)
                 update_pnl(sym, entry_price, last, qty)
                 cancel_all(sym)
@@ -142,7 +141,7 @@ def tv():
         action = data.get("action", "").upper()
         sym = data.get("ticker", "").upper()
         qty = float(data.get("quantity", 0))
-        extended = True  # allow pre/post market
+        extended = True  # allow pre/post-market
 
         #──────────── SAFETY: close existing before new buy ────────────
         existing_positions = [p.symbol for p in api.list_positions()]
@@ -176,8 +175,8 @@ def tv():
             })
             log(f"✅ BUY triggered {sym}@{entry_price}")
 
-            # Start hard stop thread
-            threading.Thread(target=stop_monitor, args=(sym, entry_price), daemon=True).start()
+            # Start 2% stop-loss thread
+            threading.Thread(target=stop_monitor, args=(sym, entry_price, 0.02), daemon=True).start()
             return jsonify(status="buy_sent"), 200
 
         #──────────── EXIT ────────────
@@ -207,6 +206,7 @@ def tv():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
