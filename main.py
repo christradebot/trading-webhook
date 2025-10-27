@@ -1,12 +1,12 @@
 # =========================
 # main.py — Athena + Chris 2025
-# ITG Scalper Bot (Limit-only, Candle-Low Stops)
+# ITG Scalper Bot (Async + Limit-only)
 # =========================
 
 from flask import Flask, request, jsonify
 from alpaca_trade_api.rest import REST
 from datetime import datetime, timedelta
-import os, time, json, traceback, pytz
+import os, time, json, traceback, pytz, threading
 
 # ──────────────────────────────
 # Environment + API setup
@@ -159,14 +159,9 @@ def execute_add(sym, qty, entry_price):
     open_add_tracker[sym] = True
 
 # ──────────────────────────────
-# Webhook endpoint
+# Alert handler (threaded)
 # ──────────────────────────────
-@app.post("/tv")
-def tv():
-    data = request.get_json(silent=True) or {}
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify(error="Invalid secret"), 403
-
+def handle_alert(data):
     try:
         sym = data.get("ticker")
         action = data.get("action")
@@ -179,19 +174,26 @@ def tv():
 
         if action == "BUY":
             execute_buy(sym, qty, entry, signal_low)
-
         elif action == "EXIT":
             managed_exit(sym, qty, exitp)
-
         elif action == "ADD":
             execute_add(sym, qty, entry)
-
         else:
             log(f"⚠️ Unknown action: {action}")
-
     except Exception as e:
-        log(f"❌ Webhook error: {e}\n{traceback.format_exc()}")
+        log(f"❌ handle_alert error: {e}\n{traceback.format_exc()}")
 
+# ──────────────────────────────
+# Webhook endpoint (instant 200)
+# ──────────────────────────────
+@app.post("/tv")
+def tv():
+    data = request.get_json(silent=True) or {}
+    if data.get("secret") != WEBHOOK_SECRET:
+        return jsonify(error="Invalid secret"), 403
+
+    threading.Thread(target=handle_alert, args=(data,)).start()
+    # Return instantly so TradingView never times out
     return jsonify(ok=True)
 
 # ──────────────────────────────
@@ -200,6 +202,7 @@ def tv():
 @app.get("/ping")
 def ping():
     return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
+
 
 
 
