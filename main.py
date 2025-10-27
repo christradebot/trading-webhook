@@ -1,209 +1,212 @@
-# main.py v2.3 — © Athena + Chris 2025
-# Unified handler for ITG Scalper + Hammer logic
-# Limit-only bot with ATR-based stops, PnL summary, and daily reset
+# ================================================================
+# main.py v2.5  |  © Athena + Chris 2025
+# Unified Trade Manager: BUY / ADD / EXIT (Limit-Only Execution)
+# ================================================================
 
 from flask import Flask, request, jsonify
-import os, json, time, traceback
-from datetime import datetime, timedelta
-import pytz
-import numpy as np
-from alpaca_trade_api.rest import REST
+from alpaca_trade_api.rest import REST, TimeFrame
+import os, json, datetime, time, math
 
-#────────────────────────────────────────────
-# Config & Environment
-#────────────────────────────────────────────
+# ------------------------------------------------
+# 🧠 Environment & Config
+# ------------------------------------------------
+ALPACA_KEY_ID     = os.environ.get("ALPACA_KEY_ID")
+ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
+ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://api.alpaca.markets")
+WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "mysecret")
+
+api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL)
+
 app = Flask(__name__)
-ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID")
-ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "mysecret")
-VERBOSE           = bool(int(os.getenv("VERBOSE", "1")))  # 1=on, 0=off
-api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version='v2')
-NY = pytz.timezone("America/New_York")
 
-#────────────────────────────────────────────
-# State Tracking
-#────────────────────────────────────────────
-loss_count = {}
-added_once = {}
-trade_stats = {}
+# ------------------------------------------------
+# ⚙️ Utility Helpers
+# ------------------------------------------------
+def now_et():
+    """Return current US Eastern time"""
+    return datetime.datetime.now(datetime.timezone(datetime.timedelta(hours=-4)))
 
-def daily_reset():
-    now = datetime.now(NY)
-    if now.hour == 0 and now.minute < 5:
-        loss_count.clear()
-        added_once.clear()
-        trade_stats.clear()
-        log("🔄 Daily reset complete (adds/losses cleared)")
+def within_vol_window():
+    """Check if current time is between 09:30 and 09:45 ET"""
+    t = now_et().time()
+    return t >= datetime.time(9, 30) and t <= datetime.time(9, 45)
 
-#────────────────────────────────────────────
-# Helpers
-#────────────────────────────────────────────
-def log(msg, force=False):
-    if VERBOSE or force:
-        print(f"[{datetime.now(NY).strftime('%H:%M:%S')}] {msg}", flush=True)
-
-def round_tick(price): return round(price, 4)
-
-def safe_qty(sym):
-    try: pos = api.get_position(sym); return float(pos.qty)
-    except Exception: return 0
-
-def latest_bid_ask(sym):
-    try:
-        q = api.get_latest_quote(sym)
-        return q.bp, q.ap
-    except Exception:
-        return (0, 0)
-
-def cancel_all(sym):
-    for o in api.list_orders(status="open"):
-        if o.symbol == sym:
-            api.cancel_order(o.id)
-
-def current_atr(sym, period=14):
-    bars = api.get_bars(sym, "1Min", limit=period*2).df
-    if len(bars) < period: return 0
+def calc_atr(symbol, period=14):
+    """Calculate ATR using last 14 one-minute bars"""
+    bars = api.get_bars(symbol, TimeFrame.Minute, limit=period + 1).df
+    if bars.empty: return None
     highs, lows, closes = bars['high'], bars['low'], bars['close']
-    trs = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]), np.abs(lows[1:] - closes[:-1]))
-    return float(np.mean(trs[-period:]))
+    trs = [max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1])) for i in range(1, len(bars))]
+    return sum(trs) / len(trs)
 
-def update_pnl(sym):
-    try:
-        pos = api.get_position(sym)
-        unreal = float(pos.unrealized_pl)
-        unreal_pct = float(pos.unrealized_plpc) * 100
-        log(f"📈 {sym} Unrealized: ${unreal:.2f} ({unreal_pct:.2f}%)")
-    except Exception:
-        log(f"📉 {sym} closed or no active position.")
-
-def record_trade(sym, realized=0, add=False, loss=False):
-    st = trade_stats.setdefault(sym, {"realized":0,"adds":0,"losses":0,"trades":0})
-    st["realized"] += realized
-    st["trades"] += 1
-    if add: st["adds"] += 1
-    if loss: st["losses"] += 1
-
-def summary(sym):
-    s = trade_stats.get(sym, {"realized":0,"adds":0,"losses":0,"trades":0})
-    log(f"📊 SUMMARY — {sym}\n"
-        f"    Realized PnL: ${s['realized']:.2f}\n"
-        f"    Trades: {s['trades']}\n"
-        f"    Adds Used: {s['adds']}\n"
-        f"    Losses Today: {s['losses']}", force=True)
-
-#────────────────────────────────────────────
-# Core Trading Logic
-#────────────────────────────────────────────
-def managed_exit(sym, qty_hint):
-    try:
-        qty = safe_qty(sym) or qty_hint
-        if qty <= 0: return
-        bid, ask = latest_bid_ask(sym)
-        trade = api.get_latest_trade(sym)
-        target = round_tick(bid or ask or (trade.price if trade and trade.price > 0 else 0))
-        if target <= 0:
-            log(f"⚠️ No valid price for exit {sym}, skipping.")
-            return
-        log(f"🟣 Exit target {sym}@{target}")
-        cancel_all(sym)
-        api.submit_order(side="sell", type="limit", time_in_force="day",
-                         symbol=sym, qty=qty, limit_price=target, extended_hours=True)
-        time.sleep(10)
+def aggressive_limit_close(symbol, qty, side="sell", limit_price=None):
+    """Aggressively close using limit orders until filled"""
+    print(f"⚠️ Stop triggered → aggressive limit {side} @ {limit_price}")
+    retries = 0
+    while retries < 10:
         try:
-            pos = api.get_position(sym)
-            unreal = float(pos.unrealized_pl)
-            log(f"📈 {sym} Unrealized after exit try: ${unreal:.2f}")
-        except Exception:
-            trade_hist = api.get_activities("FILL", until=datetime.now(NY))
-            realized = 0
-            for t in trade_hist:
-                if getattr(t, "symbol", "") == sym:
-                    realized += float(getattr(t, "net_amount", 0))
-            record_trade(sym, realized=realized)
-            summary(sym)
-    except Exception as e:
-        log(f"❌ managed_exit {sym}: {e}\n{traceback.format_exc()}")
+            api.submit_order(
+                symbol=symbol,
+                qty=qty,
+                side=side,
+                type="limit",
+                time_in_force="day",
+                limit_price=limit_price,
+                extended_hours=True
+            )
+            print(f"✅ Limit exit submitted @ {limit_price}")
+            break
+        except Exception as e:
+            print(f"Retry {retries+1}/10: {e}")
+            retries += 1
+            time.sleep(1)
 
-def handle_buy(sym, entry_price, candle_low, qty):
+def get_position(symbol):
+    """Fetch existing position if any"""
     try:
-        now = datetime.now(NY)
-        atr = current_atr(sym)
-        atr_mult = 3 if now.hour == 9 and 30 <= now.minute <= 45 else 1
-        stop = candle_low - (atr * atr_mult)
-        range_pc = (entry_price - candle_low) / entry_price * 100
-        if range_pc > 10:
-            log(f"⚠️ Skipping {sym}: range {range_pc:.1f}% > 10%")
-            return
-        cancel_all(sym)
-        limit_price = round_tick(entry_price)
-        log(f"🟢 BUY {sym} @ {limit_price} | Stop {round_tick(stop)} | ATR×{atr_mult}")
-        api.submit_order(side="buy", type="limit", time_in_force="day",
-                         symbol=sym, qty=qty, limit_price=limit_price, extended_hours=True)
-        update_pnl(sym)
-        record_trade(sym)
-    except Exception as e:
-        log(f"❌ handle_buy {sym}: {e}\n{traceback.format_exc()}")
+        return api.get_position(symbol)
+    except:
+        return None
 
-def handle_add(sym, entry_price, candle_low, qty):
-    try:
-        if added_once.get(sym):
-            log(f"⚠️ {sym} already added once; skipping additional add.")
-            return
-        unreal = 0
-        try:
-            pos = api.get_position(sym)
-            unreal = float(pos.unrealized_plpc)
-        except Exception: pass
-        if unreal <= 0:
-            log(f"⚠️ {sym} not profitable; skipping ADD.")
-            return
-        added_once[sym] = True
-        limit_price = round_tick(entry_price)
-        log(f"🟨 ADD {sym} @ {limit_price}")
-        api.submit_order(side="buy", type="limit", time_in_force="day",
-                         symbol=sym, qty=qty, limit_price=limit_price, extended_hours=True)
-        update_pnl(sym)
-        record_trade(sym, add=True)
-    except Exception as e:
-        log(f"❌ handle_add {sym}: {e}\n{traceback.format_exc()}")
+def get_pnl(symbol):
+    """Return current unrealized PnL for logging"""
+    pos = get_position(symbol)
+    if not pos: return 0.0
+    return float(pos.unrealized_pl)
 
-#────────────────────────────────────────────
-# Webhook Handler
-#────────────────────────────────────────────
+# ------------------------------------------------
+# 💰 Trade Manager
+# ------------------------------------------------
+def manage_trade(symbol, side, alert_price, signal_type):
+    """Main unified trade handler"""
+    alert_price = float(alert_price)
+    qty = 100  # fixed lot size for testing
+
+    pos = get_position(symbol)
+    has_pos = pos is not None
+    unreal_pnl = get_pnl(symbol)
+
+    # --- BUY Logic ---
+    if side == "buy":
+        if has_pos:
+            print(f"⚠️ Already in {symbol}, skipping BUY.")
+            return
+
+        # Determine stop mode
+        if within_vol_window():
+            atr = calc_atr(symbol, 14)
+            stop_price = round(alert_price - (atr * 3), 4)
+            stop_mode = "ATR×3 (09:30–09:45)"
+        else:
+            bars = api.get_bars(symbol, TimeFrame.Minute, limit=1).df
+            stop_price = round(float(bars['low'][-1]), 4)
+            stop_mode = "Candle-Low"
+
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="buy",
+            type="limit",
+            time_in_force="day",
+            limit_price=alert_price,
+            extended_hours=True
+        )
+        print(f"🚀 BUY {symbol} @ ${alert_price} | Stop Mode: {stop_mode} → Stop @ ${stop_price}")
+        print(f"📊 Unrealized PnL: ${unreal_pnl:.2f}")
+
+    # --- ADD Logic ---
+    elif side == "add":
+        if not has_pos:
+            print(f"⚠️ No open position for {symbol}, skipping ADD.")
+            return
+        if unreal_pnl <= 0:
+            print(f"⚠️ {symbol} not profitable, skipping ADD.")
+            return
+
+        api.submit_order(
+            symbol=symbol,
+            qty=qty,
+            side="buy",
+            type="limit",
+            time_in_force="day",
+            limit_price=alert_price,
+            extended_hours=True
+        )
+        print(f"➕ ADD {symbol} @ ${alert_price} | PnL before add: ${unreal_pnl:.2f}")
+
+    # --- EXIT Logic ---
+    elif side == "exit":
+        if not has_pos:
+            print(f"⚠️ No position to exit for {symbol}.")
+            return
+
+        stop_price = float(pos.avg_entry_price) * 0.98  # fallback safety stop
+        api.submit_order(
+            symbol=symbol,
+            qty=pos.qty,
+            side="sell",
+            type="limit",
+            time_in_force="day",
+            limit_price=alert_price,
+            extended_hours=True
+        )
+        print(f"💣 EXIT {symbol} @ ${alert_price}")
+        print(f"💰 Realized PnL: ${pos.unrealized_pl}")
+
+# ------------------------------------------------
+# 📡 Webhook Endpoint
+# ------------------------------------------------
 @app.post("/tv")
-def tv():
-    daily_reset()
-    try:
-        data = request.get_json(silent=True) or {}
-        if data.get("secret") != WEBHOOK_SECRET:
-            return jsonify(error="Invalid secret"), 403
+def webhook():
+    data = request.get_json()
+    if data.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "unauthorized"}), 403
 
-        sym = data.get("ticker")
-        action = data.get("action", "").upper()
-        qty = int(data.get("quantity", 100))
-        entry_price = float(data.get("entry_price", 0))
-        candle_low = float(data.get("candle_low", entry_price * 0.98))
-        if not sym or entry_price <= 0:
-            return jsonify(error="Invalid payload"), 400
+    symbol = data.get("ticker")
+    price = data.get("price") or data.get("close")
+    message = data.get("message", "").lower()
 
-        log(f"🚀 Alert {action} {sym} @ {entry_price}")
+    if not symbol or not price:
+        return jsonify({"error": "missing data"}), 400
 
-        if action == "BUY": handle_buy(sym, entry_price, candle_low, qty)
-        elif action == "EXIT": managed_exit(sym, qty)
-        elif action == "ADD": handle_add(sym, entry_price, candle_low, qty)
-        else: log(f"⚠️ Unknown action {action}")
+    if "add" in message:
+        manage_trade(symbol, "add", price, "hammer_add")
+    elif "buy" in message:
+        manage_trade(symbol, "buy", price, "hammer_buy")
+    elif "exit" in message:
+        manage_trade(symbol, "exit", price, "scalper_exit")
+    else:
+        print(f"Ignored message: {message}")
 
-        return jsonify(ok=True)
-    except Exception as e:
-        log(f"❌ tv handler: {e}\n{traceback.format_exc()}")
-        return jsonify(error=str(e)), 500
+    return jsonify({"status": "ok", "symbol": symbol})
 
-@app.get("/ping")
-def ping(): return jsonify(ok=True, time=datetime.now(NY).isoformat())
+# ------------------------------------------------
+# 🧾 JSON Payload Templates
+# ------------------------------------------------
+hammer_buy_payload = {
+    "secret": WEBHOOK_SECRET,
+    "ticker": "{{ticker}}",
+    "price": "{{close}}",
+    "message": "Bullish Hammer Detected — Action: BUY"
+}
+
+hammer_add_payload = {
+    "secret": WEBHOOK_SECRET,
+    "ticker": "{{ticker}}",
+    "price": "{{close}}",
+    "message": "Bullish Hammer Detected — Action: ADD"
+}
+
+scalper_exit_payload = {
+    "secret": WEBHOOK_SECRET,
+    "ticker": "{{ticker}}",
+    "price": "{{close}}",
+    "message": "ITG Scalper Exit"
+}
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+    app.run(host="0.0.0.0", port=8000)
+
 
 
 
