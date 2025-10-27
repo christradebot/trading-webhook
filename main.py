@@ -1,17 +1,17 @@
 # === main.py ===
-# © Chris / Athena 2025
-# Stable release with target_price + 2% stop-loss (limit-only)
+# Momentum Scalper Bot — Signal Candle Low Stop + Auto ATR Buffer (9:30–9:45 ET)
+# Includes ATR + Stop Distance Logging + Trade Summary + 10% Range Filter
+# © Athena + Chris 2025
+
 from flask import Flask, request, jsonify
-import os, json, time, threading, traceback
+from alpaca_trade_api.rest import REST
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from alpaca_trade_api.rest import REST
+import os, json, time, traceback, threading
 
-app = Flask(__name__)
-
-#──────────────────────────────────────────────
-# ENVIRONMENT
-#──────────────────────────────────────────────
+# ────────────────────────────────
+# ENV + API
+# ────────────────────────────────
 ALPACA_KEY_ID     = os.environ.get("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
@@ -19,233 +19,250 @@ WEBHOOK_SECRET    = os.environ.get("WEBHOOK_SECRET", "chrisbot1501")
 
 api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
 NY = ZoneInfo("America/New_York")
-TRADE_LOG_PATH = "/app/trade_log.json"
 
-#──────────────────────────────────────────────
-# UTILITY
-#──────────────────────────────────────────────
-def ts(): return datetime.now(NY).strftime("[%H:%M:%S]")
-def round_tick(p): return round(float(p) + 1e-9, 2)
-def log(msg): print(f"{ts()} {msg}", flush=True)
+app = Flask(__name__)
+
+LOSS_CAP = 2
+loss_count = {}
+open_positions = {}  # Track entries for summary logs
+
+
+# ────────────────────────────────
+# HELPERS
+# ────────────────────────────────
+def ts():
+    return datetime.now(NY).strftime("[%H:%M:%S]")
+
+def log(msg):
+    print(f"{ts()} {msg}", flush=True)
+
+def round_tick(px):
+    try:
+        return round(float(px) + 1e-9, 2)
+    except:
+        return 0.0
 
 def safe_qty(sym):
-    try: return float(api.get_position(sym).qty)
-    except: return 0.0
+    try:
+        return float(api.get_position(sym).qty)
+    except:
+        return 0.0
 
 def latest_bid_ask(sym):
     try:
         q = api.get_latest_quote(sym)
-        return (q.bidprice, q.askprice)
-    except:
-        return (0.0, 0.0)
+        return float(q.bidprice or 0.0), float(q.askprice or 0.0)
+    except Exception:
+        return 0.0, 0.0
 
 def cancel_all(sym):
     try:
         for o in api.list_orders(status="open"):
             if o.symbol == sym:
                 api.cancel_order(o.id)
-                log(f"🧹 Cancelled {sym}")
-    except: pass
+        log(f"🧹 Cancelled open orders for {sym}")
+    except Exception as e:
+        log(f"⚠️ cancel_all {sym}: {e}")
 
-def submit_limit(side, sym, qty, px, extended):
+def submit_limit(side, sym, qty, px):
     try:
-        if px <= 0:
-            log(f"⚠️ Invalid {side.upper()} price {px} for {sym}, skipping.")
+        if px <= 0 or qty <= 0:
+            log(f"⚠️ Invalid order {side} {sym} qty={qty} px={px}")
             return None
-        return api.submit_order(
+        o = api.submit_order(
             symbol=sym,
             side=side,
             qty=qty,
             type="limit",
             time_in_force="day",
             limit_price=round_tick(px),
-            extended_hours=extended
+            extended_hours=True
         )
+        log(f"📤 {side.upper()} {qty} {sym} @ {round_tick(px)} (extended=True, TIF=day)")
+        return o
     except Exception as e:
         log(f"❌ {side.upper()} limit error {sym}: {e}")
         return None
 
-#──────────────────────────────────────────────
-# LOGGING
-#──────────────────────────────────────────────
-def load_log():
-    if not os.path.exists(TRADE_LOG_PATH):
-        with open(TRADE_LOG_PATH, "w") as f: json.dump([], f)
-    with open(TRADE_LOG_PATH, "r") as f:
-        return json.load(f)
+def in_open_window(dt):
+    # Returns True between 9:30–9:45 AM ET
+    return dt.tzinfo and dt.hour == 9 and 30 <= dt.minute <= 45
 
-def save_log(data):
-    with open(TRADE_LOG_PATH, "w") as f:
-        json.dump(data, f, indent=2)
 
-def write_log(entry):
+# ────────────────────────────────
+# AGGRESSIVE EXIT LOOP
+# ────────────────────────────────
+def force_exit_until_flat(sym, ref_price):
+    """Exit immediately using aggressive limit orders until flat."""
     try:
-        data = load_log()
-        data.append(entry)
-        save_log(data)
-    except Exception as e:
-        log(f"⚠️ log write failed: {e}")
+        entry_px = open_positions.get(sym, {}).get("entry", None)
+        atr = open_positions.get(sym, {}).get("atr", 0)
+        atr_mult = open_positions.get(sym, {}).get("atr_mult", 1)
 
-def update_pnl(sym, exit_price):
-    try:
-        data = load_log()
-        buys = [d for d in data if d["action"] == "BUY" and d["symbol"] == sym]
-        if not buys: return
-        entry = buys[-1]
-        qty = entry.get("quantity", 0)
-        entry_price = entry.get("entry_price", 0)
-        pnl_d = (exit_price - entry_price) * qty
-        pnl_p = ((exit_price / entry_price) - 1) * 100 if entry_price else 0
-        record = {
-            "time": ts(),
-            "symbol": sym,
-            "action": "EXIT",
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "quantity": qty,
-            "PnL$": round(pnl_d, 2),
-            "PnL%": round(pnl_p, 2)
-        }
-        data.append(record)
-        save_log(data)
-        log(f"💰 {sym} closed | PnL%={pnl_p:.2f}")
-    except Exception as e:
-        log(f"⚠️ update_pnl failed: {e}")
-
-#──────────────────────────────────────────────
-# STOP MONITOR
-#──────────────────────────────────────────────
-def stop_monitor(sym, entry_price):
-    try:
-        threshold = round_tick(entry_price * 0.98)  # 2% stop-loss
-        while True:
-            qty = safe_qty(sym)
-            if qty <= 0: return
-            bid, ask = latest_bid_ask(sym)
-            trade = api.get_latest_trade(sym)
-            last = bid or ask or (trade.price if trade and trade.price > 0 else 0)
-            if last <= threshold and last > 0:
-                log(f"🛑 Stop-loss triggered {sym}@{last} (2%)")
-                cancel_all(sym)
-                px = round_tick((bid or last) - 0.01)
-                submit_limit("sell", sym, qty, px, extended=True)
-                update_pnl(sym, last)
-                return
-            time.sleep(5)
-    except Exception as e:
-        log(f"❌ stop_monitor {sym}: {e}")
-
-#──────────────────────────────────────────────
-# MANAGED EXIT (Updated)
-#──────────────────────────────────────────────
-def managed_exit(sym, qty_hint):
-    try:
-        qty = safe_qty(sym) or qty_hint
-        if qty <= 0:
-            return
-
-        # Use current market data for exit
-        bid, ask = latest_bid_ask(sym)
-        trade = api.get_latest_trade(sym)
-        target = round_tick(bid or ask or (trade.price if trade and trade.price > 0 else 0))
-        if target <= 0:
-            log(f"⚠️ No valid price for exit {sym}, skipping.")
-            return
-
-        end = datetime.now(NY) + timedelta(minutes=10)
-        log(f"🟣 Exit target {sym}@{target}")
-
+        end = datetime.now(NY) + timedelta(seconds=90)
         while datetime.now(NY) < end:
-            if safe_qty(sym) <= 0:
-                update_pnl(sym, target)
+            qty = safe_qty(sym)
+            if qty <= 0:
+                exit_px = ref_price
+                if entry_px:
+                    pnl = ((exit_px - entry_px) / entry_px) * 100
+                    log(f"📊 Closed {sym} | Entry {round_tick(entry_px)} | Exit {round_tick(exit_px)} | P/L {round(pnl,2)}% | ATR {round(atr,2)} × {atr_mult}")
+                log(f"✅ Flat {sym} after stop or exit.")
+                open_positions.pop(sym, None)
                 return
             cancel_all(sym)
             bid, ask = latest_bid_ask(sym)
-            px = round_tick(bid or ask or target)
-            submit_limit("sell", sym, qty, px, extended=True)
-            time.sleep(20)
+            px = round_tick((bid if bid > 0 else ref_price or ask or 0.01) - 0.05)
+            submit_limit("sell", sym, qty, px)
+            time.sleep(2)
 
-        if safe_qty(sym) > 0:
-            bid, _ = latest_bid_ask(sym)
-            px = round_tick((bid or target) - 0.01)
-            log(f"⚠️ Expired → LIMIT exit {sym}@{px} XH")
-            submit_limit("sell", sym, qty, px, extended=True)
-            update_pnl(sym, target)
-    except Exception as e:
-        log(f"❌ managed_exit {sym}: {e}\n{traceback.format_exc()}")
-
-#──────────────────────────────────────────────
-# TARGET MONITOR (Optional)
-#──────────────────────────────────────────────
-def target_monitor(sym, target_price):
-    try:
-        if target_price <= 0:
-            return
         qty = safe_qty(sym)
-        while qty > 0:
+        if qty > 0:
             bid, ask = latest_bid_ask(sym)
-            trade = api.get_latest_trade(sym)
-            last = bid or ask or (trade.price if trade and trade.price > 0 else 0)
-            if last >= target_price:
-                log(f"🎯 TP hit {sym}@{target_price}")
-                cancel_all(sym)
-                submit_limit("sell", sym, qty, target_price, extended=True)
-                update_pnl(sym, target_price)
-                return
-            time.sleep(5)
-            qty = safe_qty(sym)
+            deep_px = round_tick((bid if bid > 0 else ref_price or ask or 0.01) - 0.10)
+            log(f"⚠️ Final exit {sym}@{deep_px}")
+            cancel_all(sym)
+            submit_limit("sell", sym, qty, deep_px)
+            time.sleep(2)
     except Exception as e:
-        log(f"❌ target_monitor {sym}: {e}")
+        log(f"❌ force_exit_until_flat {sym}: {e}\n{traceback.format_exc()}")
 
-#──────────────────────────────────────────────
+
+# ────────────────────────────────
+# STOP MONITOR
+# ────────────────────────────────
+def monitor_stop(sym, entry_px, signal_low, atr):
+    try:
+        now = datetime.now(NY)
+        atr_mult = 3.0 if in_open_window(now) else 1.0
+        stop = signal_low - (atr * atr_mult if atr > 0 else 0)
+        stop = round_tick(max(0.01, stop))
+
+        # Calculate stop distance
+        distance = abs(entry_px - stop)
+        pct = (distance / entry_px) * 100 if entry_px > 0 else 0
+        log(f"🛡 {sym} STOP SETUP → entry={round_tick(entry_px)} | low={signal_low} | ATR={round_tick(atr)} | mult={atr_mult} | stop={stop} | distance={round(pct,2)}%")
+
+        open_positions[sym] = {"entry": entry_px, "atr": atr, "atr_mult": atr_mult}
+
+        while True:
+            qty = safe_qty(sym)
+            if qty <= 0:
+                return
+            bid, ask = latest_bid_ask(sym)
+            last = bid or ask or entry_px
+            if last <= stop:
+                log(f"🛑 STOP TRIGGERED {sym} last={round_tick(last)} <= stop={stop}")
+                force_exit_until_flat(sym, ref_price=last)
+                loss_count[sym] = loss_count.get(sym, 0) + 1
+                log(f"📉 Loss #{loss_count[sym]} for {sym}")
+                return
+            time.sleep(1.5)
+    except Exception as e:
+        log(f"❌ monitor_stop {sym}: {e}\n{traceback.format_exc()}")
+
+
+# ────────────────────────────────
+# ENTRY LOGIC
+# ────────────────────────────────
+def try_enter(sym, qty, entry_price, signal_low, atr, signal_high):
+    if loss_count.get(sym, 0) >= LOSS_CAP:
+        log(f"🚫 {sym}: Max losses reached ({LOSS_CAP}) → skipping.")
+        return jsonify(status="blocked"), 200
+
+    # Skip if candle range > 10%
+    if signal_high > 0 and signal_low > 0:
+        candle_range = ((signal_high - signal_low) / entry_price) * 100
+        if candle_range > 10:
+            log(f"🚫 {sym}: Candle range {round(candle_range,2)}% > 10% → skipped.")
+            return jsonify(status="skipped_range"), 200
+
+    if safe_qty(sym) > 0:
+        log(f"ℹ️ {sym}: Already in position.")
+        return jsonify(status="already_in"), 200
+
+    px = round_tick(entry_price)
+    order = submit_limit("buy", sym, qty, px)
+    if not order:
+        return jsonify(status="rejected"), 200
+
+    time.sleep(2)
+    try:
+        pos = api.get_position(sym)
+        avg_entry = float(pos.avg_entry_price)
+        log(f"✅ Filled {sym}@{avg_entry}")
+        threading.Thread(target=monitor_stop, args=(sym, avg_entry, signal_low, atr), daemon=True).start()
+    except Exception:
+        log(f"🕒 Pending fill for {sym} → monitoring anyway")
+        threading.Thread(target=monitor_stop, args=(sym, px, signal_low, atr), daemon=True).start()
+
+    return jsonify(status="entry_ok"), 200
+
+
+# ────────────────────────────────
+# EXIT SIGNAL HANDLER
+# ────────────────────────────────
+def exit_on_signal(sym):
+    qty = safe_qty(sym)
+    if qty <= 0:
+        return jsonify(status="no_position"), 200
+    bid, ask = latest_bid_ask(sym)
+    px = round_tick((bid or ask or 0.01) - 0.02)
+    cancel_all(sym)
+    submit_limit("sell", sym, qty, px)
+    force_exit_until_flat(sym, ref_price=px)
+    return jsonify(status="exit_ok"), 200
+
+
+# ────────────────────────────────
 # WEBHOOK
-#──────────────────────────────────────────────
-@app.route("/tv", methods=["POST"])
+# ────────────────────────────────
+@app.post("/tv")
 def tv():
     try:
         data = request.get_json(force=True) or {}
         if data.get("secret") != WEBHOOK_SECRET:
             return jsonify(err="bad secret"), 403
 
-        act = data.get("action", "").upper()
-        sym = data.get("ticker", "").upper()
-        qty = float(data.get("quantity", 0))
-        close_price = float(data.get("close_price", 0))
-        target_price = float(data.get("target_price", 0))
+        act = str(data.get("action", "")).upper()
+        sym = str(data.get("ticker", "")).upper()
+        qty = float(data.get("quantity", 0) or 0)
+        entry_price = float(data.get("entry_price", 0) or 0)
+        signal_low = float(data.get("signal_low", 0) or 0)
+        signal_high = float(data.get("signal_high", 0) or 0)
+        atr = float(data.get("atr", 0) or 0)
+
+        if not sym:
+            return jsonify(err="missing symbol"), 400
 
         if act == "BUY":
-            entry = round_tick(close_price * 1.005)
-            cancel_all(sym)
-            o = submit_limit("buy", sym, qty, entry, extended=True)
-            if o:
-                log(f"✅ BUY submitted {sym}@{entry}")
-                time.sleep(2)
-                try:
-                    pos = api.get_position(sym)
-                    entry_px = float(pos.avg_entry_price)
-                    threading.Thread(target=stop_monitor, args=(sym, entry_px), daemon=True).start()
-                    if target_price > 0:
-                        threading.Thread(target=target_monitor, args=(sym, target_price), daemon=True).start()
-                        log(f"🎯 Target set {sym}@{target_price}")
-                    write_log({"time": ts(), "symbol": sym, "action": "BUY", "entry_price": entry_px, "quantity": qty})
-                except Exception as e:
-                    log(f"🕒 Waiting for fill... {e}")
-            return jsonify(status="buy_ok"), 200
+            if entry_price <= 0 or signal_low <= 0 or qty <= 0:
+                log(f"⚠️ Bad BUY payload for {sym}")
+                return jsonify(status="bad_payload"), 400
+            log(f"🚀 BUY {sym} qty={qty} entry={entry_price} stop@low={signal_low}")
+            return try_enter(sym, qty, entry_price, signal_low, atr, signal_high)
 
         if act == "EXIT":
-            log(f"🔔 EXIT {sym}")
-            threading.Thread(target=managed_exit, args=(sym, qty), daemon=True).start()
-            return jsonify(status="exit_started"), 200
+            log(f"🔔 EXIT {sym} received")
+            return exit_on_signal(sym)
 
         return jsonify(status="ignored"), 200
 
     except Exception as e:
-        log(f"❌ {e}\n{traceback.format_exc()}")
-        return jsonify(err="server"), 500
+        log(f"❌ webhook error: {e}\n{traceback.format_exc()}")
+        return jsonify(err="server_error"), 500
 
-#──────────────────────────────────────────────
+
+# ────────────────────────────────
+@app.get("/ping")
+def ping():
+    return jsonify(ok=True, service="Athena Scalper Bot", base=ALPACA_BASE_URL)
+
+
+# ────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+
 
 
 
