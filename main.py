@@ -1,6 +1,7 @@
 # =========================
 # main.py — Athena + Chris 2025
 # ITG Scalper Bot (Async + Limit-only + Auto Stop Watcher)
+# NightSafe vFinal
 # =========================
 
 from flask import Flask, request, jsonify
@@ -261,15 +262,19 @@ def handle_alert(data):
         log(f"❌ handle_alert error: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# Webhook endpoint with safe secret check
+# Webhook endpoint (final fix)
 # ──────────────────────────────
 @app.post("/tv")
 def tv():
     data = request.get_json(silent=True) or {}
-    secret_in = (data.get("secret") or "").strip()
-    expected  = (WEBHOOK_SECRET or "").strip()
+
+    # Handles all variants: 'secret', 'Secret', spaces, case, newlines
+    secret_in = (data.get("secret") or data.get("Secret") or "").strip().lower()
+    expected  = (WEBHOOK_SECRET or "").strip().lower()
+
     if secret_in != expected:
         return jsonify(error="Invalid secret"), 403
+
     threading.Thread(target=handle_alert, args=(data,), daemon=True).start()
     return jsonify(ok=True)
 
@@ -279,6 +284,7 @@ def tv():
 @app.get("/ping")
 def ping():
     return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
+
 
 
 
