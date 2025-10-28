@@ -1,371 +1,362 @@
 # =========================
-# main.py — v3.0 (Athena + Chris 2025)
-# ITG Scalper Bot (limit-only) + Hammer + ATR window + PnL + Option-2 exit
+# main.py — Athena + Chris 2025
+# ITG Scalper Bot (Lean) — Limit-only, Alpaca price feed, Stop watcher, PnL
 # =========================
 
 from flask import Flask, request, jsonify
 from alpaca_trade_api.rest import REST
 from datetime import datetime, timedelta
-import os, time, json, traceback, pytz, threading, math
+from zoneinfo import ZoneInfo
+import os, time, json, threading, traceback, math
 
 # ──────────────────────────────
-# Environment + API setup
+# Env + API
 # ──────────────────────────────
-ALPACA_KEY_ID = os.getenv("ALPACA_KEY_ID")
+ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
-ALPACA_BASE_URL = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "chrisbot1501")
+ALPACA_BASE_URL   = os.getenv("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+WEBHOOK_SECRET    = os.getenv("WEBHOOK_SECRET", "chrisbot1501")
 
 api = REST(ALPACA_KEY_ID, ALPACA_SECRET_KEY, ALPACA_BASE_URL, api_version="v2")
+NY  = ZoneInfo("America/New_York")
+
 app = Flask(__name__)
-NY = pytz.timezone("America/New_York")
 
 # ──────────────────────────────
-# State
+# Session State (in-memory)
 # ──────────────────────────────
-open_add_tracker = {} # one add per ticker (resets when flat)
-loss_tracker = {} # max two losses per ticker per session
-stops = {} # {sym: {"stop": float, "entry": float}}
-watchers = {} # {sym: threading.Thread}
-lock = threading.Lock()
+stops      = {}    # {SYM: {"stop": float, "entry": float}}
+loss_count = {}    # {SYM: int}  max 2
+add_used   = {}    # {SYM: bool}
+watchers   = {}    # {SYM: Thread}
+lock       = threading.Lock()
 
 # ──────────────────────────────
 # Helpers
 # ──────────────────────────────
-def log(msg: str):
-    print(f"{datetime.now(NY).strftime('%H:%M:%S')} | {msg}", flush=True)
+def ts(): return datetime.now(NY).strftime("%H:%M:%S")
+def log(msg): print(f"{ts()} | {msg}", flush=True)
 
-def round_tick(px: float) -> float:
-    if px is None:
-        return 0.0
-    # penny/sub-penny precision handling
-    if px >= 1.0:
-        return round(px, 2)
-    elif px >= 0.1:
-        return round(px, 3)
-    else:
-        return round(px, 4)
+def round_tick(p: float) -> float:
+    if p is None: return 0.0
+    p = float(p)
+    step = 0.01 if p >= 1 else (0.001 if p >= 0.1 else 0.0001)
+    return float(f"{math.floor(p/step)*step:.6f}")
 
-def price_tick(px: float) -> float:
-    if px >= 1.0:
-        return 0.01
-    elif px >= 0.1:
-        return 0.001
-    else:
-        return 0.0001
-
-def latest_bid_ask(sym):
+def latest_bid_ask_trade(sym):
+    """Use Alpaca price feed (quotes + last trade) robustly."""
+    bid = ask = last = None
     try:
         q = api.get_latest_quote(sym)
-        bid = float(q.bidprice or 0.0)
-        ask = float(q.askprice or 0.0)
-        return bid, ask
+        bid = float(q.bidprice) if q and q.bidprice else None
+        ask = float(q.askprice) if q and q.askprice else None
     except Exception:
-        return 0.0, 0.0
-
-def last_trade_price(sym):
-    # Prefer bid for sells; else last trade
-    bid, ask = latest_bid_ask(sym)
-    if bid > 0:
-        return bid
+        pass
     try:
         t = api.get_latest_trade(sym)
-        return float(getattr(t, "price", 0.0) or 0.0)
+        last = float(t.price) if t and t.price else None
     except Exception:
-        return 0.0
+        last = None
+    return bid, ask, last
 
-def safe_qty(sym):
+def last_trade_price(sym) -> float:
+    bid, ask, last = latest_bid_ask_trade(sym)
+    return float(last or bid or ask or 0.0)
+
+def safe_qty(sym) -> float:
     try:
         pos = api.get_position(sym)
         return float(pos.qty)
     except Exception:
         return 0.0
 
-def avg_entry_price(sym):
+def avg_entry(sym) -> float:
     try:
         pos = api.get_position(sym)
         return float(pos.avg_entry_price)
     except Exception:
         return 0.0
 
-def in_profit(sym):
+def in_profit(sym) -> bool:
+    cur = last_trade_price(sym)
+    avg = avg_entry(sym)
+    return cur > 0 and avg > 0 and cur > avg
+
+def cancel_open_orders(sym):
     try:
-        cur = last_trade_price(sym)
-        avg = avg_entry_price(sym)
-        return (cur > 0) and (avg > 0) and (cur > avg)
-    except Exception:
-        return False
+        for o in api.list_orders(status="open"):
+            if o.symbol == sym:
+                api.cancel_order(o.id)
+        log(f"🧹 Cancelled open orders for {sym}")
+    except Exception as e:
+        log(f"⚠️ cancel_open_orders({sym}): {e}")
 
-def cancel_all(sym):
-    try:
-        for o in api.list_orders(status="open", symbols=[sym]):
-            api.cancel_order(o.id)
-    except Exception:
-        pass
-
-def record_loss(sym):
-    with lock:
-        loss_tracker[sym] = loss_tracker.get(sym, 0) + 1
-        if loss_tracker[sym] >= 2:
-            log(f"🚫 {sym} locked out after 2 losses.")
-
-def can_trade(sym) -> bool:
-    return loss_tracker.get(sym, 0) < 2
-
-def within_atr_window() -> bool:
-    now = datetime.now(NY).time()
-    a = datetime.strptime("09:30", "%H:%M").time()
-    b = datetime.strptime("09:45", "%H:%M").time()
-    return a <= now <= b
-
-def valid_candle_range(candle_close: float, candle_low: float) -> bool:
-    if candle_close <= 0:
-        return False
-    rng = (candle_close - candle_low) / candle_close * 100.0
-    log(f"🔎 Entry range (low→close): {rng:.2f}%")
-    return rng <= 10.0
-
-def get_stop(candle_low: float, candle_close: float, atr_value: float or None) -> float:
-    """
-    Use ATR×3 buffer only between 09:30–09:45 ET (wider, not tighter).
-    Outside that window, strict candle low.
-    """
-    cl_low = float(candle_low)
-    cl_close = float(candle_close)
-    if within_atr_window() and atr_value is not None:
-        widened = max(cl_low, cl_close - 3.0 * float(atr_value))
-        stop_px = min(cl_close, widened)
-    else:
-        stop_px = cl_low
-    return round_tick(stop_px)
-
-# ──────────────────────────────
-# Orders (limit-only)
-# ──────────────────────────────
-def submit_limit(side: str, sym: str, qty: float, px: float):
+def submit_limit(side, sym, qty, price):
+    price = round_tick(price)
     try:
         api.submit_order(
             symbol=sym,
-            qty=str(int(qty)),
             side=side,
+            qty=str(int(qty)),
             type="limit",
+            limit_price=str(price),
             time_in_force="day",
-            limit_price=str(round_tick(px)),
-            extended_hours=True
+            extended_hours=True  # valid RTH + extended
         )
-        log(f"📥 {side.upper()} LIMIT {sym} @ {round_tick(px)} x{int(qty)}")
+        log(f"📥 {side.upper()} LIMIT {sym} @{price} x{int(qty)}")
+        return True
     except Exception as e:
-        log(f"⚠️ submit_limit {sym}: {e}")
+        log(f"❌ {side.upper()} limit error {sym} @{price}: {e}")
+        return False
 
 # ──────────────────────────────
-# PnL logging
+# Guards / Stops
 # ──────────────────────────────
-def log_pnl(sym: str, exit_price: float, reason: str):
+def opening_vol_window() -> bool:
+    now = datetime.now(NY)
+    start = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    end   = now.replace(hour=9, minute=45, second=0, microsecond=0)
+    return start <= now <= end
+
+def entry_range_ok(candle_low, candle_close, max_pct=10.0) -> bool:
     try:
-        # Try to fetch position just before it goes flat (best-effort)
-        qty_before = safe_qty(sym)
-        avg = avg_entry_price(sym)
-        pnl_d = (float(exit_price) - float(avg)) * float(qty_before)
-        pnl_p = ((float(exit_price) / float(avg)) - 1.0) * 100.0 if avg else 0.0
-        log(f"💰 {sym} EXIT filled @{round_tick(exit_price)} (avg {round_tick(avg)}) "
-            f"| PnL {round(pnl_d,2)} ({round(pnl_p,2)}%) | {reason}")
+        low   = float(candle_low)
+        close = float(candle_close)
+        if close <= 0: return False
+        rng = ((close - low) / close) * 100.0
+        log(f"🔎 Range low→close = {rng:.2f}%")
+        return rng <= max_pct
     except Exception:
-        pass
+        return True  # if no fields, allow (alert should usually send both)
+
+def compute_stop(entry_close, signal_low) -> float:
+    """Base stop on signal candle low; during 09:30–09:45 add 3% guard."""
+    entry_close = float(entry_close)
+    signal_low  = float(signal_low)
+    if opening_vol_window():
+        guard = entry_close * 0.03
+        return round_tick(min(signal_low, entry_close - guard))
+    return round_tick(signal_low)
+
+def record_loss(sym):
+    with lock:
+        loss_count[sym] = loss_count.get(sym, 0) + 1
+        if loss_count[sym] >= 2:
+            log(f"🚫 {sym} locked after 2 losses")
+
+def can_trade(sym) -> bool:
+    return loss_count.get(sym, 0) < 2
 
 # ──────────────────────────────
-# Managed Exit (Option-2: target first, then aggressive loop)
+# Aggressive limit-only exit loop
 # ──────────────────────────────
-def managed_exit(sym: str, qty_hint: float, target_price: float = None, mark_stop_loss: bool = False, reason: str = "EXIT"):
-    try:
-        qty = safe_qty(sym) or qty_hint
-        if qty <= 0:
+def aggressive_limit_exit(sym, start_limit, reason="EXIT", max_tries=30, pause=2.0):
+    tries = 0
+    px = round_tick(start_limit)
+
+    # choose tick from current price context
+    _, _, last = latest_bid_ask_trade(sym)
+    tick = 0.01 if (last or 1) >= 1 else (0.001 if (last or 0.1) >= 0.1 else 0.0001)
+
+    while tries < max_tries and safe_qty(sym) > 0:
+        cancel_open_orders(sym)
+        bid, ask, last = latest_bid_ask_trade(sym)
+        ref = bid or last or ask or px
+        # sit one tick under current bid to get filled
+        px = max(round_tick(ref - tick), tick)
+        submit_limit("sell", sym, safe_qty(sym), px)
+        tries += 1
+        log(f"⏱ Aggressive EXIT {sym} {tries}/{max_tries} @ {px}")
+        time.sleep(pause)
+
+    # Log PnL even if partially filled (best effort)
+    qty_closed = "all" if safe_qty(sym) <= 0 else "partial"
+    _log_pnl(sym, px, reason, qty_closed)
+
+def _log_pnl(sym, exit_price, reason, qty_closed="all"):
+    a = avg_entry(sym)
+    if a > 0:
+        pnl_pct = ((float(exit_price) / a) - 1.0) * 100.0
+        log(f"💰 {sym} EXIT @{round_tick(exit_price)} (avg {round_tick(a)}) | PnL {pnl_pct:.2f}% | {reason} | {qty_closed}")
+
+# ──────────────────────────────
+# Stop watcher (uses Alpaca price feed)
+# ──────────────────────────────
+def ensure_watcher(sym):
+    with lock:
+        if sym in watchers and watchers[sym].is_alive():
             return
+        t = threading.Thread(target=_watch_stop, args=(sym,), daemon=True)
+        watchers[sym] = t
+        t.start()
 
-        # 1) Try the target (from alert or stop)
-        limit_px = None
-        if target_price is not None and target_price > 0:
-            limit_px = round_tick(target_price)
-            log(f"🟣 Exit target for {sym} @ {limit_px}")
-            cancel_all(sym)
-            submit_limit("sell", sym, qty, limit_px)
-            time.sleep(8)
-            if safe_qty(sym) <= 0:
-                log_pnl(sym, limit_px, f"{reason}_TARGET")
-                with lock:
-                    stops.pop(sym, None); open_add_tracker.pop(sym, None)
-                if mark_stop_loss:
-                    record_loss(sym)
-                return
-
-        # 2) Aggressive limit loop
-        bid, ask = latest_bid_ask(sym)
-        ref = bid or ask or limit_px or last_trade_price(sym)
-        if ref <= 0:
-            ref = limit_px or 0.01
-        step = price_tick(ref) # one tick per step
-        end_time = datetime.now(NY) + timedelta(minutes=5)
-        px = ref
-        tries = 0
-        while datetime.now(NY) < end_time and safe_qty(sym) > 0:
-            # for sells, keep stepping down by one tick from current bid/last
-            cur_bid, cur_ask = latest_bid_ask(sym)
-            base = cur_bid or last_trade_price(sym) or px
-            px = max(round_tick(base - step), step)
-            cancel_all(sym)
-            submit_limit("sell", sym, safe_qty(sym), px)
-            tries += 1
-            log(f"⏱ Aggressive EXIT {sym} try {tries} @ {px}")
-            time.sleep(3)
-
-        # Final status
-        if safe_qty(sym) <= 0:
-            log_pnl(sym, px, f"{reason}_AGGR")
-            with lock:
-                stops.pop(sym, None); open_add_tracker.pop(sym, None)
-            if mark_stop_loss:
-                record_loss(sym)
-        else:
-            log(f"⚠️ Could not close {sym} fully.")
-    except Exception as e:
-        log(f"❌ managed_exit {sym}: {e}\n{traceback.format_exc()}")
-
-# ──────────────────────────────
-# Background Stop Watcher
-# ──────────────────────────────
-def stop_watcher(sym: str):
-    log(f"👀 Stop watcher started for {sym}")
+def _watch_stop(sym):
+    log(f"👀 Stop watcher ON for {sym}")
     try:
         while True:
-            time.sleep(2)
+            time.sleep(1.0)
             with lock:
                 info = stops.get(sym)
             if info is None:
-                break
+                return
             if safe_qty(sym) <= 0:
                 with lock:
                     stops.pop(sym, None)
-                break
+                    add_used[sym] = False
+                return
 
-            stop_px = info["stop"]
+            stop_lvl = float(info["stop"])
             last = last_trade_price(sym)
             if last <= 0:
                 continue
 
-            if last <= stop_px:
-                log(f"🛑 Stop hit for {sym}: last {round_tick(last)} <= stop {round_tick(stop_px)}")
-                managed_exit(sym, safe_qty(sym), target_price=stop_px, mark_stop_loss=True, reason="STOP")
-                break
+            if last <= stop_lvl:
+                log(f"🛑 STOP HIT {sym}: last {last:.6f} ≤ {stop_lvl:.6f}")
+                cancel_open_orders(sym)
+                # Try stop level first
+                filled = submit_limit("sell", sym, safe_qty(sym), stop_lvl)
+                time.sleep(3)
+                if safe_qty(sym) > 0:
+                    aggressive_limit_exit(sym, stop_lvl, reason="STOP")
+                else:
+                    _log_pnl(sym, stop_lvl, "STOP", "all")
+                    record_loss(sym)
+                with lock:
+                    stops.pop(sym, None)
+                return
     except Exception as e:
-        log(f"❌ stop_watcher {sym}: {e}\n{traceback.format_exc()}")
-    finally:
-        log(f"🧹 Stop watcher ended for {sym}")
-
-def ensure_watcher(sym: str):
-    with lock:
-        t = watchers.get(sym)
-        if t and t.is_alive():
-            return
-        t = threading.Thread(target=stop_watcher, args=(sym,), daemon=True)
-        watchers[sym] = t
-        t.start()
+        log(f"❌ watcher {sym}: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# Trade actions
+# Core actions (driven by alerts)
 # ──────────────────────────────
-def execute_buy(sym: str, qty: float, entry_price: float, candle_low: float, candle_close: float, atr_val: float or None):
+def do_buy(sym, qty, entry_price, candle_low, candle_close):
     if not can_trade(sym):
-        log(f"🚫 Skipping {sym}: reached loss limit.")
+        log(f"🚫 BUY blocked {sym}: loss limit")
         return
     if safe_qty(sym) > 0:
-        log(f"⏩ Already in position {sym}, skip BUY.")
+        log(f"ℹ️ BUY ignored {sym}: already in position")
         return
-    if not valid_candle_range(candle_close, candle_low):
-        log(f"🚫 {sym} BUY blocked: low→close > 10%.")
+    if candle_low is not None and candle_close is not None:
+        if not entry_range_ok(candle_low, candle_close, 10.0):
+            log(f"🚫 BUY blocked {sym}: low→close > 10%")
+            return
+
+    # Place entry
+    if not submit_limit("buy", sym, qty, entry_price):
         return
 
-    stop_price = get_stop(candle_low, candle_close, atr_val)
-    log(f"🟢 BUY {sym} @ {round_tick(entry_price)} | Stop {round_tick(stop_price)}")
-    submit_limit("buy", sym, qty, entry_price)
+    # Compute & arm stop
+    if candle_low is not None and candle_close is not None:
+        stop = compute_stop(candle_close, candle_low)
+        with lock:
+            stops[sym] = {"stop": stop, "entry": round_tick(entry_price)}
+        log(f"🔒 STOP armed {sym} @ {stop}")
+        ensure_watcher(sym)
+    else:
+        log(f"⚠️ No candle_low/close supplied; stop not armed for {sym}")
 
-    with lock:
-        stops[sym] = {"stop": stop_price, "entry": round_tick(entry_price)}
-    ensure_watcher(sym)
-
-def execute_add(sym: str, qty: float, entry_price: float):
+def do_add(sym, qty, entry_price):
     if safe_qty(sym) <= 0:
-        log(f"ℹ️ No open position for {sym}, skip ADD.")
+        log(f"ℹ️ ADD fallback→BUY {sym}")
+        submit_limit("buy", sym, qty, entry_price)
         return
-    if open_add_tracker.get(sym):
-        log(f"ℹ️ Add already used for {sym}.")
+    if add_used.get(sym, False):
+        log(f"ℹ️ ADD ignored {sym}: already added once")
         return
     if not in_profit(sym):
-        log(f"ℹ️ {sym} not in profit, skip ADD.")
+        log(f"🚫 ADD blocked {sym}: not in profit")
         return
 
-    log(f"➕ ADD {sym} @ {round_tick(entry_price)}")
-    submit_limit("buy", sym, qty, entry_price)
-    open_add_tracker[sym] = True
+    if submit_limit("buy", sym, qty, entry_price):
+        add_used[sym] = True
+        log(f"➕ ADD filled/placed {sym}")
 
-def handle_exit(sym: str, qty_hint: float, exit_price: float or None):
-    managed_exit(sym, qty_hint, target_price=exit_price, mark_stop_loss=False, reason="EXIT")
+def do_exit(sym, exit_price=None):
+    if safe_qty(sym) <= 0:
+        log(f"ℹ️ EXIT ignored {sym}: flat")
+        return
+
+    # Try alert target first (if supplied), else jump straight to aggressive loop
+    if exit_price is not None and float(exit_price) > 0:
+        tgt = round_tick(float(exit_price))
+        cancel_open_orders(sym)
+        log(f"🔔 EXIT try target {sym} @ {tgt}")
+        submit_limit("sell", sym, safe_qty(sym), tgt)
+        time.sleep(6)
+        if safe_qty(sym) > 0:
+            aggressive_limit_exit(sym, tgt, reason="EXIT_FALLBACK")
+        else:
+            _log_pnl(sym, tgt, "EXIT_TARGET", "all")
+    else:
+        bid, ask, last = latest_bid_ask_trade(sym)
+        start = bid or last or ask
+        if not start:
+            log(f"⚠️ EXIT {sym}: no reference price; skipping")
+            return
+        aggressive_limit_exit(sym, start, reason="EXIT_NO_TARGET")
 
 # ──────────────────────────────
 # Alert handler (threaded)
-# Expected payload keys (strings/numbers):
-# secret, action in {BUY, ADD, EXIT, HAMMER_BUY, HAMMER_ADD}
-# ticker, quantity, entry_price, exit_price, candle_low, candle_close, atr
 # ──────────────────────────────
-def handle_alert(data: dict):
+def handle_alert(data):
     try:
-        sym = (str(data.get("ticker")) or "").upper()
-        action = (str(data.get("action")) or "").upper()
-        qty = float(data.get("quantity", 100))
-        entry = float(data.get("entry_price", 0) or 0)
-        exitp = float(data.get("exit_price", 0) or 0)
-        candle_low = float(data.get("candle_low", 0) or 0)
-        candle_close= float(data.get("candle_close", 0) or 0)
-        atr_val = data.get("atr", None)
-        atr_val = float(atr_val) if atr_val not in (None, "", "na") else None
+        action       = str(data.get("action","")).upper().strip()
+        sym          = str(data.get("ticker","")).upper().strip()
+        qty          = float(data.get("quantity", 100))
+        entry_price  = data.get("entry_price", None)
+        exit_price   = data.get("exit_price",  None)
+        candle_low   = data.get("candle_low",  None)
+        candle_close = data.get("candle_close",None)
 
-        if not sym:
-            log("⚠️ Missing ticker"); return
+        log(f"🚀 {action} | {sym}")
 
-        log(f"🚀 {action} signal for {sym}")
+        if action == "BUY":
+            if entry_price is None:
+                log("⚠️ BUY missing entry_price")
+                return
+            do_buy(sym, qty, float(entry_price), candle_low, candle_close)
 
-        if action in ("BUY", "HAMMER_BUY"):
-            execute_buy(sym, qty, entry, candle_low, candle_close, atr_val)
-        elif action in ("ADD", "HAMMER_ADD"):
-            execute_add(sym, qty, entry)
+        elif action == "ADD":
+            if entry_price is None:
+                log("⚠️ ADD missing entry_price")
+                return
+            do_add(sym, qty, float(entry_price))
+
         elif action == "EXIT":
-            handle_exit(sym, qty, exitp if exitp > 0 else None)
+            do_exit(sym, float(exit_price) if exit_price else None)
+
         else:
-            log(f"⚠️ Unknown action: {action}")
+            log(f"⚠️ Unknown action '{action}' — ignored")
+
     except Exception as e:
-        log(f"❌ handle_alert error: {e}\n{traceback.format_exc()}")
+        log(f"❌ handle_alert: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# Webhook endpoint (instant 200)
+# Routes
 # ──────────────────────────────
 @app.post("/tv")
 def tv():
-    data = request.get_json(silent=True) or {}
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify(error="Invalid secret"), 403
-    threading.Thread(target=handle_alert, args=(data,), daemon=True).start()
-    return jsonify(ok=True)
+    try:
+        data = request.get_json(silent=True) or {}
+        if data.get("secret") != WEBHOOK_SECRET:
+            return jsonify(error="Invalid secret"), 403
+        threading.Thread(target=handle_alert, args=(data,), daemon=True).start()
+        return jsonify(ok=True)
+    except Exception as e:
+        log(f"❌ /tv error: {e}\n{traceback.format_exc()}")
+        return jsonify(error="server"), 500
 
-# ──────────────────────────────
-# Ping
-# ──────────────────────────────
 @app.get("/ping")
 def ping():
-    return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
+    return jsonify(ok=True, base=ALPACA_BASE_URL, time=datetime.now(NY).isoformat())
 
 # ──────────────────────────────
-# Run (for local dev; Railway/Gunicorn will import app)
+# Main
 # ──────────────────────────────
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8080)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
+
 
 
 
