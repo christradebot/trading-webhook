@@ -1,7 +1,6 @@
 # =========================
 # main.py — Athena + Chris 2025
-# ITG Scalper Bot (Async + Limit-only + Auto Stop Watcher)
-# NightSafe vFinal
+# ITG Scalper Bot (Limit-only, Auto Stop Watcher, Debug Enabled)
 # =========================
 
 from flask import Flask, request, jsonify
@@ -10,7 +9,7 @@ from datetime import datetime, timedelta
 import os, time, json, traceback, pytz, threading
 
 # ──────────────────────────────
-# Environment + API setup
+# Environment / API setup
 # ──────────────────────────────
 ALPACA_KEY_ID     = os.getenv("ALPACA_KEY_ID")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
@@ -22,7 +21,7 @@ app = Flask(__name__)
 NY = pytz.timezone("America/New_York")
 
 # ──────────────────────────────
-# State
+# State trackers
 # ──────────────────────────────
 open_add_tracker = {}
 loss_tracker     = {}
@@ -31,12 +30,13 @@ watchers         = {}
 lock = threading.Lock()
 
 # ──────────────────────────────
-# Helpers
+# Utilities
 # ──────────────────────────────
 def log(msg): print(f"{datetime.now().strftime('%H:%M:%S')} | {msg}")
 
 def round_tick(px):
-    if px is None: return 0
+    if px is None:
+        return 0
     return round(px, 4) if px < 1 else round(px, 2)
 
 def latest_bid_ask(sym):
@@ -50,7 +50,8 @@ def latest_bid_ask(sym):
 
 def last_trade_price(sym):
     bid, ask = latest_bid_ask(sym)
-    if bid > 0: return bid
+    if bid > 0:
+        return bid
     try:
         t = api.get_latest_trade(sym)
         return float(getattr(t, "price", 0.0) or 0.0)
@@ -87,14 +88,14 @@ def cancel_all(sym):
         pass
 
 def update_pnl(sym, price):
-    log(f"💰 Recorded exit for {sym} @ {price}")
+    log(f"💰 Exit recorded for {sym} @ {price}")
 
 # ──────────────────────────────
-# Time / Filters
+# Time / Range filters
 # ──────────────────────────────
 def within_vol_window():
     now = datetime.now(NY).time()
-    return datetime.strptime("09:30","%H:%M").time() <= now <= datetime.strptime("09:45","%H:%M").time()
+    return datetime.strptime("09:30", "%H:%M").time() <= now <= datetime.strptime("09:45", "%H:%M").time()
 
 def get_stop(entry_price, signal_low):
     if within_vol_window():
@@ -113,13 +114,13 @@ def record_loss(sym):
     with lock:
         loss_tracker[sym] = loss_tracker.get(sym, 0) + 1
         if loss_tracker[sym] >= 2:
-            log(f"🚫 {sym} locked out after 2 losses.")
+            log(f"🚫 {sym} locked after 2 losses.")
 
 def can_trade(sym):
     return loss_tracker.get(sym, 0) < 2
 
 # ──────────────────────────────
-# Order submitters
+# Orders (limit-only)
 # ──────────────────────────────
 def submit_limit(side, sym, qty, px):
     try:
@@ -137,23 +138,28 @@ def submit_limit(side, sym, qty, px):
         log(f"⚠️ submit_limit {sym}: {e}")
 
 # ──────────────────────────────
-# Managed Exit
+# Managed Exit (limit-only, aggressive fallback)
 # ──────────────────────────────
 def managed_exit(sym, qty_hint, target_price=None, mark_stop_loss=False):
     try:
         qty = safe_qty(sym) or qty_hint
-        if qty <= 0: return
+        if qty <= 0:
+            return
+
         limit_price = round_tick(target_price) if target_price else 0
         if limit_price <= 0:
             bid, ask = latest_bid_ask(sym)
             limit_price = round_tick(bid or ask)
         if limit_price <= 0:
-            log(f"⚠️ No valid exit price for {sym}, skipping.")
+            log(f"⚠️ No valid exit price for {sym}, skip.")
             return
-        log(f"🟣 Exit target for {sym} @ {limit_price}")
+
+        log(f"🟣 Exit target {sym} @ {limit_price}")
         cancel_all(sym)
         submit_limit("sell", sym, qty, limit_price)
         time.sleep(8)
+
+        # Aggressive fallback (limit only)
         if safe_qty(sym) > 0:
             step = 0.0005 if limit_price < 1 else 0.02
             end_time = datetime.now(NY) + timedelta(minutes=5)
@@ -163,6 +169,7 @@ def managed_exit(sym, qty_hint, target_price=None, mark_stop_loss=False):
                 cancel_all(sym)
                 submit_limit("sell", sym, safe_qty(sym), px)
                 time.sleep(3)
+
         if safe_qty(sym) <= 0:
             update_pnl(sym, limit_price)
             log(f"✅ Closed {sym}")
@@ -173,29 +180,34 @@ def managed_exit(sym, qty_hint, target_price=None, mark_stop_loss=False):
                 record_loss(sym)
         else:
             log(f"⚠️ Could not close {sym} fully.")
+
     except Exception as e:
         log(f"❌ managed_exit {sym}: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# Background Stop Watcher
+# Stop Watcher
 # ──────────────────────────────
 def stop_watcher(sym):
-    log(f"👀 Stop watcher started for {sym}")
+    log(f"👀 Stop watcher active for {sym}")
     try:
         while True:
             time.sleep(5)
             with lock:
                 info = stops.get(sym)
-            if info is None: break
+            if info is None:
+                break
             if safe_qty(sym) <= 0:
                 with lock:
                     stops.pop(sym, None)
                 break
+
             stop_price = info["stop"]
             last = last_trade_price(sym)
-            if last <= 0: continue
+            if last <= 0:
+                continue
+
             if last <= stop_price:
-                log(f"🛑 Stop hit for {sym}: last {last} <= stop {stop_price}")
+                log(f"🛑 Stop hit {sym}: last={last} <= stop={stop_price}")
                 managed_exit(sym, safe_qty(sym), target_price=stop_price, mark_stop_loss=True)
                 break
     except Exception as e:
@@ -212,29 +224,41 @@ def ensure_watcher(sym):
         t.start()
 
 # ──────────────────────────────
-# Trade actions
+# Trade logic
 # ──────────────────────────────
 def execute_buy(sym, qty, entry_price, signal_low):
     if not can_trade(sym):
-        log(f"🚫 Skipping {sym}: reached loss limit."); return
+        log(f"🚫 Skip {sym}: reached loss limit.")
+        return
     if safe_qty(sym) > 0:
-        log(f"⏩ Already in position {sym}, skip BUY."); return
+        log(f"⏩ Already in {sym}, skip BUY.")
+        return
+
+    # Debug candle check
+    log(f"🧩 Candle check {sym}: close={entry_price}, low={signal_low}")
     if not valid_candle_range(entry_price, signal_low):
-        log(f"⚠️ Skipped {sym}: low→close > 10%."); return
+        log(f"⚠️ Skip {sym}: range >10%.")
+        return
+
     stop_price = get_stop(entry_price, signal_low)
     log(f"🟢 BUY {sym} @ {round_tick(entry_price)} | Stop {round_tick(stop_price)}")
     submit_limit("buy", sym, qty, entry_price)
+
     with lock:
         stops[sym] = {"stop": stop_price, "entry": round_tick(entry_price)}
     ensure_watcher(sym)
 
 def execute_add(sym, qty, entry_price):
     if safe_qty(sym) <= 0:
-        log(f"⚠️ No open position for {sym}, skip ADD."); return
+        log(f"⚠️ No open pos for {sym}, skip ADD.")
+        return
     if open_add_tracker.get(sym):
-        log(f"⚠️ Add already used for {sym}."); return
+        log(f"⚠️ Add already used for {sym}.")
+        return
     if not in_profit(sym):
-        log(f"⚠️ Position not in profit for {sym}, skip ADD."); return
+        log(f"⚠️ {sym} not in profit, skip ADD.")
+        return
+
     log(f"➕ ADD {sym} @ {round_tick(entry_price)}")
     submit_limit("buy", sym, qty, entry_price)
     open_add_tracker[sym] = True
@@ -247,43 +271,41 @@ def handle_exit(sym, qty_hint, exit_price):
 # ──────────────────────────────
 def handle_alert(data):
     try:
-        sym        = (data.get("ticker") or "").upper()
-        action     = (data.get("action") or "").upper()
-        qty        = float(data.get("quantity", 100))
-        entry      = float(data.get("entry_price", 0))
-        exitp      = float(data.get("exit_price", 0))
-        signal_low = float(data.get("signal_low", 0))
-        log(f"🚀 {action} signal for {sym}")
-        if action == "BUY": execute_buy(sym, qty, entry, signal_low)
-        elif action == "ADD": execute_add(sym, qty, entry)
-        elif action == "EXIT": handle_exit(sym, qty, exitp)
-        else: log(f"⚠️ Unknown action: {action}")
+        sym         = (data.get("ticker") or "").upper()
+        action      = (data.get("action") or "").upper()
+        qty         = float(data.get("quantity", 100))
+        entry       = float(data.get("entry_price", 0))
+        exitp       = float(data.get("exit_price", 0))
+        signal_low  = float(data.get("signal_low", 0))
+
+        log(f"🚀 {action} {sym}")
+
+        if action == "BUY":
+            execute_buy(sym, qty, entry, signal_low)
+        elif action == "ADD":
+            execute_add(sym, qty, entry)
+        elif action == "EXIT":
+            handle_exit(sym, qty, exitp)
+        else:
+            log(f"⚠️ Unknown action {action}")
     except Exception as e:
-        log(f"❌ handle_alert error: {e}\n{traceback.format_exc()}")
+        log(f"❌ handle_alert {sym if 'sym' in locals() else ''}: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# Webhook endpoint (final fix)
+# Webhook endpoint
 # ──────────────────────────────
 @app.post("/tv")
 def tv():
     data = request.get_json(silent=True) or {}
-
-    # Handles all variants: 'secret', 'Secret', spaces, case, newlines
-    secret_in = (data.get("secret") or data.get("Secret") or "").strip().lower()
-    expected  = (WEBHOOK_SECRET or "").strip().lower()
-
-    if secret_in != expected:
+    if data.get("secret") != WEBHOOK_SECRET:
         return jsonify(error="Invalid secret"), 403
-
     threading.Thread(target=handle_alert, args=(data,), daemon=True).start()
     return jsonify(ok=True)
 
-# ──────────────────────────────
-# Ping
-# ──────────────────────────────
 @app.get("/ping")
 def ping():
     return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
+
 
 
 
