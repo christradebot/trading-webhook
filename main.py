@@ -1,6 +1,6 @@
 # =========================
 # main.py — Athena + Chris 2025
-# ITG Scalper Bot (Limit-only, Auto Stop Watcher, Debug Enabled)
+# ITG Scalper Bot (Limit-only, Auto Stop Watcher, Debug + Live PnL)
 # =========================
 
 from flask import Flask, request, jsonify
@@ -87,8 +87,20 @@ def cancel_all(sym):
     except Exception:
         pass
 
+def live_pnl():
+    """Fetch account equity delta"""
+    try:
+        acc = api.get_account()
+        equity = float(acc.equity or 0)
+        last = float(acc.last_equity or 0)
+        diff = equity - last
+        pct = (diff / last * 100) if last else 0
+        return f"{diff:+.2f} USD ({pct:+.2f}%)"
+    except Exception:
+        return "PnL unavailable"
+
 def update_pnl(sym, price):
-    log(f"💰 Exit recorded for {sym} @ {price}")
+    log(f"💰 Exit recorded {sym} @ {price} | Live PnL: {live_pnl()}")
 
 # ──────────────────────────────
 # Time / Range filters
@@ -138,7 +150,7 @@ def submit_limit(side, sym, qty, px):
         log(f"⚠️ submit_limit {sym}: {e}")
 
 # ──────────────────────────────
-# Managed Exit (limit-only, aggressive fallback)
+# Managed Exit (limit-only)
 # ──────────────────────────────
 def managed_exit(sym, qty_hint, target_price=None, mark_stop_loss=False):
     try:
@@ -159,7 +171,6 @@ def managed_exit(sym, qty_hint, target_price=None, mark_stop_loss=False):
         submit_limit("sell", sym, qty, limit_price)
         time.sleep(8)
 
-        # Aggressive fallback (limit only)
         if safe_qty(sym) > 0:
             step = 0.0005 if limit_price < 1 else 0.02
             end_time = datetime.now(NY) + timedelta(minutes=5)
@@ -185,7 +196,7 @@ def managed_exit(sym, qty_hint, target_price=None, mark_stop_loss=False):
         log(f"❌ managed_exit {sym}: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# Stop Watcher
+# Stop watcher
 # ──────────────────────────────
 def stop_watcher(sym):
     log(f"👀 Stop watcher active for {sym}")
@@ -234,7 +245,6 @@ def execute_buy(sym, qty, entry_price, signal_low):
         log(f"⏩ Already in {sym}, skip BUY.")
         return
 
-    # Debug candle check
     log(f"🧩 Candle check {sym}: close={entry_price}, low={signal_low}")
     if not valid_candle_range(entry_price, signal_low):
         log(f"⚠️ Skip {sym}: range >10%.")
@@ -267,7 +277,7 @@ def handle_exit(sym, qty_hint, exit_price):
     managed_exit(sym, qty_hint, target_price=exit_price, mark_stop_loss=False)
 
 # ──────────────────────────────
-# Alert handler
+# Webhook handler
 # ──────────────────────────────
 def handle_alert(data):
     try:
@@ -279,7 +289,6 @@ def handle_alert(data):
         signal_low  = float(data.get("signal_low", 0))
 
         log(f"🚀 {action} {sym}")
-
         if action == "BUY":
             execute_buy(sym, qty, entry, signal_low)
         elif action == "ADD":
@@ -292,7 +301,7 @@ def handle_alert(data):
         log(f"❌ handle_alert {sym if 'sym' in locals() else ''}: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# Webhook endpoint
+# Flask endpoints
 # ──────────────────────────────
 @app.post("/tv")
 def tv():
@@ -305,6 +314,7 @@ def tv():
 @app.get("/ping")
 def ping():
     return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
+
 
 
 
