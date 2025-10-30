@@ -1,6 +1,6 @@
 # ===============================
 # main.py — Athena + Chris 2025
-# ITG Scalper + Hammer Logic (v4.1 — Auto-Fix TradingView JSON)
+# ITG Scalper + Hammer Logic (v4.2 — Safe Float + JSON Auto-Fix)
 # ===============================
 
 from flask import Flask, request, jsonify
@@ -60,9 +60,19 @@ def cancel_all(sym):
         for o in api.list_orders(status="open", symbols=[sym]): api.cancel_order(o.id)
     except Exception: pass
 
+# safer float conversion
 def ffloat(x, default=0.0):
-    try: return float(x)
-    except Exception: return float(default)
+    """Safe float conversion that handles None, blank strings, and symbols"""
+    try:
+        if x is None:
+            return float(default)
+        if isinstance(x, str):
+            x = x.strip().replace('"','')
+            if x == "" or x.lower() == "none":
+                return float(default)
+        return float(x)
+    except Exception:
+        return float(default)
 
 # ──────────────────────────────
 # STOP / LOSS
@@ -196,7 +206,8 @@ def handle_alert(data):
         act = (data.get("action") or "").upper()
         src = (data.get("source") or "GENERIC").upper()
         qty = ffloat(data.get("quantity"), 100)
-        high  = ffloat(data.get("signal_high"), data.get("entry_price"))
+        # Safe high logic
+        high  = ffloat(data.get("signal_high")) or ffloat(data.get("entry_price"))
         low   = ffloat(data.get("signal_low"), 0)
         close = ffloat(data.get("signal_close"), 0)
         exitp = ffloat(data.get("exit_price"), 0)
@@ -243,6 +254,7 @@ def ping(): return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
 # ──────────────────────────────
 if __name__=="__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT",8080)))
+
 
 
 
