@@ -1,6 +1,6 @@
 # ============================
 # main.py — Athena + Chris 2025
-# ITG Scalper + Validated Hammer/Engulfing (v4.3)
+# ITG Scalper + Validated Hammer/Engulfing (v4.5)
 # ============================
 
 from flask import Flask, request, jsonify
@@ -23,17 +23,24 @@ NY = pytz.timezone("America/New_York")
 # ──────────────────────────────
 # STATE
 # ──────────────────────────────
-stops, watchers, loss_tracker, awaiting_secondary = {}, {}, {}, {}
+stops, watchers, loss_tracker = {}, {}, {}
+awaiting_secondary = {} # after an oversized SCALPER_BUY, wait for hammer/engulfing
+first_trade_done = {} # per-symbol session flag: False until the very first trade is taken
 lock = threading.Lock()
 
 # ──────────────────────────────
 # HELPERS
 # ──────────────────────────────
-def log(msg): print(f"{datetime.now().strftime('%H:%M:%S')} | {msg}", flush=True)
+def log(msg):
+    print(f"{datetime.now().strftime('%H:%M:%S')} | {msg}", flush=True)
 
-def round_tick(px): return round(px, 4) if px < 1 else round(px, 2)
+def round_tick(px):
+    try:
+        return round(px, 4) if px < 1 else round(px, 2)
+    except Exception:
+        return px
 
-def to_float(x, default=0.0):
+def get_float(x, default=0.0):
     try:
         if x is None or (isinstance(x, str) and x.strip() == ""):
             return default
@@ -46,26 +53,31 @@ def latest_bid_ask(sym):
         q = api.get_latest_quote(sym)
         return float(q.bidprice or 0), float(q.askprice or 0)
     except Exception:
-        return 0, 0
+        return 0.0, 0.0
 
 def last_trade_price(sym):
     try:
         t = api.get_latest_trade(sym)
         return float(getattr(t, "price", 0.0) or 0.0)
     except Exception:
-        return 0
+        return 0.0
 
 def safe_qty(sym):
-    try: return float(api.get_position(sym).qty)
-    except Exception: return 0
+    try:
+        return float(api.get_position(sym).qty)
+    except Exception:
+        return 0.0
 
 def avg_entry_price(sym):
-    try: return float(api.get_position(sym).avg_entry_price)
-    except Exception: return 0
+    try:
+        return float(api.get_position(sym).avg_entry_price)
+    except Exception:
+        return 0.0
 
 def cancel_all(sym):
     try:
-        for o in api.list_orders(status="open", symbols=[sym]): api.cancel_order(o.id)
+        for o in api.list_orders(status="open", symbols=[sym]):
+            api.cancel_order(o.id)
     except Exception:
         pass
 
@@ -73,9 +85,8 @@ def cancel_all(sym):
 # STOP / LOSS
 # ──────────────────────────────
 def get_stop(entry_price, signal_low):
-    # Always use the signal candle's low as the stop, per spec
-    stop = signal_low
-    return round_tick(stop)
+    """Stop is ALWAYS the low of the signal candle."""
+    return round_tick(signal_low)
 
 def record_loss(sym):
     with lock:
@@ -83,7 +94,8 @@ def record_loss(sym):
         if loss_tracker[sym] >= 2:
             log(f"🚫 {sym} locked after 2 losses")
 
-def can_trade(sym): return loss_tracker.get(sym, 0) < 2
+def can_trade(sym):
+    return loss_tracker.get(sym, 0) < 2
 
 # ──────────────────────────────
 # ORDER + PnL
@@ -91,8 +103,12 @@ def can_trade(sym): return loss_tracker.get(sym, 0) < 2
 def submit_limit(side, sym, qty, px):
     try:
         api.submit_order(
-            symbol=sym, qty=int(qty), side=side, type="limit",
-            limit_price=round_tick(px), time_in_force="day",
+            symbol=sym,
+            qty=int(qty),
+            side=side,
+            type="limit",
+            limit_price=round_tick(px),
+            time_in_force="day",
             extended_hours=True
         )
         log(f"📥 {side.upper()} LIMIT {sym} @ {round_tick(px)} x{int(qty)}")
@@ -114,110 +130,172 @@ def update_pnl(sym, exit_price, source):
 def managed_exit(sym, qty_hint, target_price=None, mark_stop_loss=False, source="GENERIC"):
     try:
         qty = safe_qty(sym) or qty_hint
-        if qty <= 0: return
+        if qty <= 0:
+            return
         bid, ask = latest_bid_ask(sym)
         px = round_tick(target_price or bid or ask)
+        if px <= 0:
+            return
         cancel_all(sym)
         submit_limit("sell", sym, qty, px)
         time.sleep(5)
         if safe_qty(sym) <= 0:
             update_pnl(sym, px, source)
-            with lock: stops.pop(sym, None)
-            if mark_stop_loss: record_loss(sym)
+            with lock:
+                stops.pop(sym, None)
+            if mark_stop_loss:
+                record_loss(sym)
     except Exception as e:
         log(f"❌ managed_exit {sym}: {e}\n{traceback.format_exc()}")
 
 # ──────────────────────────────
-# STOP WATCHER
+# STOP WATCHER (pre-market safe; polls Alpaca live prices)
 # ──────────────────────────────
 def stop_watcher(sym, source):
     log(f"👀 Watching stop for {sym} ({source})")
     while True:
-        time.sleep(3)
+        time.sleep(2) # poll every 2s
         info = stops.get(sym)
-        if not info or safe_qty(sym) <= 0: break
+        if not info or safe_qty(sym) <= 0:
+            break
+
         stop_price = info["stop"]
+
+        # Live price from Alpaca (trade first, else quote)
         last = last_trade_price(sym)
-        if last and last <= stop_price:
-            log(f"🛑 Stop hit {sym} ({source}) last {last} ≤ {stop_price}")
-            managed_exit(sym, safe_qty(sym), stop_price, True, source); break
+        bid, ask = latest_bid_ask(sym)
+        live = last or bid or ask
+        if live <= 0:
+            continue
+
+        if live <= stop_price:
+            log(f"🛑 Stop triggered for {sym} ({source}) — live {live} ≤ stop {stop_price}")
+            # Tiny buffer to help fill a limit in pre-market
+            sell_px = round_tick(stop_price * 0.999)
+            managed_exit(sym, safe_qty(sym), sell_px, True, source)
+            break
 
 def ensure_watcher(sym, source):
     with lock:
-        if sym in watchers and watchers[sym].is_alive(): return
+        if sym in watchers and watchers[sym].is_alive():
+            return
         t = threading.Thread(target=stop_watcher, args=(sym, source), daemon=True)
-        watchers[sym] = t; t.start()
+        watchers[sym] = t
+        t.start()
 
 # ──────────────────────────────
-# TRADE LOGIC (≤ 11% from low→close, enter at close)
+# TRADE LOGIC
 # ──────────────────────────────
 def valid_candle_range(close_p, low_p):
-    if close_p <= 0: return False
-    rng = (close_p - low_p) / close_p * 100
+    rng = (close_p - low_p) / close_p * 100 if close_p else 0
     log(f"🔎 Range low→close {rng:.2f}%")
-    return rng <= 11
+    return rng <= 11, rng
 
 def execute_buy(sym, qty, entry_price, signal_low, source):
     if not can_trade(sym) or safe_qty(sym) > 0:
         log(f"⚠️ Skipping BUY {sym} ({source}) — locked or already in position")
         return
-    if not valid_candle_range(entry_price, signal_low):
-        log(f"⚠️ Skipping BUY {sym} ({source}) — candle range > 11%")
+    ok, rng = valid_candle_range(entry_price, signal_low)
+    if not ok:
+        log(f"⚠️ Skipping BUY {sym} ({source}) — invalid candle range {rng:.2f}%")
         return
-    stop = get_stop(entry_price, signal_low)
+
+    stop = get_stop(entry_price, signal_low) # always signal low
     log(f"🟢 BUY {sym} ({source}) @ {entry_price} | Stop (signal low) {stop}")
     submit_limit("buy", sym, qty, entry_price)
-    with lock: stops[sym] = {"stop": stop, "entry": entry_price}
+    with lock:
+        stops[sym] = {"stop": stop, "entry": entry_price}
     ensure_watcher(sym, source)
 
-def handle_exit(sym, qty_hint, exit_price, source):
-    log(f"🔴 EXIT {sym} ({source})")
-    managed_exit(sym, qty_hint, exit_price, False, source)
+# ──────────────────────────────
+# ALERT HANDLER (session-aware; no body-break logic)
+# ──────────────────────────────
+BUY_SOURCES_SCALPER = {"SCALPER_BUY"}
+BUY_SOURCES_HAM_ENG = {"HAMMER_EMA5", "ENGULFING_EMA5"}
 
-# ──────────────────────────────
-# ALERT HANDLER (v4.3 — no high-break logic)
-# ──────────────────────────────
 def handle_alert(data):
     try:
         sym = (data.get("ticker") or "").upper()
-        act = (data.get("action") or "").upper() # "BUY" or "EXIT"
+        act = (data.get("action") or "").upper() # "BUY"/"ADD"/"EXIT"
         src = (data.get("source") or "GENERIC").upper()
-        qty = to_float(data.get("quantity"), 100.0)
-        close_p = to_float(data.get("signal_close"), 0.0)
-        low_p = to_float(data.get("signal_low"), 0.0)
-        exit_p = to_float(data.get("exit_price"), 0.0)
+        qty = get_float(data.get("quantity", 100))
+        close_p = get_float(data.get("signal_close", 0))
+        low_p = get_float(data.get("signal_low", 0))
+        exit_p = get_float(data.get("exit_price", 0))
 
-        log(f"🚀 {act} signal for {sym} ({src})")
+        if not sym:
+            log("⚠️ Missing ticker; ignoring alert")
+            return
 
+        # If action is blank but source implies a buy, treat as BUY
+        if act not in {"BUY", "ADD", "EXIT"} and (src in BUY_SOURCES_SCALPER or src in BUY_SOURCES_HAM_ENG):
+            act = "BUY"
+
+        # Log context
         if act == "EXIT":
-            handle_exit(sym, qty, exit_p, src)
+            log(f"🚀 EXIT signal for {sym} ({src})")
+        else:
+            rng = (close_p - low_p) / close_p * 100 if close_p else 0
+            log(f"🚀 {act} signal for {sym} ({src}) | range {rng:.2f}% | first_trade_done={first_trade_done.get(sym, False)}")
+
+        # ─── EXIT ───
+        if act == "EXIT":
+            # After any exit, we DO NOT reset first_trade_done.
+            # Session stays in "scalper-first" mode permanently after the first trade of the day.
+            managed_exit(sym= sym, qty_hint= qty, target_price= exit_p, mark_stop_loss= False, source= src)
+            # Clear awaiting_secondary just to be safe for next cycle
+            awaiting_secondary.pop(sym, None)
             return
 
-        if act != "BUY":
-            log(f"⚠️ Unknown action '{act}'"); return
+        # ─── BUY/ADD paths ───
+        # Normalize ADD to BUY behavior (scale-ins treated like entries)
+        if act in {"BUY", "ADD"}:
+            # 1) BEFORE FIRST TRADE: allow any of the three (Scalper or Hammer/Engulfing)
+            if not first_trade_done.get(sym, False):
+                if src in BUY_SOURCES_SCALPER:
+                    ok, _ = valid_candle_range(close_p, low_p)
+                    if ok:
+                        execute_buy(sym, qty, close_p, low_p, src)
+                        first_trade_done[sym] = True
+                        awaiting_secondary.pop(sym, None)
+                    else:
+                        log(f"⚠️ SCALPER {sym} too large → awaiting valid Hammer/Engulfing for FIRST trade")
+                        awaiting_secondary[sym] = True
+                elif src in BUY_SOURCES_HAM_ENG:
+                    # If we were awaiting due to oversized scalper, or even if not, first trade can be hammer/engulfing
+                    execute_buy(sym, qty, close_p, low_p, src)
+                    first_trade_done[sym] = True
+                    awaiting_secondary.pop(sym, None)
+                else:
+                    log(f"⚠️ Unknown source '{src}' for first trade BUY")
+                return
 
-        # SCALPER_BUY
-        if src == "SCALPER_BUY":
-            if valid_candle_range(close_p, low_p):
-                log(f"🟢 SCALPER {sym} valid — trade executed")
-                awaiting_secondary.pop(sym, None)
-                execute_buy(sym, qty, close_p, low_p, src)
+            # 2) AFTER FIRST TRADE: must start with SCALPER; hammer/engulfing only as secondary
             else:
-                log(f"⚠️ SCALPER {sym} too large → awaiting valid hammer/engulfing")
-                awaiting_secondary[sym] = True
-            return
+                if src in BUY_SOURCES_SCALPER:
+                    ok, _ = valid_candle_range(close_p, low_p)
+                    if ok:
+                        execute_buy(sym, qty, close_p, low_p, src)
+                        awaiting_secondary.pop(sym, None)
+                    else:
+                        log(f"⚠️ SCALPER {sym} too large → awaiting valid Hammer/Engulfing (secondary)")
+                        awaiting_secondary[sym] = True
+                    return
 
-        # HAMMER/ENGULFING (BUY or ADD)
-        if src in ("HAMMER_ENGULFING_BUY", "HAMMER_ENGULFING_ADD"):
-            if awaiting_secondary.get(sym):
-                log(f"🟢 Secondary entry unlocked — {src} for {sym}")
-                awaiting_secondary.pop(sym, None)
-                execute_buy(sym, qty, close_p, low_p, src)
-            else:
-                execute_buy(sym, qty, close_p, low_p, src)
-            return
+                if src in BUY_SOURCES_HAM_ENG:
+                    if awaiting_secondary.get(sym):
+                        log(f"🟢 Secondary entry unlocked — {src} for {sym}")
+                        awaiting_secondary.pop(sym, None)
+                        execute_buy(sym, qty, close_p, low_p, src)
+                    else:
+                        log(f"⚠️ Ignoring {src} for {sym} — post-first trade requires SCALPER first")
+                    return
 
-        log(f"⚠️ Unknown source '{src}' for BUY")
+                log(f"⚠️ Unknown source '{src}' for BUY")
+                return
+
+        # Fallback
+        log(f"⚠️ Unknown action/source combo: action={act} source={src}")
 
     except Exception as e:
         log(f"❌ handle_alert {e}\n{traceback.format_exc()}")
@@ -234,7 +312,8 @@ def tv():
     return jsonify(ok=True)
 
 @app.get("/ping")
-def ping(): return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
+def ping():
+    return jsonify(ok=True, service="tv→alpaca", base=ALPACA_BASE_URL)
 
 # ──────────────────────────────
 # RUN
