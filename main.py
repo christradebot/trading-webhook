@@ -1,6 +1,6 @@
 # ============================
 # main.py — Athena + Chris 2025
-# ITG Scalper + Validated Hammer/Engulfing (v4.2)
+# ITG Scalper + Validated Hammer/Engulfing (v4.3)
 # ============================
 
 from flask import Flask, request, jsonify
@@ -35,7 +35,6 @@ def round_tick(px): return round(px, 4) if px < 1 else round(px, 2)
 
 def to_float(x, default=0.0):
     try:
-        # Treat empty strings and None as default
         if x is None or (isinstance(x, str) and x.strip() == ""):
             return default
         return float(x)
@@ -74,7 +73,8 @@ def cancel_all(sym):
 # STOP / LOSS
 # ──────────────────────────────
 def get_stop(entry_price, signal_low):
-    stop = min(signal_low, entry_price * 0.97)
+    # Always use the signal candle's low as the stop, per spec
+    stop = signal_low
     return round_tick(stop)
 
 def record_loss(sym):
@@ -165,7 +165,7 @@ def execute_buy(sym, qty, entry_price, signal_low, source):
         log(f"⚠️ Skipping BUY {sym} ({source}) — candle range > 11%")
         return
     stop = get_stop(entry_price, signal_low)
-    log(f"🟢 BUY {sym} ({source}) @ {entry_price} | Stop {stop}")
+    log(f"🟢 BUY {sym} ({source}) @ {entry_price} | Stop (signal low) {stop}")
     submit_limit("buy", sym, qty, entry_price)
     with lock: stops[sym] = {"stop": stop, "entry": entry_price}
     ensure_watcher(sym, source)
@@ -175,7 +175,7 @@ def handle_exit(sym, qty_hint, exit_price, source):
     managed_exit(sym, qty_hint, exit_price, False, source)
 
 # ──────────────────────────────
-# ALERT HANDLER (v4.2 — no high-break logic)
+# ALERT HANDLER (v4.3 — no high-break logic)
 # ──────────────────────────────
 def handle_alert(data):
     try:
@@ -193,7 +193,6 @@ def handle_alert(data):
             handle_exit(sym, qty, exit_p, src)
             return
 
-        # Only BUY paths below
         if act != "BUY":
             log(f"⚠️ Unknown action '{act}'"); return
 
@@ -218,7 +217,6 @@ def handle_alert(data):
                 execute_buy(sym, qty, close_p, low_p, src)
             return
 
-        # Anything else
         log(f"⚠️ Unknown source '{src}' for BUY")
 
     except Exception as e:
