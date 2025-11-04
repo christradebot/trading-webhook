@@ -1,430 +1,279 @@
-import json
-import time
-import os
-import requests
-import threading
+import os, json, time, threading
 from datetime import datetime, time as dt_time, timedelta
 from flask import Flask, request, jsonify
-from alpaca.data.requests import StockLatestQuoteRequest
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.timeframe import TimeFrame
+
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, ClosePositionRequest
+from alpaca.trading.requests import LimitOrderRequest, ClosePositionRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 
-# --- Configuration ---
-# Fetch credentials from environment variables
-API_KEY = os.environ.get("ALPACA_API_KEY")
-SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://api.alpaca.markets")
+# ─────────────────────────────────────────────────────────────────────────────
+# CONFIG
+# ─────────────────────────────────────────────────────────────────────────────
+API_KEY   = os.environ.get("ALPACA_API_KEY")
+SECRET    = os.environ.get("ALPACA_SECRET_KEY")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "chrisbot1501")
 
-if not all([API_KEY, SECRET_KEY, BASE_URL]):
-    print("FATAL: Alpaca API credentials not set in environment variables.")
-    # Exit silently if run in an environment without keys
-    exit(1)
+if not API_KEY or not SECRET:
+    print("FATAL: Missing ALPACA_API_KEY/ALPACA_SECRET_KEY in environment.")
+    raise SystemExit(1)
 
-# Initialize Alpaca Clients
-# Note: paper=True routes to paper automatically; BASE_URL is kept for logging/reference.
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+trading_client = TradingClient(API_KEY, SECRET, paper=True)
+data_client    = StockHistoricalDataClient(API_KEY, SECRET)
 
 app = Flask(__name__)
 
-# --- Global State and Constants ---
-# {symbol: {avg_entry: float, qty: float, stop_loss: float, add_used: bool, pnl_percent: float, source: str}}
-POSITIONS = {}
-SECRET_KEY_CHECK = "chrisbot1501"
+# Single source of truth for symbol state
+# STATE[sym] = {"qty": float, "avg_entry": float, "stop": float, "add_used": bool, "source": str}
+STATE = {}
 
-# Risk Management Constants
-MAX_DAILY_TRADES = 10
-MAX_CONCURRENT_POSITIONS = 3
-RANGE_GUARD_THRESHOLD = 0.11  # 11.0% max range (Low to Close)
-OPEN_WINDOW_START = dt_time(9, 30, 0)  # 9:30 AM ET
-OPEN_WINDOW_END = dt_time(9, 45, 0)    # 9:45 AM ET
+# Guards / constants
+RANGE_GUARD = 0.11  # 11%
+OPEN_START  = dt_time(9, 30)
+OPEN_END    = dt_time(9, 45)
 
-# --- Utility Functions ---
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILS
+# ─────────────────────────────────────────────────────────────────────────────
+def log(msg): print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
-def log(message):
-    """Simple logging with timestamp."""
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}", flush=True)
-
-def round_tick(price):
-    """Rounds price to the nearest cent."""
-    return round(price, 2)
-
-def nfloat(x):
-    """Safely converts a string to a float, returning None on failure."""
+def nfloat(v):
     try:
-        # If TradingView variable substitution failed (like {{close}}), return None.
-        return None if x in ("", None) else float(x)
-    except (ValueError, TypeError):
+        if v is None or v == "": return None
+        return float(v)
+    except (TypeError, ValueError):
         return None
 
-def get_market_time():
-    """Returns the current market time (approximate ET)."""
-    # For accuracy you'd call Alpaca clock; this is a simple UTC->ET conversion.
-    now_utc = datetime.utcnow()
-    market_time = now_utc - timedelta(hours=5)  # naive EST/EDT approximation
-    return market_time.time()
+def now_et_time():
+    # Simple UTC→ET approx; for precision use Alpaca clock
+    return (datetime.utcnow() - timedelta(hours=5)).time()
 
-def in_open_window():
-    """Checks if current market time is between 9:30 and 9:45 AM ET."""
-    current_time = get_market_time()
-    return OPEN_WINDOW_START <= current_time <= OPEN_WINDOW_END
+def within_open_window():
+    t = now_et_time()
+    return OPEN_START <= t <= OPEN_END
 
-def get_position(symbol):
-    """Fetches current Alpaca position and updates POSITIONS."""
-    try:
-        alpaca_position = trading_client.get_open_position(symbol)
-        avg_entry = float(alpaca_position.avg_entry_price)
-        qty = float(alpaca_position.qty)
-        pnl_percent = float(alpaca_position.unrealized_plpc) * 100
-
-        if symbol in POSITIONS:
-            POSITIONS[symbol].update({
-                'avg_entry': avg_entry,
-                'qty': qty,
-                'pnl_percent': pnl_percent,
-            })
-        else:
-            POSITIONS[symbol] = {
-                'avg_entry': avg_entry,
-                'qty': qty,
-                'pnl_percent': pnl_percent,
-                'stop_loss': None,
-                'add_used': False,
-                'source': 'EXTERNAL'
-            }
-        return POSITIONS[symbol]
-    except Exception:
-        if symbol in POSITIONS:
-            del POSITIONS[symbol]
-        return None
-
-def cancel_all_orders(symbol):
-    """Cancels all open orders for a given symbol."""
-    try:
-        # alpaca-py has cancel_orders() (all); symbol-specific cancel isn't official.
-        # If symbol-scoped cancel raises, fall back to cancel all.
-        try:
-            trading_client.cancel_orders(symbol)
-        except TypeError:
-            trading_client.cancel_orders()
-        log(f"🧹 Canceled open orders for {symbol}.")
-    except Exception as e:
-        log(f"⚠️ Failed to cancel orders for {symbol}: {e}")
-
-# --- Core Logic ---
+def latest_bid(sym):
+    q = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[sym]))
+    return q[sym].bid_price
 
 def compute_stop(entry, signal_low):
-    """Calculates the stop-loss based on window and signal low."""
-    market_time = get_market_time()
     lo = nfloat(signal_low)
+    if within_open_window():
+        floor_3pct = entry * 0.97
+        return round(min(floor_3pct, lo)) if lo else round(floor_3pct, 2)
+    return round(lo, 2) if lo else None
 
-    # 9:30–9:45: min(signal low, 3% hard floor). If missing, use 3% floor.
-    if OPEN_WINDOW_START <= market_time <= OPEN_WINDOW_END:
-        hard_floor = entry * 0.97
-        if lo is not None and lo > 0:
-            stop = min(lo, hard_floor)
-        else:
-            stop = hard_floor
-        log(f"⏰ Open Window Stop: Entry={entry}, SignalLow={lo}, 3%Floor={hard_floor:.2f} → Stop={stop:.3f}")
-        return round_tick(stop)
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDER PATHS
+# ─────────────────────────────────────────────────────────────────────────────
+def aggressive_close(sym, reason, ref_price=None):
+    """Sell using fast limits, then force market close if needed."""
+    log(f"🏃 Aggressive close {sym} | reason={reason}")
+    try:
+        # Try a few aggressive limits near bid
+        for i in range(4):
+            try:
+                bid = latest_bid(sym)
+                if bid and bid > 0:
+                    pos = trading_client.get_open_position(sym)
+                    if float(pos.qty) <= 0: break
+                    order = LimitOrderRequest(
+                        symbol=sym, qty=pos.qty, side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC, limit_price=round(bid - 0.01, 2)
+                    )
+                    trading_client.submit_order(order)
+                    log(f"  • try {i+1}/4: SELL {sym} @{round(bid-0.01,2)}")
+                    time.sleep(2)
+                else:
+                    break
+            except Exception as e:
+                log(f"    limit error: {e}")
+                time.sleep(1)
 
-    # After 9:45: use signal low only
-    if lo is not None and lo > 0:
-        return round_tick(lo)
-    return None
-
-def aggressive_close(symbol, price_ref, reason):
-    """
-    Executes a market-leaning close using aggressive limit orders.
-    Re-checks available qty each loop.
-    """
-    log(f"🏃 Closing {symbol} aggressively at {price_ref} | Reason={reason}")
-    cancel_all_orders(symbol)
-
-    position_data = get_position(symbol)
-    if not position_data or position_data.get('qty', 0) <= 0:
-        log(f"ℹ️ {symbol} is already flat, aggressive close halted.")
-        return
-
-    MAX_ATTEMPTS = 20
-    for i in range(1, MAX_ATTEMPTS + 1):
-        position_data = get_position(symbol)
-        current_qty = position_data.get('qty', 0) if position_data else 0
-        if current_qty <= 0:
-            log(f"✅ Position {symbol} successfully flat after {i-1} attempts.")
-            break
-
+        # Final assurance: market close
         try:
-            quote = trading_client.get_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[symbol]))
-            best_bid = quote[symbol].bid_price
-            aggressive_limit_price = round_tick(best_bid - 0.01) if best_bid is not None else None
-
-            if aggressive_limit_price is None or aggressive_limit_price <= 0.01:
-                trading_client.close_position(symbol, ClosePositionRequest(percentage=100))
-                log(f"⚠️ {symbol} price too low/None ({best_bid}). Market closing as final resort.")
-                break
-
-            order_data = LimitOrderRequest(
-                symbol=symbol,
-                qty=current_qty,
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                limit_price=aggressive_limit_price
-            )
-            trading_client.submit_order(order_data)
-            log(f"📥 SELL LIMIT {symbol} x{current_qty} @ {aggressive_limit_price} | Aggressive exit {i}/{MAX_ATTEMPTS} ({reason})")
-
+            trading_client.close_position(sym, ClosePositionRequest(percentage=100))
+            log(f"  • final market close submitted for {sym}")
         except Exception as e:
-            log(f"❌ SELL limit error {symbol}: {e}")
-            if "insufficient qty" in str(e).lower():
-                break
+            log(f"  • market close error {sym}: {e}")
 
-        time.sleep(2)
+    except Exception as e:
+        log(f"❌ aggressive_close fatal {sym}: {e}")
 
-    final_pos_data = get_position(symbol)
-    if final_pos_data and final_pos_data.get('qty', 0) > 0:
-        log(f"❗ Failed to fully flat {symbol}. Remaining Qty: {final_pos_data['qty']}")
+def start_stop_watcher(sym):
+    def loop():
+        log(f"🚀 stop watcher started for {sym}")
+        while True:
+            try:
+                if sym not in STATE: break
+                stop = STATE[sym].get("stop")
+                if stop is None: time.sleep(1); continue
 
-    if symbol in POSITIONS:
-        pnl = final_pos_data.get('pnl_percent', 0.0) if final_pos_data else 0.0
-        log(f"💰 EXIT {symbol} completed | reason={reason} | PnL%≈{pnl:.2f}")
-        del POSITIONS[symbol]
+                bid = latest_bid(sym)
+                if bid is not None and bid <= float(stop):
+                    log(f"🛑 {sym} bid {bid:.4f} <= stop {float(stop):.4f} → EXIT")
+                    aggressive_close(sym, "STOP", ref_price=bid)
+                    STATE.pop(sym, None)
+                    break
 
-def watch_loop(symbol, stop):
-    """Monitors price and triggers aggressive close if stop is breached."""
-    log(f"🚀 Started new stop watcher for {symbol}")
+                # Exit if flat
+                try:
+                    pos = trading_client.get_open_position(sym)
+                    if float(pos.qty) <= 0:
+                        STATE.pop(sym, None)
+                        break
+                except Exception:
+                    STATE.pop(sym, None)
+                    break
 
-    if symbol in POSITIONS:
-        POSITIONS[symbol]['stop_loss'] = stop
+                time.sleep(1)
+            except Exception as e:
+                log(f"watcher err {sym}: {e}")
+                time.sleep(2)
+        log(f"🧹 stop watcher ended for {sym}")
+    threading.Thread(target=loop, daemon=True).start()
 
-    market_is_open = True
-    while symbol in POSITIONS and POSITIONS[symbol].get('qty', 0) > 0 and market_is_open:
-        try:
-            position_stop = POSITIONS[symbol]['stop_loss']
-            if position_stop is None:
-                time.sleep(5)
-                continue
+def handle_buy_or_add(data):
+    sym        = data["ticker"]
+    action     = data["action"]  # BUY or ADD
+    qty        = int(data.get("quantity", 100))
+    entry_px   = nfloat(data.get("entry_price"))
+    signal_low = nfloat(data.get("signal_low"))
+    signal_cls = nfloat(data.get("signal_close"))
+    source     = data.get("source", "UNKNOWN")
 
-            quote = trading_client.get_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[symbol]))
-            ref = quote[symbol].bid_price
-
-            if ref is not None and ref <= float(position_stop):
-                log(f"🛑 Stop breach {symbol}: last={ref:.5f} ≤ stop={position_stop:.5f} → aggressive close")
-                aggressive_close(symbol, ref, reason="STOP")
-                break
-
-            time.sleep(1)
-
-        except Exception as e:
-            log(f"⚠️ Stop watcher error for {symbol}: {e}")
-            time.sleep(5)
-
-    log(f"🧹 Stop watcher ended for {symbol}")
-    if symbol in POSITIONS and POSITIONS[symbol].get('stop_loss') is not None:
-        POSITIONS[symbol]['stop_loss'] = None
-
-def check_and_place_buy(data):
-    """Processes BUY and ADD actions with all guards."""
-    symbol = data['ticker']
-    action = data['action']
-    quantity = int(data['quantity'])
-    entry_price = nfloat(data['entry_price'])
-    signal_low = nfloat(data['signal_low'])
-    signal_close = nfloat(data['signal_close'])
-    source = data['source']
-
-    # Pre-checks
-    if symbol in POSITIONS and action == "BUY":
-        log(f"ℹ️ {symbol} BUY ignored; already in a position.")
+    if entry_px is None:
+        log(f"🚫 {sym} {action} rejected: missing entry_price")
         return
 
-    if action == "ADD" and (symbol not in POSITIONS or POSITIONS[symbol]['add_used']):
-        log(f"ℹ️ {symbol} ADD ignored; not in position or ADD already used.")
-        return
-
-    if entry_price is None:
-        log(f"❌ {symbol} {action} failed: Missing valid entry_price.")
-        return
-
-    # Range guard
-    if action == "BUY" and source in ["HAMMER_ENGULFING", "ITG_SCALPER"]:
-        if signal_low is None or signal_close is None:
-            log("ℹ️ Range guard skipped (no valid signal_low/signal_close).")
+    # Range guard for both sources
+    if source in ("ITG_SCALPER", "HAMMER_ENGULFING"):
+        if signal_low is None or signal_cls is None:
+            log(f"ℹ️ {sym} range guard skipped (no low/close)")
         else:
-            price_range = (signal_close - signal_low) / signal_low
-            log(f"🔎 Low→Close range: {price_range:.2%} (≤ {RANGE_GUARD_THRESHOLD:.1%} required)")
-            if price_range > RANGE_GUARD_THRESHOLD:
-                log(f"🚫 {symbol} BUY blocked by {RANGE_GUARD_THRESHOLD:.1%} range guard.")
+            rng = (signal_cls - signal_low) / max(signal_low, 1e-9)
+            log(f"🔍 {sym} low→close range {rng:.2%} (limit {RANGE_GUARD:.0%})")
+            if rng > RANGE_GUARD:
+                log(f"🚫 {sym} {action} blocked by 11% range guard")
                 return
 
-    # ADD must be in profit
-    if action == "ADD":
-        pos_data = POSITIONS[symbol]
-        try:
-            current_price = nfloat(
-                trading_client.get_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[symbol]))[symbol].bid_price
-            )
-        except Exception as e:
-            log(f"⚠️ Failed to fetch current bid for ADD on {symbol}: {e}")
-            current_price = None
-
-        if current_price is None or current_price <= pos_data['avg_entry']:
-            log(f"🚫 {symbol} ADD blocked: Not in profit (current={current_price}, avg={pos_data['avg_entry']}).")
-            return
-
-    # Execute order
-    try:
-        order_data = LimitOrderRequest(
-            symbol=symbol,
-            qty=quantity,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.GTC,
-            limit_price=entry_price
-        )
-        trading_client.submit_order(order_data)
-
-        stop_loss = compute_stop(entry_price, signal_low)
-
-        if symbol not in POSITIONS:
-            POSITIONS[symbol] = {
-                'avg_entry': entry_price,
-                'qty': 0,  # updated later by get_position()
-                'stop_loss': stop_loss,
-                'add_used': (action == "ADD"),
-                'source': source
-            }
-        elif action == "ADD":
-            POSITIONS[symbol]['add_used'] = True
-
-        log(f"📥 BUY LIMIT {symbol} x{quantity} @ {entry_price}")
-        log(f"✅ {symbol} {action} placed @ {entry_price} | stop={stop_loss} | src={source}")
-
-        threading.Thread(target=watch_loop, args=(symbol, stop_loss), daemon=True).start()
-
-    except Exception as e:
-        log(f"❌ Failed to submit {action} order for {symbol}: {e}")
-
-def check_and_place_exit(data):
-    """Processes EXIT actions (Target hit or manual close)."""
-    symbol = data['ticker']
-    exit_price = nfloat(data.get('exit_price'))
-
-    pos_data = get_position(symbol)
-    if not pos_data:
-        log(f"ℹ️ {symbol} EXIT ignored; flat.")
+    if action == "BUY" and sym in STATE:
+        log(f"ℹ️ {sym} BUY ignored: already long")
         return
 
-    cancel_all_orders(symbol)
-
-    if exit_price is not None:
-        log(f"🔔 {symbol} EXIT try alert target @{exit_price}")
+    if action == "ADD":
+        if sym not in STATE:
+            log(f"ℹ️ {sym} ADD ignored: not in position")
+            return
+        if STATE[sym].get("add_used"):
+            log(f"ℹ️ {sym} ADD ignored: already used")
+            return
         try:
-            order_data = LimitOrderRequest(
-                symbol=symbol,
-                qty=pos_data['qty'],
-                side=OrderSide.SELL,
-                time_in_force=TimeInForce.GTC,
-                limit_price=exit_price
-            )
-            trading_client.submit_order(order_data)
-
-            time.sleep(6)
-
-            pos_data = get_position(symbol)
-            if pos_data and pos_data.get('qty', 0) > 0:
-                log(f"⏱ {symbol} target limit not filled. Starting aggressive exit fallback.")
-                aggressive_close(symbol, exit_price, reason="EXIT_ALERT_FALLBACK")
-
+            bid = latest_bid(sym)
+            if bid is None or bid <= STATE[sym]["avg_entry"]:
+                log(f"🚫 {sym} ADD blocked: not in profit")
+                return
         except Exception as e:
-            log(f"❌ Failed to submit target limit order for {symbol}: {e}")
-            aggressive_close(symbol, exit_price, reason="EXIT_ALERT_TARGET_FAIL")
+            log(f"bid check failed for ADD {sym}: {e}")
+            return
 
-    else:
-        log(f"🔔 {symbol} EXIT received with no price. Starting aggressive market close.")
-        try:
-            quote = trading_client.get_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[symbol]))
-            current_ref_price = quote[symbol].bid_price
-            aggressive_close(symbol, current_ref_price, reason="EXIT_ALERT_MARKET")
-        except Exception as e:
-            log(f"❌ Failed to get quote for aggressive market exit: {e}")
-            trading_client.close_position(symbol, ClosePositionRequest(percentage=100))
-            log(f"⚠️ {symbol} simple market close triggered.")
+    try:
+        order = LimitOrderRequest(
+            symbol=sym, qty=qty, side=OrderSide.BUY,
+            time_in_force=TimeInForce.GTC, limit_price=round(entry_px, 2)
+        )
+        trading_client.submit_order(order)
+        log(f"📥 {action} {sym} x{qty} @ {round(entry_px,2)} [{source}]")
 
-# --- Async wrapper for webhook work ---
+        stop = compute_stop(entry_px, signal_low)
+        state = STATE.get(sym, {"qty": 0, "avg_entry": entry_px})
+        state.update({
+            "source": source,
+            "stop": stop,
+            "add_used": state.get("add_used", False) or (action == "ADD"),
+            "avg_entry": state.get("avg_entry", entry_px)
+        })
+        STATE[sym] = state
+        start_stop_watcher(sym)
 
-def process_signal(data):
-    """Fire-and-forget processing so /tv can return immediately."""
+    except Exception as e:
+        log(f"❌ submit {action} error {sym}: {e}")
+
+def handle_exit(data):
+    sym       = data["ticker"]
+    exit_px   = nfloat(data.get("exit_price"))
+
+    try:
+        if exit_px is not None:
+            # place a quick limit first
+            try:
+                pos = trading_client.get_open_position(sym)
+                if float(pos.qty) > 0:
+                    order = LimitOrderRequest(
+                        symbol=sym, qty=pos.qty, side=OrderSide.SELL,
+                        time_in_force=TimeInForce.GTC, limit_price=round(exit_px, 2)
+                    )
+                    trading_client.submit_order(order)
+                    log(f"🔔 EXIT try {sym} @ {round(exit_px,2)}")
+                    time.sleep(4)
+            except Exception as e:
+                log(f"limit exit submit err {sym}: {e}")
+
+        # ensure flat
+        aggressive_close(sym, "EXIT_ALERT", ref_price=exit_px)
+        STATE.pop(sym, None)
+
+    except Exception as e:
+        log(f"❌ EXIT error {sym}: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# BACKGROUND DISPATCH
+# ─────────────────────────────────────────────────────────────────────────────
+def dispatch(data):
     try:
         action = data.get("action")
-        if action in ["BUY", "ADD"]:
-            check_and_place_buy(data)
+        if action in ("BUY", "ADD"):
+            handle_buy_or_add(data)
         elif action == "EXIT":
-            check_and_place_exit(data)
+            handle_exit(data)
         else:
-            log(f"⚠️ Unknown action received in background worker: {action}")
+            log(f"⚠️ unknown action: {action}")
     except Exception as e:
-        log(f"❌ Background process_signal error: {e}")
+        log(f"dispatch error: {e}")
 
-# --- Flask Webhook Endpoint ---
+# ─────────────────────────────────────────────────────────────────────────────
+# ROUTES
+# ─────────────────────────────────────────────────────────────────────────────
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "time": datetime.utcnow().isoformat()})
+
+@app.route("/echo", methods=["POST"])
+def echo():
+    data = request.get_json(force=True) or {}
+    return jsonify({"received": data, "valid_secret": data.get("secret") == WEBHOOK_SECRET})
 
 @app.route("/tv", methods=["POST"])
-def webhook_handler():
-    """Receives webhook signals from TradingView."""
-    try:
-        data = request.get_json(force=True) or {}
+def tv():
+    data = request.get_json(force=True) or {}
+    # auth first
+    if data.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"error": "Invalid secret"}), 403
+    # required fields
+    if not data.get("action") or not data.get("ticker"):
+        return jsonify({"error": "Missing action/ticker"}), 400
 
-        # Authentication and validation (fast path)
-        if data.get("secret") != SECRET_KEY_CHECK:
-            log("🚫 Unauthorized access attempt.")
-            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+    log(f"📡 {data.get('action')} {data.get('ticker')} | src={data.get('source')}")
+    # immediate 200 to avoid 499s
+    threading.Thread(target=dispatch, args=(data,), daemon=True).start()
+    return jsonify({"status": "ok"}), 200
 
-        action = data.get("action")
-        symbol = data.get("ticker")
-        if not action or not symbol:
-            log("❌ Invalid payload: Missing action or ticker.")
-            return jsonify({"status": "error", "message": "Missing action/ticker"}), 400
-
-        log(f"📡 Received {action} signal for {symbol} | Source: {data.get('source')}")
-
-        # ✅ Immediately return and do the heavy work in background to avoid 499 timeouts
-        threading.Thread(target=process_signal, args=(data,), daemon=True).start()
-        return jsonify({"status": "ok", "message": "Signal received"}), 200
-
-    except Exception as e:
-        log(f"❌ Webhook processing error: {e}. Data: {request.data}")
-        return jsonify({"status": "error", "message": str(e)}), 500
-
-# --- Market Time Logging for Debugging ---
-
-def log_market_open():
-    """Logs when the open window starts and ends."""
-    current_date = datetime.now().date()
-
-    def get_market_datetime(time_obj):
-        # Convert ET time to approximate UTC for comparison with datetime.utcnow()
-        dt_utc = datetime.combine(current_date, time_obj) + timedelta(hours=5)
-        return dt_utc
-
-    open_start_utc = get_market_datetime(OPEN_WINDOW_START)
-    open_end_utc = get_market_datetime(OPEN_WINDOW_END)
-
-    while True:
-        now = datetime.utcnow()
-        if now.hour == open_start_utc.hour and now.minute == open_start_utc.minute and now.second < 10:
-            log("🟢 Market Open Window STARTED (9:30 AM ET)")
-        elif now.hour == open_end_utc.hour and now.minute == open_end_utc.minute and now.second < 10:
-            log("🔴 Market Open Window ENDED (9:45 AM ET)")
-        time.sleep(10)
-
-# Start the market time logger in a background thread
-threading.Thread(target=log_market_open, daemon=True).start()
-
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # In production, gunicorn runs this; this path is for local testing.
+    # Local run (Railway/Gunicorn will call app externally)
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
