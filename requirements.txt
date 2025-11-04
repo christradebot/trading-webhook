@@ -1,5 +1,7 @@
 Flask==2.3.3
 gunicorn==21.2.0
-alpaca-trade-api==0.43.2
+requests==2.31.0
+alpaca-py==0.21.0
+
 
 
