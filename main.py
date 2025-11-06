@@ -1,6 +1,6 @@
 # main.py — Alpaca Paper-Trading Bot with TradingView Integration
 # Author: Chris + Athena (2025)
-# Uses the official alpaca-py SDK — compatible with Railway deployment
+# Enhanced: Secure webhook check, trade-flatten safety, duplicate prevention
 
 import os
 import json
@@ -9,7 +9,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest, ClosePositionRequest
 
 # ─────────────────────────────────────────────
 # Flask App
@@ -39,7 +39,7 @@ except Exception as e:
     print(f"❌ Failed to connect to Alpaca: {e}")
 
 # ─────────────────────────────────────────────
-# Helper: fetch latest quote (for limit orders)
+# Helper: Fetch latest quote for limit orders
 # ─────────────────────────────────────────────
 def get_latest_price(symbol: str) -> float:
     try:
@@ -53,6 +53,32 @@ def get_latest_price(symbol: str) -> float:
         return None
 
 # ─────────────────────────────────────────────
+# Helper: Flatten open position (close all)
+# ─────────────────────────────────────────────
+def flatten_position(symbol: str):
+    try:
+        print(f"⚙️ Closing any open {symbol} positions before new trade...")
+        trading_client.close_position(symbol)
+        print(f"✅ Flattened position for {symbol}")
+    except Exception as e:
+        print(f"ℹ️ No open position to flatten for {symbol} (or already flat). {e}")
+
+# ─────────────────────────────────────────────
+# Helper: Check if a position is already open
+# ─────────────────────────────────────────────
+def has_open_position(symbol: str) -> bool:
+    try:
+        positions = trading_client.get_all_positions()
+        for p in positions:
+            if p.symbol.upper() == symbol.upper():
+                print(f"⚠️ Position already open for {symbol}: qty={p.qty}")
+                return True
+        return False
+    except Exception as e:
+        print(f"⚠️ Could not fetch positions: {e}")
+        return False
+
+# ─────────────────────────────────────────────
 # Core webhook handler
 # ─────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
@@ -62,27 +88,38 @@ def webhook():
     except Exception:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    # Optional: security check
-    if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
-        print("❌ Unauthorized webhook attempt.")
+    # ── Secure secret check (case- & space-insensitive)
+    incoming_secret = (data.get("secret") or "").strip()
+    expected_secret = (WEBHOOK_SECRET or "").strip()
+
+    if incoming_secret.lower() != expected_secret.lower():
+        print(f"❌ Unauthorized webhook attempt — received: '{incoming_secret}' expected: '{expected_secret}'")
         return jsonify({"error": "Unauthorized"}), 403
 
-    action = data.get("action")
-    symbol = data.get("ticker") or data.get("symbol")
+    # ── Extract core fields
+    action = data.get("action", "").upper()
+    symbol = (data.get("ticker") or data.get("symbol") or "").upper()
     qty = int(data.get("quantity", 1))
     order_type = data.get("type", "market").lower()
 
     if not symbol or not action:
         return jsonify({"error": "Missing action or ticker"}), 400
 
-    side = OrderSide.BUY if action.upper() == "BUY" else OrderSide.SELL
-    limit_price = None
-
-    # Get live quote if limit order
-    if order_type == "limit":
-        limit_price = get_latest_price(symbol)
-
     print(f"📩 Webhook received: {data}")
+
+    # ── Determine order side
+    side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
+
+    # ── Flatten before new trades
+    flatten_position(symbol)
+
+    # ── Prevent duplicate buys
+    if has_open_position(symbol) and action == "BUY":
+        print(f"⚠️ Skipping BUY — position already open for {symbol}")
+        return jsonify({"status": "ignored", "reason": "position already open"}), 200
+
+    # ── Get latest price if needed
+    limit_price = get_latest_price(symbol) if order_type == "limit" else None
 
     try:
         if order_type == "limit" and limit_price:
@@ -102,7 +139,7 @@ def webhook():
             )
 
         trading_client.submit_order(order)
-        print(f"✅ {action.upper()} order submitted: {symbol} x{qty}")
+        print(f"✅ {action} order submitted: {symbol} x{qty}")
         return jsonify({"status": "success", "order": str(order)}), 200
 
     except Exception as e:
@@ -114,7 +151,7 @@ def webhook():
 # ─────────────────────────────────────────────
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
-    return webhook()  # reuse the same logic
+    return webhook()  # reuse same logic
 
 # ─────────────────────────────────────────────
 # Root route — sanity check
@@ -124,11 +161,12 @@ def home():
     return jsonify({"status": "running", "account": str(account.status)}), 200
 
 # ─────────────────────────────────────────────
-# Main
+# Main entry point
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
