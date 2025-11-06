@@ -1,4 +1,4 @@
-# main.py — Clean Alpaca Paper-Trading Webhook Bot
+# main.py — Alpaca Paper-Trading Bot with TradingView Integration
 # Author: Chris + Athena (2025)
 # Uses the official alpaca-py SDK — compatible with Railway deployment
 
@@ -21,7 +21,7 @@ app = Flask(__name__)
 # ─────────────────────────────────────────────
 API_KEY = os.environ.get("APCA_API_KEY_ID")
 SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "chrisbot1501")  # default fallback
 
 if not API_KEY or not SECRET_KEY:
     raise SystemExit("❌ Missing Alpaca API credentials — set APCA_API_KEY_ID and APCA_API_SECRET_KEY in Railway.")
@@ -53,7 +53,7 @@ def get_latest_price(symbol: str) -> float:
         return None
 
 # ─────────────────────────────────────────────
-# Webhook endpoint (TradingView → Alpaca)
+# Core webhook handler
 # ─────────────────────────────────────────────
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -62,18 +62,23 @@ def webhook():
     except Exception:
         return jsonify({"error": "Invalid JSON"}), 400
 
-    # Optional: simple security check
+    # Optional: security check
     if WEBHOOK_SECRET and data.get("secret") != WEBHOOK_SECRET:
+        print("❌ Unauthorized webhook attempt.")
         return jsonify({"error": "Unauthorized"}), 403
 
     action = data.get("action")
     symbol = data.get("ticker") or data.get("symbol")
     qty = int(data.get("quantity", 1))
-    side = OrderSide.BUY if action == "BUY" else OrderSide.SELL
     order_type = data.get("type", "market").lower()
+
+    if not symbol or not action:
+        return jsonify({"error": "Missing action or ticker"}), 400
+
+    side = OrderSide.BUY if action.upper() == "BUY" else OrderSide.SELL
     limit_price = None
 
-    # Optional: get live market price if needed
+    # Get live quote if limit order
     if order_type == "limit":
         limit_price = get_latest_price(symbol)
 
@@ -97,12 +102,19 @@ def webhook():
             )
 
         trading_client.submit_order(order)
-        print(f"✅ {action} order submitted: {symbol} x{qty}")
+        print(f"✅ {action.upper()} order submitted: {symbol} x{qty}")
         return jsonify({"status": "success", "order": str(order)}), 200
 
     except Exception as e:
         print(f"❌ Order submission failed: {e}")
         return jsonify({"status": "error", "message": str(e)}), 500
+
+# ─────────────────────────────────────────────
+# Alternate endpoint for TradingView alerts (/tv)
+# ─────────────────────────────────────────────
+@app.route("/tv", methods=["POST"])
+def tv_webhook():
+    return webhook()  # reuse the same logic
 
 # ─────────────────────────────────────────────
 # Root route — sanity check
@@ -117,6 +129,7 @@ def home():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
