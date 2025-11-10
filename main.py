@@ -6,13 +6,13 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from flask import Flask, request, jsonify
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest, ClosePositionRequest
+from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
 # ──────────────────────────────────────────────
-# ENVIRONMENT
+# ENVIRONMENT VARIABLES
 # ──────────────────────────────────────────────
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
@@ -78,13 +78,14 @@ def losses_for(symbol):
     return loss_counts.get(key, {}).get(symbol, 0)
 
 # ──────────────────────────────────────────────
-# BACKGROUND WORKER
+# ENTRY WORKER
 # ──────────────────────────────────────────────
 def entry_worker():
     while True:
         try:
             reset_daily_state_if_needed()
             now = datetime.now(tz=tz_et)
+
             for sym, st in list(pending_entries.items()):
                 if st["placed"]:
                     continue
@@ -107,14 +108,14 @@ def entry_worker():
                         )
                         st["placed"] = True
                         st["entry_limit"] = limit_price
-                        print(f"✅ BUY placed {sym} x{st['qty']} @ {limit_price} (source={st['source']})", flush=True)
                         open_trades[sym] = {"entry": limit_price, "qty": st["qty"]}
+                        print(f"✅ BUY placed {sym} x{st['qty']} @ {limit_price} (source={st['source']})", flush=True)
                     except Exception as e:
                         print(f"❌ BUY submit failed {sym}: {e}", flush=True)
 
-            # Auto-close at 19:59 ET
+            # 19:59 ET forced closure
             if now.hour == 19 and now.minute == 59:
-                force_close_all(now)
+                force_close_all()
                 time.sleep(5)
         except Exception as e:
             print(f"⚠️ entry_worker error: {e}", flush=True)
@@ -142,7 +143,7 @@ def chase_sell(symbol, qty, target_close):
     except Exception as e:
         print(f"❌ SELL failed {symbol}: {e}", flush=True)
 
-def force_close_all(now_et):
+def force_close_all():
     try:
         positions = trading.get_all_positions()
         if not positions:
@@ -197,12 +198,19 @@ def tv():
         print(f"⛔ Unauthorized webhook attempt: {payload}", flush=True)
         return jsonify({"ok": False, "error": "unauthorized"}), 401
 
-    if "ticker" not in payload or not payload["ticker"]:
-        print(f"⛔ Missing ticker in payload: {payload}", flush=True)
-        return jsonify({"ok": False, "error": "missing_ticker"}), 400
-
     action = str(payload.get("action", "")).upper().strip()
     symbol = str(payload.get("ticker", "")).upper().strip()
+
+    # Handle blank ticker dynamically
+    if not symbol:
+        possible_tv_field = payload.get("message") or payload.get("tv_ticker") or ""
+        symbol = str(possible_tv_field).upper().strip()
+        if not symbol:
+            symbol = "UNKNOWN"
+            print(f"⚠️ Blank ticker received — using placeholder. Payload: {payload}", flush=True)
+        else:
+            print(f"⚙️ Auto-filled ticker from message: {symbol}", flush=True)
+
     qty = int(payload.get("quantity", 0))
     source = str(payload.get("source", "UNKNOWN"))
     target_close = float(payload.get("signal_close", 0.0))
@@ -210,6 +218,7 @@ def tv():
     print(f"✅ Parsed payload: action={action} symbol={symbol} qty={qty} source={source}", flush=True)
     reset_daily_state_if_needed()
 
+    # BUY logic
     if action == "BUY":
         if losses_for(symbol) >= 2:
             print(f"🚫 Blocked BUY for {symbol}: 2-loss daily limit hit.", flush=True)
@@ -226,6 +235,7 @@ def tv():
         print(f"🕒 Pending BUY for {symbol} x{qty} ({source}) at next bar {nb.strftime('%H:%M:%S ET')}", flush=True)
         return jsonify({"ok": True, "pending": True, "symbol": symbol})
 
+    # SELL logic
     elif action == "SELL":
         if symbol in pending_entries:
             del pending_entries[symbol]
@@ -241,6 +251,7 @@ def tv():
         entry_info = open_trades.get(symbol)
         if entry_info and target_close < entry_info["entry"]:
             inc_loss(symbol)
+
         print(f"📩 SELL for {symbol} x{qty} target_close={target_close}", flush=True)
         chase_sell(symbol, qty, target_close)
         if symbol in open_trades:
@@ -251,7 +262,7 @@ def tv():
         return jsonify({"ok": False, "error": "unknown_action"}), 400
 
 # ──────────────────────────────────────────────
-# WSGI
+# MAIN
 # ──────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8080")))
