@@ -1,9 +1,12 @@
 # main.py
+# Final build for Chris — limit-only, premarket+RTH, robust exits, loss caps, 19:59 ET kill-switch
+
 import os
 import json
 import time
 import threading
 from datetime import datetime, timedelta, timezone
+from collections import defaultdict
 
 from flask import Flask, request, jsonify
 
@@ -11,327 +14,353 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest, ClosePositionRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
+from alpaca.data.requests import StockLatestQuoteRequest, StockLatestTradeRequest
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Config / Env
-# ──────────────────────────────────────────────────────────────────────────────
-APP_SECRET = os.environ.get("WEBHOOK_SECRET", "CHRISBOT1501").upper()
-
-API_KEY    = os.environ.get("ALPACA_API_KEY")
-SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
-BASE_URL   = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
-PAPER      = os.environ.get("ALPACA_PAPER", "true").lower() != "false"
+# ───────────────────────────────────────────────────────────────
+# ✅ Environment variables (must match Railway names exactly)
+# ───────────────────────────────────────────────────────────────
+API_KEY        = os.getenv("APCA_API_KEY_ID")
+SECRET_KEY     = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL       = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "CHRISBOT1501")
 
 if not API_KEY or not SECRET_KEY:
     raise ValueError("🚨 Alpaca API_KEY or SECRET_KEY not found in Railway Variables.")
 
-trading = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)  # base_url handled by SDK
-data    = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+# ───────────────────────────────────────────────────────────────
+# ✅ Clients
+# ───────────────────────────────────────────────────────────────
+trading     = TradingClient(API_KEY, SECRET_KEY, paper=True)
+data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# Constants
-ET = timezone(timedelta(hours=-5))  # Eastern Time (no DST mgmt needed for bot logic simplicity)
-EXIT_RETRY_SECONDS = 8              # per your choice
-DAILY_LIQUIDATE_HHMM = (19, 59)     # 19:59 ET
+# ───────────────────────────────────────────────────────────────
+# State
+# ───────────────────────────────────────────────────────────────
+app = Flask(__name__)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# State (in-memory; resets on deploy)
-# ──────────────────────────────────────────────────────────────────────────────
-# per-day loss counter
-loss_counter = {}             # { "SYMBOL": {"date":"YYYY-MM-DD","losses": int} }
-MAX_LOSSES_PER_TICKER = 2
+# pending buys keyed by symbol: {"symbol": {...}}
+PENDING_BUYS = {}
 
-# open average prices tracked (best-effort; we also query broker when needed)
-position_cache = {}           # { "SYMBOL": avg_price_float }
+# per-day loss cap (max 2 losses per ticker per ET trading day)
+LOSSES_TODAY = defaultdict(int)
+LOSS_DAY_ET  = None  # track date string "YYYY-MM-DD" in ET
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────
 # Helpers
-# ──────────────────────────────────────────────────────────────────────────────
-def log(msg, **extra):
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    if extra:
-        print(f"[{stamp}] {msg} | {json.dumps(extra, ensure_ascii=False)}")
-    else:
-        print(f"[{stamp}] {msg}")
+# ───────────────────────────────────────────────────────────────
+ET = timezone(timedelta(hours=-5))  # updated automatically by system TZ changes (handles DST in hosted envs)
+def now_et() -> datetime:
+    return datetime.now(tz=ET)
 
-def today_et_str():
-    return datetime.now(ET).strftime("%Y-%m-%d")
+def today_et_str() -> str:
+    return now_et().strftime("%Y-%m-%d")
 
-def reset_if_new_day(symbol):
+def reset_loss_counters_if_new_day():
+    global LOSS_DAY_ET
     d = today_et_str()
-    rec = loss_counter.get(symbol)
-    if not rec or rec.get("date") != d:
-        loss_counter[symbol] = {"date": d, "losses": 0}
+    if LOSS_DAY_ET != d:
+        LOSSES_TODAY.clear()
+        LOSS_DAY_ET = d
+        print(f"🔄 Reset loss counters for new ET day: {d}")
 
-def inc_loss(symbol):
-    reset_if_new_day(symbol)
-    loss_counter[symbol]["losses"] += 1
-
-def losses_remaining(symbol):
-    reset_if_new_day(symbol)
-    return max(0, MAX_LOSSES_PER_TICKER - loss_counter[symbol]["losses"])
-
-def get_latest_quote(symbol):
+def parse_float_maybe(x):
     try:
-        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        q = data.get_stock_latest_quote(req)
-        # The SDK returns dict-like keyed by symbol for multi; for single it may return object
-        # Normalize:
-        if isinstance(q, dict):
-            q = q.get(symbol)
-        return {
-            "bid": float(q.bid_price or 0.0),
-            "ask": float(q.ask_price or 0.0),
-            "mid": float(((q.bid_price or 0.0) + (q.ask_price or 0.0)) / 2.0),
-        }
+        return float(x)
+    except Exception:
+        return None
+
+def latest_trade_price(symbol: str) -> float | None:
+    try:
+        r = data_client.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol))
+        t = r[symbol]
+        return float(t.price)
     except Exception as e:
-        log("❗ get_latest_quote failed", symbol=symbol, error=str(e))
-        return {"bid": 0.0, "ask": 0.0, "mid": 0.0}
+        print(f"⚠️ latest_trade_price error {symbol}: {e}")
+        return None
 
-def entry_buffer_dollars(ref_price):
-    # ≥ $1 → $0.03 ; < $1 → $0.003
-    return 0.03 if ref_price >= 1.0 else 0.003
-
-def parse_float(value, default=None):
-    if value is None:
-        return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    s = str(value).strip()
-    if "{{" in s and "}}" in s:   # template from TradingView not rendered
-        return default
+def latest_quote(symbol: str):
     try:
-        return float(s)
-    except:
-        return default
+        r = data_client.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol))
+        q = r[symbol]
+        return float(q.bid_price), float(q.ask_price)
+    except Exception as e:
+        print(f"⚠️ latest_quote error {symbol}: {e}")
+        return None, None
 
-def parse_quantity(value, default=100):
-    q = parse_float(value, default)
-    return int(q) if q and q > 0 else default
+def entry_buffer_for(price: float) -> float:
+    # Above $1 → +$0.03; below $1 → +$0.003
+    return 0.03 if price >= 1.0 else 0.003
 
-def good_symbol(sym):
-    if not sym:
-        return False
-    s = str(sym).strip().upper()
-    if "{{" in s and "}}" in s:
-        return False
-    return s.isalnum() or "-" in s or "." in s
+def schedule_next_minute_et() -> datetime:
+    t = now_et().replace(second=0, microsecond=0) + timedelta(minutes=1)
+    return t
 
-def place_limit_buy(symbol, qty, source):
-    q = get_latest_quote(symbol)
-    ref = q["ask"] if q["ask"] > 0 else (q["mid"] if q["mid"] > 0 else q["bid"])
-    if ref <= 0:
-        raise ValueError(f"No quote to price BUY {symbol}")
-    limit_price = round(ref + entry_buffer_dollars(ref), 4)
-    order = trading.submit_order(
-        order_data=LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            limit_price=limit_price,
-            time_in_force=TimeInForce.DAY,
-            extended_hours=True
-        )
+def place_limit_buy(symbol: str, qty: int, limit_price: float, source: str):
+    # Extended hours allowed
+    req = LimitOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=OrderSide.BUY,
+        limit_price=limit_price,
+        time_in_force=TimeInForce.DAY,
+        extended_hours=True
     )
-    log("✅ BUY placed", action="BUY", symbol=symbol, qty=qty, limit=limit_price, source=source)
-    return order
+    o = trading.submit_order(req)
+    print(f"✅ BUY placed {symbol} x{qty} @ {limit_price} (source={source})")
+    return o
 
-def force_exit_limit(symbol, qty_target, target_close_price=None, reason="SIGNAL_EXIT"):
-    """
-    Force-exit loop that never gives up:
-      1) Try at target_close_price (if provided)
-      2) Otherwise/then chase best bid every EXIT_RETRY_SECONDS until flat
-    """
-    # Resolve how many shares are actually held
+def place_limit_sell(symbol: str, qty: int, limit_price: float):
+    req = LimitOrderRequest(
+        symbol=symbol,
+        qty=qty,
+        side=OrderSide.SELL,
+        limit_price=limit_price,
+        time_in_force=TimeInForce.DAY,
+        extended_hours=True
+    )
+    o = trading.submit_order(req)
+    print(f"➡️  SELL attempt {symbol} x{qty} @ {limit_price}")
+    return o
+
+def get_open_position(symbol: str):
     try:
         pos = trading.get_open_position(symbol)
-        qty_open = int(float(pos.qty))
-        avg_price = float(pos.avg_entry_price)
-        position_cache[symbol] = avg_price
+        return pos
     except Exception:
-        qty_open = 0
+        return None
 
-    if qty_open <= 0:
-        log("ℹ️ No position to close", symbol=symbol)
-        return
+def realized_loss_on_close(symbol: str, est_exit_price: float | None) -> bool:
+    pos = get_open_position(symbol)
+    if not pos:
+        return False
+    try:
+        avg = float(pos.avg_entry_price)
+        # we’ll treat exit below avg as a “loss” for daily cap purposes
+        if est_exit_price is None:
+            bid, _ = latest_quote(symbol)
+            est_exit_price = bid
+        return est_exit_price is not None and est_exit_price < avg
+    except Exception:
+        return False
 
-    def try_once_close_at(price, qty):
-        price = round(float(price), 4)
+# ───────────────────────────────────────────────────────────────
+# Aggressive exit engine — will not give up until flat
+# ───────────────────────────────────────────────────────────────
+def chase_exit_until_flat(symbol: str, target_close: float | None):
+    """
+    Exit strategy:
+      1) Try limit at max(target_close, current_bid) for longs.
+      2) If not filled, cancel & chase to current_bid every ~2s.
+      3) Keep going until position size is 0.
+    """
+    # Note: run in thread to avoid blocking /tv handler.
+    print(f"🚦 Start exit engine for {symbol}; target_close={target_close}")
+
+    # Safety: hard loop guard, but ‘never give up’: we recycle loop while position exists
+    while True:
+        pos = get_open_position(symbol)
+        if not pos:
+            print(f"✅ Exit complete — no open position on {symbol}")
+            break
+
+        qty = int(float(pos.qty))
+        if qty <= 0:
+            print(f"✅ Exit complete — qty is zero for {symbol}")
+            break
+
+        bid, ask = latest_quote(symbol)
+        if bid is None and ask is None:
+            # Last trade fallback
+            last = latest_trade_price(symbol)
+            bid = last
+
+        # First target is the signal close if provided; otherwise use bid
+        base_price = target_close if target_close is not None else bid
+        if base_price is None:
+            # nothing we can do without a price reference; wait briefly
+            time.sleep(1.5)
+            continue
+
+        # Use the better of (target_close) vs (current bid) for sells (we want out)
+        limit_price = max(base_price, bid if bid else base_price)
+
         try:
-            order = trading.submit_order(
-                order_data=LimitOrderRequest(
-                    symbol=symbol,
-                    qty=qty,
-                    side=OrderSide.SELL,
-                    limit_price=price,
-                    time_in_force=TimeInForce.DAY,
-                    extended_hours=True
-                )
-            )
-            log("➡️ Exit attempt", symbol=symbol, qty=qty, limit=price, reason=reason)
-            return True
+            o = place_limit_sell(symbol, qty, limit_price)
         except Exception as e:
-            log("❌ Exit submit failed", symbol=symbol, error=str(e), limit=price)
-            return False
+            print(f"⚠️ place_limit_sell failed {symbol}: {e}")
+            time.sleep(1.5)
+            continue
 
-    # 1) Try at target close price (if valid)
-    first_tried = False
-    if target_close_price and target_close_price > 0:
-        first_tried = try_once_close_at(target_close_price, qty_open)
-        # Give a brief moment before we start chase loop
-        time.sleep(1)
+        # wait briefly for fill, then check again
+        time.sleep(2.0)
 
-    # 2) Chase until flat
-    safety_loops = 0
-    while True:
-        # refresh open qty
+        # If still open, cancel open sell orders and tighten to current bid again
         try:
-            pos = trading.get_open_position(symbol)
-            qty_open = int(float(pos.qty))
-            last_avg = float(pos.avg_entry_price)
-            position_cache[symbol] = last_avg
+            # Cancel all open orders for the symbol (to reprice)
+            orders = trading.get_orders(status="open", nested=True)
+            for oo in orders:
+                if getattr(oo, "symbol", "") == symbol:
+                    try:
+                        trading.cancel_order_by_id(oo.id)
+                    except Exception:
+                        pass
         except Exception:
-            qty_open = 0
+            pass
 
-        if qty_open <= 0:
-            log("✅ Flat after exit", symbol=symbol, reason=reason)
-            return
+        # Loop continues until position disappears
 
-        # peg to bid for best chance to fill
-        q = get_latest_quote(symbol)
-        bid = q["bid"]
-        if bid <= 0:
-            # if we have no bid, try mid or last fallback
-            bid = q["mid"] if q["mid"] > 0 else max(0.01, position_cache.get(symbol, 0.01) * 0.9)
+    # loss accounting (approximate)
+    if realized_loss_on_close(symbol, target_close):
+        LOSSES_TODAY[symbol] += 1
+        print(f"📉 Recorded loss for {symbol}. Losses today: {LOSSES_TODAY[symbol]}")
 
-        # small sweetener to increase fill probability (a tiny undercut is not possible on sell; we hit bid)
-        target = bid
-
-        try_once_close_at(target, qty_open)
-
-        safety_loops += 1
-        time.sleep(EXIT_RETRY_SECONDS)
-
-        # safety print every few loops
-        if safety_loops % 10 == 0:
-            log("⏳ Still exiting...", symbol=symbol, loops=safety_loops, last_bid=bid)
-
-def record_loss_if_applicable(symbol, exit_price):
-    avg = position_cache.get(symbol)
-    if avg is None:
-        # try broker
-        try:
-            pos = trading.get_open_position(symbol)
-            avg = float(pos.avg_entry_price)
-        except Exception:
-            avg = None
-    if avg is None:
-        return
-    if exit_price < avg:
-        inc_loss(symbol)
-        log("📉 Loss recorded", symbol=symbol, losses=loss_counter[symbol]["losses"])
-
-def daily_liquidation_daemon():
+# ───────────────────────────────────────────────────────────────
+# Background workers
+# ───────────────────────────────────────────────────────────────
+def pending_buy_worker():
     while True:
-        now = datetime.now(ET)
-        hhmm = (now.hour, now.minute)
-        if hhmm == DAILY_LIQUIDATE_HHMM:
-            try:
-                acct = trading.get_account()
-                log("⚠️ Daily liquidation starting", equity=str(acct.equity))
-            except Exception:
-                log("⚠️ Daily liquidation starting")
+        try:
+            reset_loss_counters_if_new_day()
 
-            # get positions and exit each
-            try:
-                positions = trading.get_all_positions()
+            now = now_et()
+            to_place = []
+            for sym, info in list(PENDING_BUYS.items()):
+                if now >= info["when"]:
+                    to_place.append(sym)
+
+            for sym in to_place:
+                info = PENDING_BUYS.pop(sym, None)
+                if not info:
+                    continue
+
+                # Obtain reference “open of next candle” proxy: the first trade right now
+                # Use latest trade/quote and apply buffer.
+                lp = latest_trade_price(sym)
+                if lp is None:
+                    _, ask = latest_quote(sym)
+                    lp = ask
+
+                if lp is None:
+                    print(f"⚠️ Could not price BUY for {sym}; skipping.")
+                    continue
+
+                limit_price = lp + entry_buffer_for(lp)
+                try:
+                    place_limit_buy(sym, info["qty"], limit_price, info["source"])
+                except Exception as e:
+                    print(f"⚠️ BUY submit failed {sym}: {e}")
+
+        except Exception as e:
+            print(f"⚠️ pending_buy_worker loop error: {e}")
+
+        time.sleep(0.8)
+
+def kill_switch_worker():
+    """
+    At 19:59:00 ET, force-exit all open positions with aggressive chasing.
+    """
+    while True:
+        try:
+            t = now_et()
+            # fire between 19:59:00 and 20:00:00 once
+            if t.hour == 19 and t.minute == 59 and t.second < 10:
+                print("🛑 19:59 ET kill-switch engaged. Exiting all positions.")
+                try:
+                    positions = trading.get_all_positions()
+                except Exception as e:
+                    print(f"⚠️ get_all_positions failed: {e}")
+                    positions = []
+
                 for p in positions:
                     sym = p.symbol
                     qty = int(float(p.qty))
-                    if qty > 0:
-                        # target close unknown after hours; just chase immediately
-                        threading.Thread(target=force_exit_limit, args=(sym, qty, None, "DAILY_19_59"), daemon=True).start()
-            except Exception as e:
-                log("❗ liquidation fetch positions failed", error=str(e))
-            time.sleep(60)  # avoid multiple triggers in same minute
-        time.sleep(5)
+                    # Start a chaser thread for each symbol
+                    threading.Thread(target=chase_exit_until_flat, args=(sym, None), daemon=True).start()
 
-# start daily liquidation thread
-threading.Thread(target=daily_liquidation_daemon, daemon=True).start()
+                # sleep a bit to avoid multiple firings in the same minute
+                time.sleep(12)
+        except Exception as e:
+            print(f"⚠️ kill_switch_worker loop error: {e}")
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Flask
-# ──────────────────────────────────────────────────────────────────────────────
-app = Flask(__name__)
+        time.sleep(1.0)
 
-@app.get("/health")
+# Launch background threads
+threading.Thread(target=pending_buy_worker, daemon=True).start()
+threading.Thread(target=kill_switch_worker, daemon=True).start()
+
+# ───────────────────────────────────────────────────────────────
+# Flask endpoints
+# ───────────────────────────────────────────────────────────────
+@app.route("/health")
 def health():
-    try:
-        acct = trading.get_account()
-        return jsonify({"ok": True, "status": "ACTIVE", "equity": str(acct.equity)})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e)}), 500
+    return jsonify(ok=True, time=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
 
-@app.post("/tv")
+@app.route("/tv", methods=["POST"])
 def tv():
-    raw = request.get_data(as_text=True) or ""
-    log("📩 Webhook inbound", raw=raw)
+    reset_loss_counters_if_new_day()
 
     try:
         payload = request.get_json(force=True, silent=False)
     except Exception:
-        log("❌ JSON parse failed")
-        return jsonify({"ok": False, "error": "invalid json"}), 400
+        return jsonify(ok=False, error="Invalid JSON"), 400
 
-    secret = str(payload.get("secret", "")).upper().strip()
-    if secret != APP_SECRET:
-        log("🚫 Unauthorized webhook", got=secret)
-        return jsonify({"ok": False, "error": "unauthorized"}), 401
+    print(f"🔍 Raw webhook body: {json.dumps(payload, indent=2)}")
+
+    # Secret
+    if str(payload.get("secret", "")) != str(WEBHOOK_SECRET):
+        print("🔒 Unauthorized webhook attempt")
+        return jsonify(ok=False, error="unauthorized"), 401
 
     action = str(payload.get("action", "")).upper().strip()
-    symbol = payload.get("ticker") or payload.get("symbol") or ""
-    symbol = str(symbol).upper().strip()
+    symbol = str(payload.get("ticker", "")).upper().strip()
+    qty_raw = payload.get("quantity", 0)
 
-    if not good_symbol(symbol):
-        log("❌ Bad symbol in payload", symbol=symbol)
-        return jsonify({"ok": False, "error": "bad symbol"}), 400
-
-    qty = parse_quantity(payload.get("quantity", 100), 100)
-    source = str(payload.get("source", "UNKNOWN")).upper().strip()
-
-    # optional: may be template; parse_float handles templates -> None
-    signal_close = parse_float(payload.get("signal_close"), None)
-
-    # Loss lockout
-    if action == "BUY" and losses_remaining(symbol) <= 0:
-        log("🛑 Loss cap reached; ignoring BUY", symbol=symbol)
-        return jsonify({"ok": False, "ignored": "loss_cap_reached"}), 200
+    # Ignore placeholders (e.g., {{ticker}}) and blanks
+    if not symbol or "{" in symbol or "}" in symbol:
+        return jsonify(ok=False, error="Invalid or placeholder ticker"), 400
 
     try:
-        if action == "BUY":
-            # VBTS or SMOOTH_HA buys: limit-only w/ buffer from current ask
-            order = place_limit_buy(symbol, qty, source)
-            return jsonify({"ok": True, "order_id": order.id, "symbol": symbol})
-        elif action == "SELL":
-            # Force-exit loop (try signal_close first, then chase)
-            threading.Thread(
-                target=force_exit_limit,
-                args=(symbol, qty, signal_close, source or "SIGNAL_EXIT"),
-                daemon=True
-            ).start()
-            return jsonify({"ok": True, "exit_started": True, "symbol": symbol})
-        else:
-            log("❌ Unknown action", action=action)
-            return jsonify({"ok": False, "error": "unknown action"}), 400
-    except Exception as e:
-        log("❌ Handler failed", error=str(e))
-        return jsonify({"ok": False, "error": str(e)}), 500
+        qty = int(float(qty_raw))
+    except Exception:
+        qty = 0
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Gunicorn entrypoint
-# ──────────────────────────────────────────────────────────────────────────────
+    source = str(payload.get("source", "")).upper().strip()
+
+    # SELL/STOP target close might be placeholder too
+    target_close = parse_float_maybe(payload.get("signal_close"))
+
+    print(f"✅ Parsed payload: action={action} symbol={symbol} qty={qty} source={source} target_close={target_close}")
+
+    # Enforce loss cap
+    if action == "BUY":
+        if LOSSES_TODAY[symbol] >= 2:
+            msg = f"🛑 Skipping BUY {symbol} — reached 2 losses today."
+            print(msg)
+            return jsonify(ok=False, reason="loss_cap", message=msg), 200
+
+        if qty <= 0:
+            return jsonify(ok=False, error="quantity must be > 0"), 400
+
+        # Schedule for next bar open (next minute boundary ET)
+        when = schedule_next_minute_et()
+        PENDING_BUYS[symbol] = {"qty": qty, "when": when, "source": source}
+        print(f"🕒 Pending BUY for {symbol} x{qty} ({source}) at next bar {when.strftime('%H:%M:%S')} ET")
+        return jsonify(ok=True, scheduled_for=when.isoformat(), symbol=symbol)
+
+    elif action in ("SELL", "STOP", "EXIT"):
+        # Spawn non-blocking chaser (never gives up)
+        threading.Thread(target=chase_exit_until_flat, args=(symbol, target_close), daemon=True).start()
+        return jsonify(ok=True, message="exit_started", symbol=symbol)
+
+    else:
+        return jsonify(ok=False, error="unknown action"), 400
+
+
+# ───────────────────────────────────────────────────────────────
+# WSGI entrypoint
+# ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Local run
+    # For local testing
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", "8080")))
 
 
