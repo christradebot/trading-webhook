@@ -16,7 +16,7 @@ from alpaca.data.requests import StockLatestQuoteRequest
 API_KEY = os.environ.get("APCA_API_KEY_ID")
 SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "CHRISBOT150")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "CHRISBOT1501")  # ✅ Correct secret
 
 if not all([API_KEY, SECRET_KEY]):
     raise ValueError("🚨 Alpaca API_KEY or SECRET_KEY not found in Railway Variables.")
@@ -172,6 +172,7 @@ def auto_close_at_end_of_day():
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
