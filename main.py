@@ -1,180 +1,178 @@
-# main.py
-# --------------------------------------
-# ✅ FINAL STABLE BUILD (Chris + Athena)
-# Alpaca Limit-Only Webhook Trading Bot
-# --------------------------------------
-
 import os
-import json
 import time
-from datetime import datetime
+import json
+import logging
+from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
-from alpaca.trading.requests import LimitOrderRequest
+from alpaca.trading.requests import LimitOrderRequest, ClosePositionRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
-# --------------------------------------
-# Environment Variables (locked names)
-# --------------------------------------
-API_KEY = os.getenv("APCA_API_KEY_ID")
-SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-BASE_URL = os.getenv("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
+# ─────────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────────
+API_KEY = os.environ.get("APCA_API_KEY_ID")
+SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
+BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "CHRISBOT150")
 
-if not all([API_KEY, SECRET_KEY, BASE_URL, WEBHOOK_SECRET]):
-    raise ValueError("🚨 Missing one or more Alpaca or Webhook environment variables.")
+if not all([API_KEY, SECRET_KEY]):
+    raise ValueError("🚨 Alpaca API_KEY or SECRET_KEY not found in Railway Variables.")
 
-# --------------------------------------
-# Alpaca Clients
-# --------------------------------------
+app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
+
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# --------------------------------------
-# Flask App
-# --------------------------------------
-app = Flask(__name__)
+# ─────────────────────────────────────────────
+# GLOBALS
+# ─────────────────────────────────────────────
+open_positions = {}
+max_losses_per_ticker = {}
+MAX_LOSSES = 2
 
-# --------------------------------------
-# Helper Functions
-# --------------------------------------
-def get_live_price(symbol: str) -> float:
-    """Fetch the most recent quote for precise pricing."""
+# ─────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────
+def get_latest_price(symbol):
+    """Fetch real-time bid/ask to place realistic limit orders."""
     try:
-        quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        quote = data_client.get_stock_latest_quote(quote_req)
-        if symbol in quote:
-            return float(quote[symbol].ask_price or quote[symbol].bid_price or 0)
+        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+        quote = data_client.get_stock_latest_quote(req)
+        bid = quote[symbol].bid_price or 0
+        ask = quote[symbol].ask_price or 0
+        return (bid + ask) / 2 if bid and ask else 0
     except Exception as e:
-        print(f"⚠️ Live price fetch failed for {symbol}: {e}")
-    return 0.0
+        logging.error(f"⚠️ Price fetch failed for {symbol}: {e}")
+        return 0
 
+def limit_buffer(close_price):
+    """Dynamic buffer: +0.03 for >$1 stocks, +0.003 for <$1."""
+    return 0.03 if close_price >= 1 else 0.003
 
-def place_limit_order(symbol: str, qty: int, side: str, limit_price: float, source: str):
-    """Submit limit-only order."""
+def place_limit_order(symbol, qty, side, ref_price):
+    """Place a limit order with small offset for real fills."""
+    price = ref_price + limit_buffer(ref_price) if side == "buy" else ref_price - limit_buffer(ref_price)
+    limit_price = round(price, 4)
+
     try:
-        order = LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY if side.upper() == "BUY" else OrderSide.SELL,
-            limit_price=limit_price,
-            time_in_force=TimeInForce.DAY
+        order = trading_client.submit_order(
+            LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY if side == "buy" else OrderSide.SELL,
+                type="limit",
+                time_in_force=TimeInForce.DAY,
+                limit_price=limit_price
+            )
         )
-        trading_client.submit_order(order)
-        print(f"✅ {side.upper()} placed {symbol} x{qty} @ {limit_price} (source={source})")
-        return True
+        logging.info(f"✅ {side.upper()} placed for {symbol} x{qty} @ {limit_price}")
+        return order
     except Exception as e:
-        print(f"❌ Order placement failed: {e}")
-        return False
+        logging.error(f"❌ Order failed for {symbol}: {e}")
+        return None
 
-
-def cancel_open_orders(symbol: str):
-    """Cancel any unfilled open orders for this ticker."""
-    try:
-        open_orders = trading_client.get_orders(status="open")
-        for order in open_orders:
-            if order.symbol == symbol:
-                trading_client.cancel_order_by_id(order.id)
-                print(f"🧹 Cancelled open order for {symbol}")
-    except Exception as e:
-        print(f"⚠️ Order cancellation error: {e}")
-
-
-def close_position(symbol: str):
-    """Keep retrying until position fully closed."""
-    retries = 0
-    while retries < 10:
+def close_position(symbol, last_close):
+    """Close open position aggressively if needed."""
+    for attempt in range(10):
         try:
-            positions = trading_client.get_all_positions()
-            for pos in positions:
-                if pos.symbol == symbol:
-                    print(f"🚨 Closing {symbol} position...")
-                    order = LimitOrderRequest(
-                        symbol=symbol,
-                        qty=abs(int(float(pos.qty))),
-                        side=OrderSide.SELL,
-                        limit_price=get_live_price(symbol) * 0.99,  # sell slightly below market
-                        time_in_force=TimeInForce.DAY
-                    )
-                    trading_client.submit_order(order)
-                    time.sleep(3)
-            # verify position closed
-            remaining = [p for p in trading_client.get_all_positions() if p.symbol == symbol]
-            if not remaining:
-                print(f"✅ Position fully closed for {symbol}")
-                return True
+            live_price = get_latest_price(symbol)
+            if not live_price:
+                live_price = last_close
+
+            limit_price = round(min(live_price, last_close) * 0.995, 4)
+            order = trading_client.submit_order(
+                LimitOrderRequest(
+                    symbol=symbol,
+                    qty=open_positions.get(symbol, 0),
+                    side=OrderSide.SELL,
+                    type="limit",
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=limit_price
+                )
+            )
+            logging.info(f"🚨 SELL order placed {symbol} @ {limit_price} (attempt {attempt+1})")
+            time.sleep(3)
+            return
         except Exception as e:
-            print(f"⚠️ Error while closing {symbol}: {e}")
-        retries += 1
-        time.sleep(2)
-    print(f"❌ Failed to close {symbol} after {retries} retries.")
-    return False
+            logging.warning(f"Retrying close {symbol}: {e}")
+            time.sleep(2)
 
+    logging.error(f"❌ Failed to close {symbol} after 10 tries")
 
-# --------------------------------------
-# Webhook Endpoint
-# --------------------------------------
+# ─────────────────────────────────────────────
+# FLASK ENDPOINT
+# ─────────────────────────────────────────────
 @app.route("/tv", methods=["POST"])
 def tv():
-    if request.content_type != "application/json":
-        return jsonify({"error": "415 Unsupported Media Type"}), 415
+    try:
+        payload = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "415 Unsupported Media Type - could not parse JSON"}), 415
 
-    payload = request.get_json(silent=True)
     if not payload:
-        return jsonify({"error": "Invalid or empty payload", "ok": False}), 400
+        return jsonify({"error": "Empty payload"}), 400
 
-    # Secret Validation
     if payload.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized webhook secret", "ok": False}), 403
+        return jsonify({"error": "Invalid secret"}), 403
 
     action = payload.get("action", "").upper()
-    symbol = payload.get("ticker", "").upper().replace("{{", "").replace("}}", "")
+    symbol = payload.get("ticker", "").upper()
     qty = int(payload.get("quantity", 0))
-    source = payload.get("source", "unknown")
+    signal_close = payload.get("signal_close")
 
-    if not symbol or "TICKER" in symbol or "{" in symbol:
-        return jsonify({"error": "Invalid or placeholder ticker", "ok": False}), 400
+    try:
+        target_close = float(signal_close)
+    except Exception:
+        target_close = 0.0
 
-    live_price = get_live_price(symbol)
-    if live_price <= 0:
-        return jsonify({"error": f"Invalid live price for {symbol}", "ok": False}), 400
+    logging.info(f"✅ Parsed: {action} {symbol} x{qty} close={target_close}")
 
-    # Entry buffer (fixed decimal, not percent)
-    entry_buffer = 0.03 if live_price >= 1 else 0.003
-    limit_price = round(live_price + entry_buffer, 4) if action == "BUY" else round(live_price - entry_buffer, 4)
+    # Limit losses safeguard
+    if max_losses_per_ticker.get(symbol, 0) >= MAX_LOSSES:
+        return jsonify({"error": f"❌ {symbol}: max loss limit reached"}), 403
 
-    print(f"🔍 Parsed payload: {payload}")
-    print(f"📈 Live price for {symbol}: {live_price}, limit price: {limit_price}")
-
+    # ────────── BUY
     if action == "BUY":
-        cancel_open_orders(symbol)
-        placed = place_limit_order(symbol, qty, "BUY", limit_price, source)
-        if placed:
-            # wait one bar (1 minute typically)
-            time.sleep(60)
-            cancel_open_orders(symbol)
-        return jsonify({"ok": placed, "symbol": symbol, "limit_price": limit_price}), 200
+        live_price = get_latest_price(symbol)
+        ref_price = target_close or live_price
+        if not ref_price:
+            return jsonify({"error": "No valid price"}), 400
+        place_limit_order(symbol, qty, "buy", ref_price)
+        open_positions[symbol] = qty
 
+    # ────────── SELL
     elif action == "SELL":
-        success = close_position(symbol)
-        return jsonify({"ok": success, "symbol": symbol}), 200
+        if symbol in open_positions:
+            close_position(symbol, target_close)
+            del open_positions[symbol]
+            logging.info(f"✅ {symbol} position fully closed")
 
-    else:
-        return jsonify({"error": "Unknown action", "ok": False}), 400
+    # ────────── TEST
+    elif action == "TEST":
+        return jsonify({"ok": True, "symbol": symbol})
 
+    return jsonify({"ok": True, "symbol": symbol, "action": action})
 
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"ok": True, "time": datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")})
+# ─────────────────────────────────────────────
+# AUTO-CLOSE POSITIONS AT 19:59
+# ─────────────────────────────────────────────
+@app.before_request
+def auto_close_at_end_of_day():
+    now = datetime.utcnow()
+    if now.hour == 23 and now.minute >= 59:  # 7:59pm ET
+        for symbol in list(open_positions.keys()):
+            close_position(symbol, get_latest_price(symbol))
+            del open_positions[symbol]
+            logging.info(f"🕖 Auto-closed {symbol} at EOD")
 
-
-# --------------------------------------
-# Run
-# --------------------------------------
+# ─────────────────────────────────────────────
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
