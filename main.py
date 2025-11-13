@@ -21,7 +21,7 @@ SECRET_KEY = os.environ.get("ALPACA_SECRET_KEY")
 ALPACA_BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
 
 # TradingView webhook secret (can override via env)
-WEBHOOK_TOKEN = os.environ.get("TV_WEBHOOK_SECRET", "CHRISBOI1501")
+WEBHOOK_TOKEN = os.environ.get("TV_WEBHOOK_SECRET", "CHRISBOT1501")
 
 if not API_KEY or not SECRET_KEY:
     raise SystemExit("ALPACA_API_KEY / ALPACA_SECRET_KEY not set")
