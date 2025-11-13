@@ -1,8 +1,8 @@
 import json
 import os
 import logging
-from datetime import datetime
-from typing import Dict, Any
+from datetime import datetime, timedelta
+from typing import Dict, Any, Optional
 
 from flask import Flask, request, jsonify
 
@@ -13,36 +13,38 @@ from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
 # -----------------------------
-# Config
+# Config - MATCHES RAILWAY VARS
 # -----------------------------
 
-# These MUST match your Railway variables exactly:
 API_KEY = os.environ.get("APCA_API_KEY_ID")
 SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 ALPACA_BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
 
-# TradingView webhook secret (matches your TV alert)
-WEBHOOK_TOKEN = os.environ.get("WEBHOOK_SECRET", "Chrisbot15")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "CHRISBOT1501")
 
 if not API_KEY or not SECRET_KEY:
     raise SystemExit("APCA_API_KEY_ID / APCA_API_SECRET_KEY not set")
 
-# Alpaca clients
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True, base_url=ALPACA_BASE_URL)
+# Alpaca clients - NO base_url kwarg (SDK uses env var)
+trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
 data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
-# In-memory trade tracking (per ticker)
+# In-memory trade tracking (only ONE active trade at a time)
 open_trades: Dict[str, Dict[str, Any]] = {}
 
 # Behaviour / buffers
-# Option 2:
-#   - Above $1  -> +$0.05
-#   - Below $1  -> +$0.005
-BUY_STEP_ABOVE_1 = 0.05
-BUY_STEP_BELOW_1 = 0.005
+ENTRY_ABSOLUTE_BUFFER = 0.05 # +$0.05 for all stocks (above & below $1)
+SELL_UNDER_BID_BUFFER = 0.01 # place sell slightly under current bid
+MAX_SELL_RETRIES = 1 # after a 403 error, stop retrying for that ticker
+ORDER_EXPIRY_SECONDS = 60 # 1 minute to fill, then cancel
 
-SELL_UNDER_BID_BUFFER = 0.01   # place sell slightly under current bid to force fill
-MAX_SELL_RETRIES = 1           # after a 403 error, stop retrying for that ticker
+# Simple daily P&L stats (reset when process restarts)
+daily_stats = {
+    "realized": 0.0,
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+}
 
 # Flask app
 app = Flask(__name__)
@@ -59,15 +61,8 @@ logger = logging.getLogger("main-bot")
 # Helpers
 # -----------------------------
 
-def _within_reason(ref_price: float, quote_price: float, max_diff_pct: float = 20.0) -> bool:
-    """
-    Returns True if quote_price is within max_diff_pct of ref_price.
-    Used so we don't trust totally insane quotes (like 0.46 vs 0.348).
-    """
-    if ref_price <= 0 or quote_price <= 0:
-        return False
-    diff_pct = abs(quote_price - ref_price) / ref_price * 100.0
-    return diff_pct <= max_diff_pct
+def _now_utc() -> datetime:
+    return datetime.utcnow()
 
 
 def get_latest_quote(symbol: str):
@@ -82,44 +77,78 @@ def get_latest_quote(symbol: str):
         return None
 
 
+def cancel_expired_buy_orders():
+    """
+    Cancel BUY limit orders that have been sitting for more than ORDER_EXPIRY_SECONDS.
+    Called on every webhook hit (approximation, no background thread).
+    """
+    now = _now_utc()
+    for symbol, mem in list(open_trades.items()):
+        if mem.get("status") != "OPEN":
+            continue
+        order_id = mem.get("entry_order_id")
+        entry_time_str = mem.get("entry_time")
+        if not order_id or not entry_time_str:
+            continue
+        try:
+            entry_time = datetime.fromisoformat(entry_time_str)
+        except Exception:
+            continue
+
+        age = (now - entry_time).total_seconds()
+        if age > ORDER_EXPIRY_SECONDS:
+            try:
+                trading_client.cancel_order_by_id(order_id)
+                logger.info(
+                    "⌛ BUY expired and cancelled for %s (order_id=%s, age=%.1fs)",
+                    symbol, order_id, age,
+                )
+                mem["status"] = "EXPIRED"
+            except Exception as e:
+                logger.error("Failed to cancel expired BUY for %s: %s", symbol, e)
+
+
 def place_limit_buy(symbol: str, qty: int, signal_close: float, source: str):
     """
-    Limit BUY a new position using a slightly aggressive limit.
-    Option 2 buffer: +0.05 (>= $1) or +0.005 (< $1).
+    Limit BUY a new position using a fixed +$0.05 buffer.
+    (for both stocks above and below $1 as per Chris)
     """
     latest = get_latest_quote(symbol)
     ref_price = signal_close
 
     if latest:
-        # Prefer ask if it's sane, otherwise fall back to signal_close
         try:
             ask = float(latest.ask_price)
-            if ask > 0 and _within_reason(signal_close, ask, max_diff_pct=20.0):
+            if ask > 0:
+                # Use the higher of signal close and ask
                 ref_price = max(signal_close, ask)
         except Exception:
             pass
 
-    step = BUY_STEP_ABOVE_1 if ref_price >= 1.0 else BUY_STEP_BELOW_1
-    limit_price = round(ref_price + step, 4)
+    # Fixed 5-cent buffer as requested
+    limit_price = round(ref_price + ENTRY_ABSOLUTE_BUFFER, 4)
 
     order_req = LimitOrderRequest(
         symbol=symbol,
         qty=qty,
         side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY,  # we manage "give it a minute" at strategy level
+        time_in_force=TimeInForce.DAY,
         limit_price=limit_price,
     )
 
     order = trading_client.submit_order(order_req)
+    order_id = getattr(order, "id", None)
+
     logger.info("✅ BUY placed %s x%d @ %.4f src=%s", symbol, qty, limit_price, source)
 
-    # Track this trade in memory
+    open_trades.clear() # enforce ONE trade at a time globally
     open_trades[symbol] = {
         "symbol": symbol,
         "qty": qty,
-        "entry_price": float(signal_close),     # signal close
-        "entry_limit": float(limit_price),      # actual limit
-        "entry_time": datetime.utcnow().isoformat(),
+        "entry_price": float(signal_close), # signal close
+        "entry_limit": float(limit_price), # actual limit
+        "entry_time": _now_utc().isoformat(),
+        "entry_order_id": order_id,
         "source": source,
         "status": "OPEN",
         "sell_retries": 0,
@@ -127,10 +156,10 @@ def place_limit_buy(symbol: str, qty: int, signal_close: float, source: str):
     return order
 
 
-def place_limit_sell(symbol: str, qty: int, signal_close: float, source: str):
+def place_limit_sell(symbol: str, qty_hint: int, signal_close: float, source: str):
     """
     Limit SELL existing position. Uses an aggressive limit under bid to avoid expiry.
-    Uses live Alpaca position qty to avoid 403 "insufficient qty" + wash trade issues.
+    Does NOT trust TradingView for quantity; uses live position from Alpaca.
     """
     # 1) Check live position on Alpaca to avoid 403 "insufficient qty"
     try:
@@ -139,7 +168,6 @@ def place_limit_sell(symbol: str, qty: int, signal_close: float, source: str):
         if pos_qty <= 0:
             logger.warning("⚠️ No live qty for %s, skipping SELL", symbol)
             return None
-        # Use live qty to be safe
         qty = int(pos_qty)
     except Exception as e:
         logger.warning("⚠️ Could not fetch open position for %s, skipping SELL: %s", symbol, e)
@@ -147,18 +175,26 @@ def place_limit_sell(symbol: str, qty: int, signal_close: float, source: str):
 
     # 2) Build aggressive limit under current bid / signal_close
     latest = get_latest_quote(symbol)
-    ref_sell = signal_close
+    ref_sell = signal_close if signal_close > 0 else None
 
     if latest:
         try:
             bid = float(latest.bid_price)
-            if bid > 0 and _within_reason(signal_close, bid, max_diff_pct=20.0):
+            if bid > 0:
                 # Go slightly UNDER bid to encourage instant fill
-                ref_sell = min(signal_close, bid - SELL_UNDER_BID_BUFFER)
+                candidate = bid - SELL_UNDER_BID_BUFFER
+                ref_sell = candidate if ref_sell is None else min(ref_sell, candidate)
         except Exception:
             pass
 
-    limit_price = round(ref_sell, 4)
+    if ref_sell is None:
+        # No signal_close and no usable bid -> fallback to entry price if we have it
+        mem = open_trades.get(symbol)
+        if mem:
+            ref_sell = float(mem.get("entry_price", 0.0))
+
+    limit_price = round(ref_sell or 0.0, 4)
+
     if limit_price <= 0:
         logger.error("❌ Invalid SELL price %.4f for %s, skipping", limit_price, symbol)
         return None
@@ -196,6 +232,7 @@ def place_limit_sell(symbol: str, qty: int, signal_close: float, source: str):
 def maybe_log_pnl(symbol: str):
     """
     If a trade is flat on Alpaca, log P&L once and mark it as done.
+    Also updates daily_stats.
     """
     mem = open_trades.get(symbol)
     if not mem:
@@ -205,12 +242,12 @@ def maybe_log_pnl(symbol: str):
     try:
         position = trading_client.get_open_position(symbol)
         if float(position.qty) > 0:
-            return  # still open
+            return # still open
     except Exception:
         # No open position -> flat
         pass
 
-    if mem.get("status") in ("CLOSED", "PNL_LOGGED"):
+    if mem.get("status") in ("CLOSED", "PNL_LOGGED", "EXPIRED"):
         return
 
     entry = float(mem.get("entry_price", 0))
@@ -225,64 +262,99 @@ def maybe_log_pnl(symbol: str):
             symbol, qty, entry, exit_price, pnl, pnl_pct,
         )
 
+        # Update daily stats
+        daily_stats["realized"] += pnl
+        daily_stats["trades"] += 1
+        if pnl > 0:
+            daily_stats["wins"] += 1
+        elif pnl < 0:
+            daily_stats["losses"] += 1
+
+        logger.info(
+            "📈 DAILY SUMMARY: trades=%d wins=%d losses=%d net=$%.2f",
+            daily_stats["trades"],
+            daily_stats["wins"],
+            daily_stats["losses"],
+            daily_stats["realized"],
+        )
+
     mem["status"] = "PNL_LOGGED"
-    # Optional: clean up memory if you want:
-    # del open_trades[symbol]
 
 
 def validate_webhook_payload(payload: Dict[str, Any]):
     """
     Validates and extracts required fields from TradingView payload.
-    Tries to be forgiving on SELL (can infer ticker if exactly one trade is open).
+
+    - BUY: requires action + ticker + quantity + signal_close
+    - SELL: requires action only (ticker & qty optional; symbol can be inferred)
     """
     secret = payload.get("secret")
-    if secret != WEBHOOK_TOKEN:
+    if secret != WEBHOOK_SECRET:
         raise ValueError("Invalid secret")
 
-    action = payload.get("action")
-    if action not in ("BUY", "SELL"):
+    raw_action = payload.get("action") or payload.get("side")
+    if not raw_action:
         raise ValueError("Invalid or missing action")
+    action = str(raw_action).upper()
 
-    ticker = payload.get("ticker")
-
-    # If SELL has no ticker but exactly one open trade, infer it
-    if not ticker:
-        if action == "SELL" and len(open_trades) == 1:
-            ticker = list(open_trades.keys())[0]
-            logger.warning("⚠️ SELL webhook missing ticker; inferred %s from open_trades", ticker)
-        else:
-            raise ValueError("Missing ticker")
-
-    ticker = str(ticker).upper()
-
-    # Quantity:
-    qty_raw = payload.get("quantity", 0)
-    try:
-        qty = int(qty_raw)
-    except Exception:
-        qty = 0
-
-    if action == "BUY":
-        if qty <= 0:
-            raise ValueError("Missing or invalid quantity for BUY")
-    else:
-        # SELL: we ignore this qty and use live Alpaca position, so we don't hard-fail
-        if qty <= 0:
-            qty = 1  # dummy, not actually used
-
-    # signal_close
-    signal_close_raw = payload.get("signal_close", 0)
-    try:
-        signal_close = float(signal_close_raw)
-    except Exception:
-        signal_close = 0.0
-
-    if signal_close <= 0:
-        raise ValueError("Missing or invalid signal_close")
-
+    # Ticker can be missing on SELL; we'll infer it from open_trades if needed
+    ticker = payload.get("ticker") or payload.get("symbol")
     source = payload.get("source", "TV")
 
-    return action, ticker, qty, signal_close, source
+    # BUY specific requirements
+    if action == "BUY":
+        if not ticker or not isinstance(ticker, str):
+            raise ValueError("Missing ticker for BUY")
+
+        qty_val = payload.get("quantity") or payload.get("qty")
+        try:
+            qty = int(qty_val)
+        except (TypeError, ValueError):
+            qty = 0
+        if qty <= 0:
+            raise ValueError("Missing or invalid quantity for BUY")
+
+        sig_val = payload.get("signal_close") or payload.get("price") or payload.get("close")
+        try:
+            signal_close = float(sig_val)
+        except (TypeError, ValueError):
+            signal_close = 0.0
+        if signal_close <= 0:
+            raise ValueError("Missing or invalid signal_close for BUY")
+
+        return action, ticker.upper(), qty, signal_close, source
+
+    # SELL: ticker/qty/signal_close optional
+    if action == "SELL":
+        qty = 0 # we ignore TV qty & use Alpaca position anyway
+
+        sig_val = payload.get("signal_close") or payload.get("price") or payload.get("close")
+        try:
+            signal_close = float(sig_val) if sig_val is not None else 0.0
+        except (TypeError, ValueError):
+            signal_close = 0.0
+
+        return action, (ticker.upper() if isinstance(ticker, str) else None), qty, signal_close, source
+
+    raise ValueError("Unsupported action")
+
+
+def infer_sell_ticker_if_missing(ticker: Optional[str]) -> Optional[str]:
+    """If SELL came without a ticker, infer from the single open trade (one-trade-only rule)."""
+    if ticker:
+        return ticker
+
+    if len(open_trades) == 1:
+        inferred = next(iter(open_trades.keys()))
+        logger.info("ℹ️ SELL ticker inferred from single open trade: %s", inferred)
+        return inferred
+
+    if len(open_trades) == 0:
+        logger.warning("⚠️ SELL with no ticker and no open trades; nothing to close.")
+    else:
+        logger.warning("⚠️ SELL with no ticker and multiple open trades; cannot infer uniquely.")
+
+    return None
 
 
 # -----------------------------
@@ -291,9 +363,8 @@ def validate_webhook_payload(payload: Dict[str, Any]):
 
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
-    # Opportunistic PNL logging on every webhook
-    for sym in list(open_trades.keys()):
-        maybe_log_pnl(sym)
+    # Cancel expired BUY orders (1-minute FOK-style behaviour)
+    cancel_expired_buy_orders()
 
     # Parse JSON
     try:
@@ -314,13 +385,14 @@ def tv_webhook():
 
     # ----- BUY -----
     if action == "BUY":
-        # Allow multiple tickers, but only one trade per ticker
-        if ticker in open_trades and open_trades[ticker].get("status") in ("OPEN", "EXITING"):
-            logger.warning(
-                "⏭️ BUY skipped for %s, already in trade with status %s",
-                ticker, open_trades[ticker].get("status")
-            )
-            return jsonify({"status": "skipped", "reason": "already_in_trade"}), 200
+        # Enforce ONE active trade at a time across all tickers
+        for sym, mem in open_trades.items():
+            if mem.get("status") in ("OPEN", "EXITING"):
+                logger.warning(
+                    "⏭️ BUY skipped for %s; existing trade open on %s with status %s",
+                    ticker, sym, mem.get("status"),
+                )
+                return jsonify({"status": "skipped", "reason": "existing_trade_open"}), 200
 
         logger.info("Parsed BUY %s close=%.4f src=%s", ticker, signal_close, source)
         try:
@@ -333,21 +405,29 @@ def tv_webhook():
 
     # ----- SELL -----
     if action == "SELL":
+        # Infer ticker if TradingView didn't send one
+        ticker = infer_sell_ticker_if_missing(ticker)
+
+        if not ticker:
+            return jsonify({"status": "skipped", "reason": "no_ticker"}), 200
+
         logger.info("Parsed SELL %s close=%.4f src=%s", ticker, signal_close, source)
 
-        if ticker not in open_trades:
-            logger.warning("⏭️ SELL skipped — %s not in memory", ticker)
+        mem = open_trades.get(ticker)
+        if not mem:
+            logger.warning("⏭️ SELL skipped — %s not in memory; trying direct close_position", ticker)
             # Try to close any stray Alpaca position just in case
             try:
                 trading_client.close_position(ticker)
                 logger.info("Forced close_position on Alpaca for stray %s", ticker)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("close_position failed for %s: %s", ticker, e)
             return jsonify({"status": "skipped", "reason": "no_memory"}), 200
 
         try:
-            place_limit_sell(ticker, open_trades[ticker]["qty"], signal_close, source)
-            # PNL will be logged when position actually flat (next webhook)
+            # Use stored qty hint & signal_close (can be 0 -> bid-based)
+            place_limit_sell(ticker, mem["qty"], signal_close, source)
+            maybe_log_pnl(ticker)
         except Exception:
             logger.exception("❌ Exception while placing SELL for %s", ticker)
             return jsonify({"status": "error", "message": "sell_failed"}), 500
