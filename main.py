@@ -1,465 +1,465 @@
-import json
 import os
-import time
 import threading
+import time
 import logging
-from datetime import datetime, date
-from typing import Dict, Any, Optional
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, request, jsonify
 
+from alpaca.trading.client import TradingClient
+from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
+from alpaca.trading.enums import OrderSide, TimeInForce
+from alpaca.trading.models import Order
+
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import (
-    LimitOrderRequest,
-    GetOrdersRequest,
-    TakeProfitRequest,
-    StopLossRequest,
-)
-from alpaca.trading.enums import (
-    OrderSide,
-    TimeInForce,
-    OrderClass,
-    QueryOrderStatus,
-)
 
-# ============================================================
-#   CONFIG / ENV VARS  (MATCH RAILWAY EXACTLY)
-# ============================================================
+# =========================================================
+# CONFIG  – matches Railway variables exactly
+# =========================================================
 
-API_KEY = os.environ.get("APCA_API_KEY_ID")
-SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
-APCA_API_BASE_URL = os.environ.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
+APCA_API_BASE_URL = os.environ.get("APCA_API_BASE_URL")
+APCA_API_KEY_ID = os.environ.get("APCA_API_KEY_ID")
+APCA_API_SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "CHRISBOT1501")
-
-if not API_KEY or not SECRET_KEY:
+if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY:
     raise SystemExit("APCA_API_KEY_ID / APCA_API_SECRET_KEY not set")
 
-# Alpaca clients (paper=True uses the paper endpoint given by APCA_API_BASE_URL)
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+# Trading client – DO NOT pass base_url (Alpaca v2 doesn’t accept it)
+trading_client = TradingClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
 
-# ============================================================
-#   BOT BEHAVIOUR
-# ============================================================
+# Data client (for quotes)
+data_client = StockHistoricalDataClient(APCA_API_KEY_ID, APCA_API_SECRET_KEY)
 
-# BUFFER:
-#   >= 1.00  -> +0.05
-#   <  1.00  -> +0.005
-BUY_EXPIRY_SECONDS = 60     # 1 minute to fill, then cancel
+# =========================================================
+# BOT SETTINGS – tweak here only if you want to
+# =========================================================
 
-# We allow unlimited tickers and trades, but keep 1 plan per ticker to avoid chaos
-plans: Dict[str, Dict[str, Any]] = {}   # per-ticker trade plan & state
+# Entry limit buffer (in dollars) on top of best ask/entry level.
+# You previously converged to ~1 cent for >$1 and 0.001 for sub-$1.
+ENTRY_BUFFER_HIGH = 0.01     # symbol price >= 1.00
+ENTRY_BUFFER_LOW = 0.001     # symbol price < 1.00
 
-DAILY_STATS = {
-    "date": date.today().isoformat(),
-    "trades": 0,
-    "wins": 0,
-    "losses": 0,
-    "net": 0.0,
-}
+# How long an entry order is allowed to sit before cancel (seconds)
+ENTRY_LIFETIME_SEC = 60
 
-# Flask app
+# Trailing stop percentage from the **high-water** price
+TRAILING_STOP_PCT = 0.15  # 15%
+
+# To guarantee trailing stop still exits above entry, only activate
+# once price has moved at least +17.65% (≈ 1 / (1 - 0.15) - 1)
+TRAIL_ACTIVATION_MULTIPLIER = 1.18  # ~+18% before trail turns on
+
+# Polling intervals
+MANAGER_SLEEP_SEC = 1.0
+
+# =========================================================
+# STATE
+# =========================================================
+
 app = Flask(__name__)
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-logger = logging.getLogger("levels-bot")
+
+# One dict entry per ticker
+open_trades = {}
+open_trades_lock = threading.Lock()
+
+# Daily P&L
+daily_stats = {
+    "date": datetime.now(timezone.utc).date(),
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "pnl": 0.0,
+}
+
+# =========================================================
+# UTILS
+# =========================================================
+
+def _reset_daily_stats_if_new_day():
+    global daily_stats
+    today = datetime.now(timezone.utc).date()
+    if daily_stats["date"] != today:
+        logging.info("📆 New day – resetting daily P&L summary")
+        daily_stats = {
+            "date": today,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "pnl": 0.0,
+        }
 
 
-# ============================================================
-#   HELPERS
-# ============================================================
-
-def reset_daily_if_needed() -> None:
-    """Reset daily PnL counters when the calendar day changes."""
-    today = date.today().isoformat()
-    if DAILY_STATS["date"] != today:
-        DAILY_STATS["date"] = today
-        DAILY_STATS["trades"] = 0
-        DAILY_STATS["wins"] = 0
-        DAILY_STATS["losses"] = 0
-        DAILY_STATS["net"] = 0.0
-        logger.info("🧹 New day detected; DAILY_STATS reset")
-
-
-def buffer_for_entry(entry: float) -> float:
-    """Return the entry buffer based on price level."""
-    if entry >= 1.0:
-        return 0.05
-    else:
-        return 0.005
-
-
-def get_latest_quote(symbol: str):
-    """Fetch latest quote (bid/ask) from Alpaca. Returns None on failure."""
+def _get_latest_ask(symbol: str) -> float | None:
     try:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        resp = data_client.get_stock_latest_quote(req)
-        quote = resp[symbol]
-        return quote
+        quote = data_client.get_stock_latest_quote(req)
+        q = quote[symbol]
+        # Prefer ask; fall back to bid / mid if needed
+        if q.ask_price and q.ask_price > 0:
+            return float(q.ask_price)
+        if q.bid_price and q.bid_price > 0:
+            return float(q.bid_price)
+        if q.ask_price and q.bid_price:
+            return float((q.ask_price + q.bid_price) / 2.0)
+        return None
     except Exception as e:
-        logger.error("⚠️ Failed to fetch latest quote for %s: %s", symbol, e)
+        logging.error(f"❌ Failed to fetch latest quote for {symbol}: {e}")
         return None
 
 
-def compute_limit_price(entry_price: float, symbol: str) -> float:
+def _place_limit_buy(symbol: str, qty: int, entry_price: float) -> Order | None:
     """
-    Compute the BUY limit:
-      - Base = max(entry_price, best ask) if we have it
-      - Then add buffer: +0.05 or +0.005
+    Place an aggressive-but-bounded limit BUY that should fill quickly,
+    but is cancelled after ENTRY_LIFETIME_SEC if not filled.
     """
-    buf = buffer_for_entry(entry_price)
-    ref_price = entry_price
+    latest_ask = _get_latest_ask(symbol)
+    if latest_ask is None:
+        logging.warning(f"⚠️ No quote for {symbol}, using entry_price as limit")
+        limit_price = entry_price
+    else:
+        # Apply buffer depending on price level
+        if latest_ask >= 1.0:
+            limit_price = max(entry_price, latest_ask + ENTRY_BUFFER_HIGH)
+        else:
+            limit_price = max(entry_price, latest_ask + ENTRY_BUFFER_LOW)
 
-    quote = get_latest_quote(symbol)
-    if quote:
-        try:
-            ask = float(quote.ask_price)
-            if ask > 0:
-                ref_price = max(ref_price, ask)
-        except Exception:
-            pass
-
-    limit_price = round(ref_price + buf, 4)
-    return limit_price
-
-
-def validate_plan_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Validate and normalize a PLAN payload from TradingView."""
-    secret = payload.get("secret")
-    if secret != WEBHOOK_SECRET:
-        raise ValueError("Invalid secret")
-
-    action = str(payload.get("action", "")).upper()
-    if action != "PLAN":
-        raise ValueError("Unsupported action (expected PLAN)")
-
-    ticker = payload.get("ticker")
-    if not ticker or not isinstance(ticker, str):
-        raise ValueError("Missing ticker")
-
-    qty = int(payload.get("quantity", 0))
-    if qty <= 0:
-        raise ValueError("Missing or invalid quantity")
-
-    entry_price = float(payload.get("entry_price", 0))
-    stop_price = float(payload.get("stop_price", 0))
-    target_price = float(payload.get("target_price", 0))
-
-    if entry_price <= 0 or stop_price <= 0 or target_price <= 0:
-        raise ValueError("Missing or invalid entry/stop/target price")
-
-    # For now we assume LONG only: stop below entry, target above entry
-    if not (stop_price < entry_price < target_price):
-        raise ValueError("Expected stop < entry < target for long trades")
-
-    source = payload.get("source", "LEVELS")
-
-    return {
-        "ticker": ticker.upper(),
-        "qty": qty,
-        "entry_price": entry_price,
-        "stop_price": stop_price,
-        "target_price": target_price,
-        "source": source,
-    }
+    try:
+        order_req = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round(limit_price, 4),
+        )
+        order = trading_client.submit_order(order_req)
+        logging.info(
+            f"✅ ENTRY submitted {symbol} x{qty} @ {order.limit_price} "
+            f"(entry level={entry_price}, ask={latest_ask})"
+        )
+        return order
+    except Exception as e:
+        logging.error(f"❌ Failed to submit BUY for {symbol}: {e}")
+        return None
 
 
-def start_buy_expiry_timer(symbol: str, parent_order_id: str) -> None:
+def _place_market_sell(symbol: str, qty: int, reason: str) -> tuple[float | None, str]:
     """
-    Start a background timer that cancels the BUY leg if it's still unfilled
-    after BUY_EXPIRY_SECONDS.
+    Close position via market sell. Returns (avg_fill_price, status).
     """
+    try:
+        order_req = MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+        )
+        order = trading_client.submit_order(order_req)
+        logging.info(f"✅ EXIT submitted {symbol} x{qty} via MARKET ({reason})")
 
-    def worker():
-        time.sleep(BUY_EXPIRY_SECONDS)
-        plan = plans.get(symbol)
-        if not plan:
-            return
+        # Poll until filled or timeout (basic)
+        deadline = time.time() + 30
+        while time.time() < deadline:
+            filled = trading_client.get_order_by_id(order.id)
+            if filled.status == "filled":
+                price = float(filled.filled_avg_price)
+                logging.info(
+                    f"🏁 EXIT filled {symbol} x{qty} @ {price} ({reason})"
+                )
+                return price, "filled"
+            time.sleep(0.5)
 
-        # If we've already marked as filled / cancelled / closed, do nothing.
-        if plan.get("status") in ("FILLED", "CANCELLED", "CLOSED"):
-            return
-
-        try:
-            order = trading_client.get_order_by_id(parent_order_id)
-            status = str(order.status).lower()
-            # Treat NEW/ACCEPTED/PENDING_NEW as "not yet filled"
-            if status in ("new", "accepted", "pending_new"):
-                trading_client.cancel_order_by_id(parent_order_id)
-                plan["status"] = "CANCELLED"
-                logger.info("⏱️ Cancelled unfilled BUY for %s after %ds", symbol, BUY_EXPIRY_SECONDS)
-            else:
-                logger.info("⏱️ Expiry check: BUY for %s is status=%s (no cancel)", symbol, status)
-        except Exception as e:
-            logger.error("❌ Failed expiry cancel for %s: %s", symbol, e)
-
-    t = threading.Thread(target=worker, daemon=True)
-    t.start()
+        logging.warning(
+            f"⚠️ EXIT for {symbol} not confirmed filled within timeout ({reason})"
+        )
+        return None, "unknown"
+    except Exception as e:
+        logging.error(f"❌ Failed to submit EXIT for {symbol}: {e}")
+        return None, "error"
 
 
-def place_bracket_limit_buy(plan: Dict[str, Any]) -> Optional[str]:
-    """
-    Place a bracket LIMIT BUY order using:
-      - entry_price (from plan) + buffer
-      - target_price as take-profit limit
-      - stop_price as stop-loss
-    Returns parent order id on success, None on failure.
-    """
-    symbol = plan["ticker"]
-    qty = plan["qty"]
-    entry_price = plan["entry_price"]
-    stop_price = plan["stop_price"]
-    target_price = plan["target_price"]
-    source = plan["source"]
+def _update_pnl(symbol: str, entry_price: float, exit_price: float, qty: int):
+    global daily_stats
+    _reset_daily_stats_if_new_day()
+    pnl = (exit_price - entry_price) * qty
+    daily_stats["trades"] += 1
+    if pnl >= 0:
+        daily_stats["wins"] += 1
+    else:
+        daily_stats["losses"] += 1
+    daily_stats["pnl"] += pnl
 
-    limit_price = compute_limit_price(entry_price, symbol)
-
-    order_req = LimitOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=OrderSide.BUY,
-        time_in_force=TimeInForce.DAY,
-        limit_price=limit_price,
-        order_class=OrderClass.BRACKET,
-        take_profit=TakeProfitRequest(limit_price=target_price),
-        stop_loss=StopLossRequest(stop_price=stop_price),
+    pct = (exit_price / entry_price - 1.0) * 100.0
+    logging.info(
+        f"📊 PNL {symbol}: qty={qty} entry={entry_price:.4f} "
+        f"exit={exit_price:.4f} -> ${pnl:.2f} ({pct:.2f}%)"
+    )
+    logging.info(
+        f"📈 DAILY SUMMARY {daily_stats['date']}: "
+        f"trades={daily_stats['trades']} "
+        f"wins={daily_stats['wins']} "
+        f"losses={daily_stats['losses']} "
+        f"net=${daily_stats['pnl']:.2f}"
     )
 
-    try:
-        order = trading_client.submit_order(order_data=order_req)
-        logger.info(
-            "✅ PLAN BUY submitted %s x%d @ %.4f (entry=%.4f, stop=%.4f, target=%.4f) src=%s",
-            symbol, qty, limit_price, entry_price, stop_price, target_price, source,
-        )
-        plan["parent_order_id"] = str(order.id)
-        plan["limit_price"] = float(limit_price)
-        plan["status"] = "SUBMITTED"
-        plan["created_at"] = datetime.utcnow().isoformat()
-        return str(order.id)
-    except Exception as e:
-        logger.error("❌ Failed to submit PLAN BUY for %s: %s", symbol, e)
-        plan["status"] = "ERROR"
-        return None
 
+# =========================================================
+# TRADE MANAGER LOOP
+# =========================================================
 
-def reconcile_plan(symbol: str) -> None:
+def trade_manager_loop():
     """
-    Reconcile a single plan:
-      - Detect if parent is filled.
-      - Detect if bracket children closed the trade.
-      - Log PnL once when fully closed.
+    Background loop:
+      - Watches pending entry orders and cancels after 60s if unfilled.
+      - Watches open trades for:
+          * hard stop hit
+          * target hit
+          * 15% trailing stop (after activation level)
     """
-    plan = plans.get(symbol)
-    if not plan:
-        return
-
-    parent_id = plan.get("parent_order_id")
-    if not parent_id:
-        return
-
-    # 1) Check if there is still an open position
-    try:
-        pos = trading_client.get_open_position(symbol)
-        # If we get here without exception, we still have a live position
-        plan["status"] = "OPEN"
-        plan["last_price"] = float(pos.current_price)
-        return
-    except Exception:
-        # No open position -> could be not yet filled or already fully closed
-        pass
-
-    # 2) Fetch all CLOSED orders for this symbol and look for children of our parent
-    try:
-        req = GetOrdersRequest(
-            status=QueryOrderStatus.CLOSED,
-            symbols=[symbol],
-            limit=50,
-        )
-        orders = trading_client.get_orders(filter=req)
-    except Exception as e:
-        logger.error("⚠️ Failed to fetch closed orders for reconcile %s: %s", symbol, e)
-        return
-
-    # Find parent and children
-    parent = None
-    children = []
-    for o in orders:
-        oid = str(o.id)
-        poid = str(o.parent_order_id) if getattr(o, "parent_order_id", None) else None
-        if oid == parent_id:
-            parent = o
-        if poid == parent_id:
-            children.append(o)
-
-    if not parent:
-        # No info yet
-        return
-
-    parent_status = str(parent.status).lower()
-
-    # If the parent itself was cancelled / expired and never filled, mark plan and stop.
-    if parent_status in ("canceled", "expired", "rejected"):
-        plan["status"] = "CANCELLED"
-        return
-
-    # If there were no children filled, nothing to do.
-    if not children:
-        return
-
-    # Find the last filled child (our exit)
-    filled_children = [c for c in children if str(c.status).lower() == "filled"]
-    if not filled_children:
-        return
-
-    exit_order = sorted(
-        filled_children,
-        key=lambda c: c.filled_at or datetime.min
-    )[-1]
-
-    if plan.get("pnl_logged"):
-        # Already logged PnL once
-        plan["status"] = "CLOSED"
-        return
-
-    # Compute PnL
-    reset_daily_if_needed()
-
-    entry_price = float(plan.get("limit_price", plan["entry_price"]))
-    exit_price = float(exit_order.filled_avg_price or exit_order.limit_price or exit_order.stop_price or 0.0)
-    qty = int(plan["qty"])
-
-    if entry_price > 0 and exit_price > 0 and qty > 0:
-        pnl = (exit_price - entry_price) * qty
-        pnl_pct = (exit_price / entry_price - 1.0) * 100.0
-
-        DAILY_STATS["trades"] += 1
-        DAILY_STATS["net"] += pnl
-        if pnl > 0:
-            DAILY_STATS["wins"] += 1
-        elif pnl < 0:
-            DAILY_STATS["losses"] += 1
-
-        logger.info(
-            "📊 PNL %s: qty=%d entry=%.4f exit=%.4f -> $%.2f (%.2f%%)",
-            symbol, qty, entry_price, exit_price, pnl, pnl_pct,
-        )
-        logger.info(
-            "📈 DAILY SUMMARY: trades=%d wins=%d losses=%d net=$%.2f",
-            DAILY_STATS["trades"], DAILY_STATS["wins"],
-            DAILY_STATS["losses"], DAILY_STATS["net"],
-        )
-
-    plan["pnl_logged"] = True
-    plan["status"] = "CLOSED"
-
-
-def reconcile_all_plans() -> None:
-    """Reconcile all tracked plans (called on every webhook)."""
-    for sym in list(plans.keys()):
+    while True:
         try:
-            reconcile_plan(sym)
+            _reset_daily_stats_if_new_day()
+            now = datetime.now(timezone.utc)
+
+            with open_trades_lock:
+                symbols = list(open_trades.keys())
+
+            for symbol in symbols:
+                with open_trades_lock:
+                    trade = open_trades.get(symbol)
+                if not trade:
+                    continue
+
+                status = trade["status"]
+
+                # 1) PENDING ENTRY – check order status / expiry
+                if status == "PENDING_ENTRY":
+                    order_id = trade["entry_order_id"]
+                    created_at = trade["entry_created_at"]
+                    try:
+                        order = trading_client.get_order_by_id(order_id)
+                    except Exception as e:
+                        logging.error(f"❌ Failed to fetch entry order {order_id} for {symbol}: {e}")
+                        continue
+
+                    if order.status == "filled":
+                        entry_price = float(order.filled_avg_price)
+                        qty = int(order.filled_qty)
+                        logging.info(
+                            f"✅ ENTRY filled {symbol} x{qty} @ {entry_price}"
+                        )
+                        with open_trades_lock:
+                            trade["status"] = "OPEN"
+                            trade["qty"] = qty
+                            trade["entry_price"] = entry_price
+                            trade["high_water"] = entry_price
+                            trade["trail_active"] = False
+                            # Activation level so 15% trail never goes below entry
+                            trade["trail_activation_price"] = entry_price * TRAIL_ACTIVATION_MULTIPLIER
+                            open_trades[symbol] = trade
+                        continue
+
+                    # Cancel if lifetime exceeded
+                    if now - created_at > timedelta(seconds=ENTRY_LIFETIME_SEC):
+                        try:
+                            trading_client.cancel_order_by_id(order_id)
+                            logging.info(
+                                f"⌛ ENTRY for {symbol} expired after {ENTRY_LIFETIME_SEC}s – cancelled"
+                            )
+                        except Exception as e:
+                            logging.error(f"❌ Failed to cancel expired entry for {symbol}: {e}")
+                        with open_trades_lock:
+                            open_trades.pop(symbol, None)
+                        continue
+
+                # 2) OPEN TRADE – manage exits (stop, target, trailing)
+                if status == "OPEN":
+                    qty = trade["qty"]
+                    entry_price = trade["entry_price"]
+                    stop_price = trade["stop_price"]
+                    target_price = trade["target_price"]
+                    high_water = trade["high_water"]
+                    trail_active = trade["trail_active"]
+                    trail_activation_price = trade["trail_activation_price"]
+
+                    # Get latest price (ask / mid)
+                    last_price = _get_latest_ask(symbol)
+                    if last_price is None:
+                        continue
+
+                    # Update high-water mark
+                    if last_price > high_water:
+                        high_water = last_price
+                        trade["high_water"] = high_water
+
+                    # Hard stop – ALWAYS ON
+                    if last_price <= stop_price:
+                        exit_price, status = _place_market_sell(
+                            symbol, qty, reason="HARD_STOP"
+                        )
+                        if exit_price is not None:
+                            _update_pnl(symbol, entry_price, exit_price, qty)
+                        with open_trades_lock:
+                            open_trades.pop(symbol, None)
+                        continue
+
+                    # Target hit
+                    if last_price >= target_price:
+                        exit_price, status = _place_market_sell(
+                            symbol, qty, reason="TARGET_HIT"
+                        )
+                        if exit_price is not None:
+                            _update_pnl(symbol, entry_price, exit_price, qty)
+                        with open_trades_lock:
+                            open_trades.pop(symbol, None)
+                        continue
+
+                    # Activate trailing once we move far enough
+                    if not trail_active and last_price >= trail_activation_price:
+                        trail_active = True
+                        trade["trail_active"] = True
+                        logging.info(
+                            f"🎯 TRAIL activated for {symbol} at {last_price:.4f} "
+                            f"(entry={entry_price:.4f}, activation={trail_activation_price:.4f})"
+                        )
+
+                    # Trailing stop logic – 15% from high-water, but never below entry/stop
+                    if trail_active:
+                        trail_floor = high_water * (1.0 - TRAILING_STOP_PCT)
+                        trail_floor = max(trail_floor, entry_price, stop_price)
+
+                        if last_price <= trail_floor:
+                            exit_price, status = _place_market_sell(
+                                symbol, qty, reason="TRAIL_STOP"
+                            )
+                            if exit_price is not None:
+                                _update_pnl(symbol, entry_price, exit_price, qty)
+                            with open_trades_lock:
+                                open_trades.pop(symbol, None)
+                            continue
+
         except Exception as e:
-            logger.error("⚠️ Error reconciling %s: %s", sym, e)
+            logging.error(f"❌ Error in trade_manager_loop: {e}")
+
+        time.sleep(MANAGER_SLEEP_SEC)
 
 
-# ============================================================
-#   FLASK ROUTES
-# ============================================================
+# Kick off background manager
+manager_thread = threading.Thread(target=trade_manager_loop, daemon=True)
+manager_thread.start()
+
+# =========================================================
+# WEBHOOK ENDPOINT
+# =========================================================
 
 @app.route("/tv", methods=["POST"])
 def tv_webhook():
-    # Reconcile any previous trades first
-    reconcile_all_plans()
+    """
+    TradingView webhook endpoint.
+    Expects JSON PLAN payload of the form:
 
-    # Parse JSON from TradingView
+    {
+      "secret": "CHRISBOT1501",
+      "action": "PLAN",
+      "ticker": "BCG",
+      "quantity": 100,
+      "entry_price": 2.03,
+      "stop_price": 1.93,
+      "target_price": 2.68,
+      "source": "3M-midpoint"
+    }
+    """
+
+    # --- Parse JSON
     try:
         payload = request.get_json(force=True, silent=False)
-    except Exception:
-        logger.exception("❌ Failed to parse JSON from TradingView")
-        return jsonify({"status": "error", "message": "invalid json"}), 400
+    except Exception as e:
+        logging.error(f"❌ Failed to parse JSON from TradingView: {e}")
+        return jsonify({"status": "error", "message": "invalid_json"}), 400
 
-    logger.info("RAW PAYLOAD: %s", payload)
+    logging.info(f"RAW PAYLOAD: {payload}")
 
+    # --- Secret check
+    if payload.get("secret") != WEBHOOK_SECRET:
+        logging.warning("🚫 Invalid secret in payload")
+        return jsonify({"status": "error", "message": "unauthorized"}), 401
+
+    action = str(payload.get("action", "")).upper()
+
+    if action != "PLAN":
+        logging.warning(f"⚠️ Unsupported action '{action}' – expected 'PLAN'")
+        return jsonify({"status": "error", "message": "unsupported_action"}), 400
+
+    # --- Extract plan fields
     try:
-        plan_data = validate_plan_payload(payload)
-    except ValueError as ve:
-        logger.error("⚠️ Invalid PLAN payload skipped: %s", ve)
-        return jsonify({"status": "error", "message": str(ve)}), 400
+        symbol = str(payload["ticker"]).upper()
+        qty = int(payload["quantity"])
+        entry_price = float(payload["entry_price"])
+        stop_price = float(payload["stop_price"])
+        target_price = float(payload["target_price"])
+        source = str(payload.get("source", "LEVEL_PLAN"))
+    except Exception as e:
+        logging.error(f"❌ Missing or invalid PLAN fields: {e}")
+        return jsonify({"status": "error", "message": "bad_plan_fields"}), 400
 
-    symbol = plan_data["ticker"]
-    qty = plan_data["qty"]
-    entry_price = plan_data["entry_price"]
-    stop_price = plan_data["stop_price"]
-    target_price = plan_data["target_price"]
-    source = plan_data["source"]
+    if qty <= 0:
+        return jsonify({"status": "error", "message": "quantity_must_be_positive"}), 400
+    if not (0 < stop_price < entry_price < target_price):
+        return jsonify({"status": "error", "message": "invalid_price_hierarchy"}), 400
 
-    # If there is already a live plan for this ticker, skip to avoid overlapping brackets.
-    existing = plans.get(symbol)
-    if existing and existing.get("status") not in ("CLOSED", "CANCELLED", "ERROR"):
-        logger.warning(
-            "⏭️ PLAN skipped for %s; existing plan status=%s",
-            symbol, existing.get("status")
-        )
-        return jsonify({"status": "skipped", "reason": "plan_exists"}), 200
+    # --- Check if we already have an active trade for this ticker
+    with open_trades_lock:
+        existing = open_trades.get(symbol)
+        if existing and existing["status"] in ("PENDING_ENTRY", "OPEN"):
+            logging.warning(
+                f"⏭️ PLAN skipped for {symbol}; existing trade status={existing['status']}"
+            )
+            return jsonify({"status": "skipped", "message": "trade_already_open"}), 200
 
-    plans[symbol] = {
-        "ticker": symbol,
-        "qty": qty,
-        "entry_price": entry_price,
-        "stop_price": stop_price,
-        "target_price": target_price,
-        "source": source,
-        "status": "NEW",
-        "parent_order_id": None,
-        "limit_price": None,
-        "created_at": datetime.utcnow().isoformat(),
-        "pnl_logged": False,
-    }
+    # --- Place entry order immediately (price has crossed alert level)
+    entry_order = _place_limit_buy(symbol, qty, entry_price)
+    if not entry_order:
+        return jsonify({"status": "error", "message": "failed_to_place_entry"}), 500
 
-    logger.info(
-        "🧠 New PLAN for %s: qty=%d entry=%.4f stop=%.4f target=%.4f src=%s",
-        symbol, qty, entry_price, stop_price, target_price, source,
+    # --- Register new trade in state
+    with open_trades_lock:
+        open_trades[symbol] = {
+            "symbol": symbol,
+            "status": "PENDING_ENTRY",
+            "qty": qty,
+            "entry_price": entry_price,     # provisional; overwritten on fill
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "source": source,
+            "entry_order_id": entry_order.id,
+            "entry_created_at": datetime.now(timezone.utc),
+            "high_water": entry_price,
+            "trail_active": False,
+            "trail_activation_price": entry_price * TRAIL_ACTIVATION_MULTIPLIER,
+        }
+
+    logging.info(
+        f"📥 PLAN accepted for {symbol}: qty={qty} "
+        f"entry={entry_price} stop={stop_price} target={target_price} src={source}"
     )
 
-    parent_id = place_bracket_limit_buy(plans[symbol])
-    if not parent_id:
-        return jsonify({"status": "error", "message": "order_submit_failed"}), 500
-
-    # Start 1-minute expiry timer for the parent BUY leg
-    start_buy_expiry_timer(symbol, parent_id)
-
-    return jsonify({
-        "status": "ok",
-        "action": "PLAN",
-        "ticker": symbol,
-        "qty": qty,
-        "entry_price": entry_price,
-        "stop_price": stop_price,
-        "target_price": target_price,
-    }), 200
+    return jsonify({"status": "ok", "message": "plan_accepted"}), 200
 
 
-@app.route("/", methods=["GET"])
-def healthcheck():
-    """Simple health endpoint."""
-    return jsonify({"status": "alive", "tracked_symbols": list(plans.keys())})
-
-
-# ============================================================
-#   ENTRY POINT
-# ============================================================
+# =========================================================
+# WSGI entrypoint
+# =========================================================
 
 if __name__ == "__main__":
-    # Railway uses PORT; default to 8080 locally
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    # Local testing only – Railway will use gunicorn
+    app.run(host="0.0.0.0", port=8080, debug=False)
+
 
 
 
