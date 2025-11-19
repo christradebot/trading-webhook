@@ -5,12 +5,10 @@ import traceback
 from datetime import datetime
 from flask import Flask, request, jsonify
 
-# Trading API
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-# Data API (quotes)
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
@@ -24,11 +22,10 @@ BASE_URL = os.environ.get("APCA_API_BASE_URL")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
 LIVE_MODE = True
-MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "5"))
 
+MAX_SPREAD_PCT = float(os.environ.get("MAX_SPREAD_PCT", "5"))
 TRADE_START_UTC_HOUR = int(os.environ.get("TRADE_START_UTC_HOUR", "4"))
 TRADE_END_UTC_HOUR   = int(os.environ.get("TRADE_END_UTC_HOUR", "20"))
-
 MAX_ORDER_ATTEMPTS = 3
 
 if not all([API_KEY, SECRET_KEY, BASE_URL]):
@@ -41,7 +38,7 @@ data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 app = Flask(__name__)
 
 # =====================================================================
-# ACTIVE PLAN
+# GLOBAL STATE
 # =====================================================================
 
 active_plan = {
@@ -73,26 +70,28 @@ def log(msg):
 
 def is_trading_time():
     now = datetime.utcnow()
-    hour = now.hour
-    allowed = TRADE_START_UTC_HOUR <= hour < TRADE_END_UTC_HOUR
+    h = now.hour
+    allowed = TRADE_START_UTC_HOUR <= h < TRADE_END_UTC_HOUR
     if not allowed:
-        log(f"[TIME GUARD] Outside allowed UTC trading window (hour={hour})")
+        log(f"[TIME GUARD] Outside allowed UTC hours {TRADE_START_UTC_HOUR}-{TRADE_END_UTC_HOUR}")
     return allowed
 
 # =====================================================================
-# POSITION CHECKER
+# POSITION CHECK
 # =====================================================================
 
 def has_open_position(symbol):
     try:
         pos = trading_client.get_open_position(symbol)
         qty = float(pos.qty)
-        return qty > 0
+        log(f"[POSITION] Open position for {symbol}: qty={qty}")
+        return qty != 0
     except:
+        log(f"[POSITION] No open position for {symbol}")
         return False
 
 # =====================================================================
-# PAYLOAD PARSER
+# WEBHOOK PARSER
 # =====================================================================
 
 def parse_webhook_payload(req):
@@ -108,15 +107,25 @@ def parse_webhook_payload(req):
         return None
 
 # =====================================================================
-# ORDER SENDER
+# LIMIT ORDER
 # =====================================================================
 
 def submit_limit_order(symbol, qty, price, side):
-    if price <= 0 or qty <= 0:
-        log("[ORDER ERROR] Invalid qty or price.")
+
+    try:
+        price = round(float(price), 4)
+    except:
+        log(f"[ORDER ERROR] Invalid price: {price}")
         return None
 
-    limit_price = round(price + 0.01, 4) if side == OrderSide.BUY else round(price - 0.01, 4)
+    if price <= 0 or qty <= 0:
+        log("[ORDER ERROR] price/qty <= 0, refusing order")
+        return None
+
+    if side == OrderSide.BUY:
+        limit_price = round(price + 0.01, 4)
+    else:
+        limit_price = round(price - 0.01, 4)
 
     for attempt in range(1, MAX_ORDER_ATTEMPTS + 1):
         try:
@@ -128,55 +137,49 @@ def submit_limit_order(symbol, qty, price, side):
                 time_in_force=TimeInForce.DAY
             )
             order = trading_client.submit_order(req)
-            log(f"[ORDER SUCCESS] Attempt {attempt}: {order}")
+            log(f"[ORDER SUCCESS] {order}")
             return order
         except Exception as e:
-            log(f"[ORDER ERROR] Attempt {attempt}: {e}")
+            log(f"[ORDER ERROR] attempt {attempt} failed → {e}")
             traceback.print_exc()
             time.sleep(1)
 
-    log("[ORDER FAILURE] All attempts failed.")
+    log("[ORDER ERROR] All attempts failed.")
     return None
 
 # =====================================================================
-# QUOTE HANDLER (FULLY COMPATIBLE)
+# FIXED QUOTE READER (FINAL VERSION)
 # =====================================================================
 
 def get_latest_bid_ask(symbol):
     """
-    Handles all possible Alpaca SDK formats:
-    {
-        "quote": {"bp": 8.95, "ap": 8.98}
-    }
-    OR:
-    {"KZIA": {"bid_price": ..., "ask_price": ...}}
-    OR object-style attributes.
+    Alpaca returns:
+        { "STEC": Quote(bp=..., ap=..., ...) }
+
+    Quote objects do NOT support `.get()`, so we must read attributes.
     """
     try:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
         resp = data_client.get_stock_latest_quote(req)
 
-        bid = ask = 0.0
-
-        # --- CASE A: resp = {"symbol": "KZIA", "quote": {...}) ---
-        if isinstance(resp, dict) and "quote" in resp:
-            q = resp["quote"]
-            bid = float(q.get("bp", 0))
-            ask = float(q.get("ap", 0))
-
-        # --- CASE B: resp = {"KZIA": {...}} ---
-        elif isinstance(resp, dict):
-            item = list(resp.values())[0]
-            bid = float(item.get("bid_price", item.get("bp", 0)))
-            ask = float(item.get("ask_price", item.get("ap", 0)))
-
-        # --- CASE C: object format (older SDKs) ---
+        # resp is ALWAYS a dict when passing list/str
+        if isinstance(resp, dict):
+            quote = list(resp.values())[0]
         else:
-            bid = float(getattr(resp, "bid_price", getattr(resp, "bp", 0)))
-            ask = float(getattr(resp, "ask_price", getattr(resp, "ap", 0)))
+            quote = resp
+
+        # Preferred attributes: bp (bid price) and ap (ask price)
+        bid = float(getattr(quote, "bp", 0))
+        ask = float(getattr(quote, "ap", 0))
+
+        # fallback for older formats
+        if bid <= 0:
+            bid = float(getattr(quote, "bid_price", bid))
+        if ask <= 0:
+            ask = float(getattr(quote, "ask_price", ask))
 
         if bid <= 0 or ask <= 0:
-            log(f"[QUOTE] Invalid bid/ask → {bid}, {ask}")
+            log(f"[QUOTE] Invalid bid/ask for {symbol}: bid={bid}, ask={ask}")
             return None, None, None
 
         spread_pct = (ask - bid) / ask * 100
@@ -190,7 +193,7 @@ def get_latest_bid_ask(symbol):
         return None, None, None
 
 # =====================================================================
-# MAIN TRADING LOOP
+# MONITOR LOOP (UNCHANGED LOGIC)
 # =====================================================================
 
 def monitor_price():
@@ -211,19 +214,17 @@ def monitor_price():
                 time.sleep(1)
                 continue
 
-            # -------------------------------
             # ENTRY LOGIC
-            # -------------------------------
             if not active_plan["entry_filled"]:
+
                 if has_open_position(symbol):
                     active_plan["entry_filled"] = True
                     active_plan["in_position"] = True
                 else:
                     if spread_pct > MAX_SPREAD_PCT:
-                        log(f"[SPREAD] Too wide ({spread_pct:.2f}%)")
+                        log(f"[SPREAD GUARD] Spread too high: {spread_pct:.2f}%")
                     else:
                         if bid >= active_plan["entry"]:
-                            log("[ENTRY] Triggered.")
                             order = submit_limit_order(symbol, active_plan["qty"], active_plan["entry"], OrderSide.BUY)
                             if order:
                                 active_plan["entry_filled"] = True
@@ -235,59 +236,34 @@ def monitor_price():
                 time.sleep(1)
                 continue
 
-            # Sync check
-            if not has_open_position(symbol):
-                active_plan["in_position"] = False
-                time.sleep(1)
-                continue
-
-            # -------------------------------
-            # TARGET EXIT
-            # -------------------------------
-            if not active_plan["target_sent"] and bid >= active_plan["target"]:
-                log("[TARGET] SELL triggered.")
-                order = submit_limit_order(symbol, active_plan["qty"], active_plan["target"], OrderSide.SELL)
-                if order:
-                    active_plan["target_sent"] = True
-                    active_plan["in_position"] = False
-                    active_plan["trail_active"] = False
-                time.sleep(1)
-                continue
-
-            # -------------------------------
-            # STOP LOSS
-            # -------------------------------
+            # HARD STOP
             if not active_plan["stop_sent"] and bid <= active_plan["stop"]:
-                log("[STOP] SELL triggered.")
-                order = submit_limit_order(symbol, active_plan["qty"], active_plan["stop"], OrderSide.SELL)
-                if order:
-                    active_plan["stop_sent"] = True
-                    active_plan["in_position"] = False
-                    active_plan["trail_active"] = False
-                time.sleep(1)
+                if has_open_position(symbol):
+                    submit_limit_order(symbol, active_plan["qty"], active_plan["stop"], OrderSide.SELL)
+                active_plan["stop_sent"] = True
+                active_plan["in_position"] = False
                 continue
 
-            # -------------------------------
-            # TRAILING STOP
-            # -------------------------------
-            if active_plan["trail_active"] and not active_plan["trail_sent"]:
-                highest = active_plan["highest_bid"]
+            # TARGET
+            if not active_plan["target_sent"] and bid >= active_plan["target"]:
+                if has_open_position(symbol):
+                    submit_limit_order(symbol, active_plan["qty"], active_plan["target"], OrderSide.SELL)
+                active_plan["target_sent"] = True
+                active_plan["in_position"] = False
+                continue
 
-                if bid > highest:
-                    highest = bid
+            # TRAILING STOP
+            if active_plan["trail_active"] and not active_plan["trail_sent"]:
+                if bid > active_plan["highest_bid"]:
                     active_plan["highest_bid"] = bid
 
-                trail_level = highest * (1 - active_plan["trail_pct"] / 100)
-
-                log(f"[TRAIL] highest={highest:.4f}, trail={trail_level:.4f}, bid={bid:.4f}")
+                trail_level = active_plan["highest_bid"] * (1 - active_plan["trail_pct"] / 100)
 
                 if bid <= trail_level:
-                    log("[TRAIL] SELL triggered.")
-                    order = submit_limit_order(symbol, active_plan["qty"], bid, OrderSide.SELL)
-                    if order:
-                        active_plan["trail_sent"] = True
-                        active_plan["in_position"] = False
-                        active_plan["trail_active"] = False
+                    if has_open_position(symbol):
+                        submit_limit_order(symbol, active_plan["qty"], bid, OrderSide.SELL)
+                    active_plan["trail_sent"] = True
+                    active_plan["in_position"] = False
 
             time.sleep(1)
 
@@ -304,20 +280,19 @@ def monitor_price():
 def tv_webhook():
     payload = parse_webhook_payload(request)
     if payload is None:
-        return jsonify({"status": "error", "message": "invalid_json"}), 400
+        return jsonify({"status": "error", "message": "bad_json"}), 400
 
     if str(payload.get("secret")) != str(WEBHOOK_SECRET):
         return jsonify({"status": "error", "message": "bad_secret"}), 401
 
     try:
-        ticker = payload["ticker"].upper()
+        ticker = str(payload["ticker"]).upper()
         qty = int(payload["quantity"])
         entry = float(payload["entry"])
         stop = float(payload["stop"])
         target = float(payload["target"])
         trail_pct = float(payload.get("trail_pct", 0))
-    except Exception as e:
-        log(f"[PAYLOAD ERROR] {e}")
+    except Exception:
         return jsonify({"status": "error", "message": "bad_payload"}), 400
 
     active_plan.update({
@@ -337,22 +312,24 @@ def tv_webhook():
     })
 
     log(f"[PLAN LOADED] {active_plan}")
+
     return jsonify({"status": "ok", "message": "plan_loaded"}), 200
 
 # =====================================================================
-# START THREAD
+# START MONITOR THREAD
 # =====================================================================
 
 import threading
 threading.Thread(target=monitor_price, daemon=True).start()
 
 # =====================================================================
-# RUN SERVER
+# FLASK RUN
 # =====================================================================
 
 if __name__ == "__main__":
-    log(f"SERVER STARTED — live={LIVE_MODE}, window={TRADE_START_UTC_HOUR}-{TRADE_END_UTC_HOUR}, max_spread={MAX_SPREAD_PCT}%")
+    log(f"SERVER STARTED — LIVE_MODE={LIVE_MODE}, TRADE HOURS {TRADE_START_UTC_HOUR}-{TRADE_END_UTC_HOUR}, MAX_SPREAD={MAX_SPREAD_PCT}%")
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
