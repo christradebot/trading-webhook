@@ -18,10 +18,14 @@ SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
 BASE_URL = os.environ.get("APCA_API_BASE_URL")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
+# 🔒 TEST MODE (NO ORDERS SENT)
+TEST_MODE = True
+
 if not all([API_KEY, SECRET_KEY, BASE_URL]):
     print("[FATAL] Missing Alpaca API credentials.")
     exit(1)
 
+# Still initialize client (safe in TEST_MODE)
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=False)
 
 app = Flask(__name__)
@@ -41,21 +45,17 @@ active_plan = {
 }
 
 # =====================================================================
-# UTILITY LOGGING
+# LOGGING
 # =====================================================================
 
 def log(msg):
     print(f"[{datetime.utcnow()}] {msg}", flush=True)
 
 # =====================================================================
-# PARSE WEBHOOK JSON (ACCEPT ANYTHING FROM TRADINGVIEW)
+# PARSE WEBHOOK JSON
 # =====================================================================
 
 def parse_webhook_payload(req):
-    """
-    TradingView sends improper headers.
-    This function safely decodes ANY incoming body as JSON.
-    """
     try:
         raw = req.data.decode("utf-8").strip()
         log(f"RAW Incoming Body: {raw}")
@@ -67,17 +67,15 @@ def parse_webhook_payload(req):
     except Exception as e:
         log(f"[ERROR] Failed JSON decode: {e}")
         traceback.print_exc()
-
         return None
 
 # =====================================================================
-# SEND LIMIT ORDER
+# SEND LIMIT ORDER (SAFE TEST MODE)
 # =====================================================================
 
 def submit_limit_order(symbol, qty, price, side):
     """
-    Sends a limit order.
-    With 0.01 buffer for instant fill attempt (Option A).
+    In TEST_MODE this function does NOT submit any order.
     """
 
     price = round(float(price), 2)
@@ -87,7 +85,17 @@ def submit_limit_order(symbol, qty, price, side):
     else:
         limit_price = round(price - 0.01, 2)
 
-    log(f"Submitting {side} LIMIT order for {symbol} at {limit_price}")
+    log(f"[TEST_MODE={TEST_MODE}] Prepared {side} LIMIT order for {symbol} at {limit_price}")
+
+    if TEST_MODE:
+        log("⚠️ TEST MODE ENABLED — ORDER NOT SENT")
+        return {
+            "test_mode": True,
+            "symbol": symbol,
+            "qty": qty,
+            "side": str(side),
+            "limit_price": limit_price
+        }
 
     try:
         req = LimitOrderRequest(
@@ -107,11 +115,10 @@ def submit_limit_order(symbol, qty, price, side):
         return None
 
 # =====================================================================
-# PRICE CHECKER (POLLING)
+# PRICE CHECKER (STILL RUNS IN TEST MODE)
 # =====================================================================
 
 def get_current_bid(symbol):
-    """Grabs latest bid price for entry trigger."""
     try:
         quote = trading_client.get_latest_quote(symbol)
         bid = float(quote.bid_price)
@@ -126,26 +133,22 @@ def get_current_bid(symbol):
 # =====================================================================
 
 def monitor_price():
-    """
-    Runs continuous trigger logic every second.
-    """
     while True:
         if active_plan["ticker"] is None:
             time.sleep(1)
             continue
 
         symbol = active_plan["ticker"]
-
-        # get quote
         bid = get_current_bid(symbol)
+
         if bid is None:
             time.sleep(1)
             continue
 
-        # ENTRY TRIGGER
+        # ENTRY
         if not active_plan["entry_filled"]:
             if bid >= active_plan["entry"]:
-                log("ENTRY TRIGGERED → sending BUY")
+                log("ENTRY TRIGGERED → BUY (TEST MODE)")
 
                 submit_limit_order(
                     symbol=symbol,
@@ -156,12 +159,11 @@ def monitor_price():
 
                 active_plan["entry_filled"] = True
                 active_plan["in_position"] = True
-                log("Entry filled flag set TRUE")
 
-        # STOP TRIGGER (only AFTER entry filled)
+        # STOP
         if active_plan["entry_filled"] and not active_plan["stop_sent"]:
             if bid <= active_plan["stop"]:
-                log("STOP HIT → sending SELL")
+                log("STOP HIT → SELL (TEST MODE)")
 
                 submit_limit_order(
                     symbol=symbol,
@@ -172,12 +174,11 @@ def monitor_price():
 
                 active_plan["stop_sent"] = True
                 active_plan["in_position"] = False
-                log("Stop sent, position closed.")
 
-        # TARGET TRIGGER
+        # TARGET
         if active_plan["entry_filled"] and not active_plan["target_sent"]:
             if bid >= active_plan["target"]:
-                log("TARGET HIT → sending SELL")
+                log("TARGET HIT → SELL (TEST MODE)")
 
                 submit_limit_order(
                     symbol=symbol,
@@ -188,12 +189,11 @@ def monitor_price():
 
                 active_plan["target_sent"] = True
                 active_plan["in_position"] = False
-                log("Target sent, position closed.")
 
         time.sleep(1)
 
 # =====================================================================
-# WEBHOOK ENDPOINT
+# WEBHOOK
 # =====================================================================
 
 @app.route("/tv", methods=["POST"])
@@ -203,14 +203,13 @@ def tv_webhook():
     if payload is None:
         return jsonify({"status": "error", "message": "invalid_json"}), 400
 
-    # Validate secret
+    # Secret check
     if str(payload.get("secret")) != str(WEBHOOK_SECRET):
         log("[ERROR] SECRET INVALID")
         return jsonify({"status": "error", "message": "bad_secret"}), 401
 
     log("SECRET VALID")
 
-    # Extract fields
     try:
         ticker = payload["ticker"]
         qty = int(payload["quantity"])
@@ -223,7 +222,6 @@ def tv_webhook():
         log(f"[PAYLOAD ERROR] {e}")
         return jsonify({"status": "error", "message": "bad_payload"}), 400
 
-    # Store plan
     active_plan.update({
         "ticker": ticker,
         "qty": qty,
@@ -241,7 +239,6 @@ def tv_webhook():
 
     return jsonify({"status": "ok", "message": "plan_loaded"}), 200
 
-
 # =====================================================================
 # START MONITOR THREAD
 # =====================================================================
@@ -249,13 +246,15 @@ def tv_webhook():
 import threading
 threading.Thread(target=monitor_price, daemon=True).start()
 
-
 # =====================================================================
 # RUN FLASK
 # =====================================================================
 
 if __name__ == "__main__":
+    log("TEST MODE SERVER RUNNING — NO ORDERS WILL BE SENT")
     app.run(host="0.0.0.0", port=8080)
+
+
 
 
 
