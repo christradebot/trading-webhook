@@ -9,19 +9,16 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestQuoteRequest
-
 # =====================================================================
 # CONFIG
 # =====================================================================
 
 API_KEY = os.environ.get("APCA_API_KEY_ID")
 SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
-BASE_URL = os.environ.get("APCA_API_BASE_URL")  # not strictly needed but kept for clarity
+BASE_URL = os.environ.get("APCA_API_BASE_URL")
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET")
 
-# Live trading (paper=False). Change to False if you want to test on paper.
+# Live trading (paper=False if LIVE_MODE=True)
 LIVE_MODE = True
 
 # Spread safety (percentage, e.g. 5 = 5%)
@@ -34,15 +31,11 @@ TRADE_END_UTC_HOUR   = int(os.environ.get("TRADE_END_UTC_HOUR", "20"))    # 20:0
 # Order retry attempts
 MAX_ORDER_ATTEMPTS = 3
 
-if not all([API_KEY, SECRET_KEY]):
+if not all([API_KEY, SECRET_KEY, BASE_URL]):
     print("[FATAL] Missing Alpaca API credentials.")
     exit(1)
 
-# Trading client (orders)
 trading_client = TradingClient(API_KEY, SECRET_KEY, paper=not LIVE_MODE)
-
-# Data client (quotes)
-data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
 
 app = Flask(__name__)
 
@@ -70,14 +63,14 @@ active_plan = {
 # UTILITY LOGGING
 # =====================================================================
 
-def log(msg):
+def log(msg: str):
     print(f"[{datetime.utcnow()}] {msg}", flush=True)
 
 # =====================================================================
 # TIME WINDOW CHECK
 # =====================================================================
 
-def is_trading_time():
+def is_trading_time() -> bool:
     """
     Only allow trading within a UTC hour window for extra safety.
     You can adjust via TRADE_START_UTC_HOUR / TRADE_END_UTC_HOUR env vars.
@@ -93,19 +86,18 @@ def is_trading_time():
 # POSITION CHECKS
 # =====================================================================
 
-def has_open_position(symbol):
+def has_open_position(symbol: str) -> bool:
     """
     Check if there is any open position for the given symbol.
-    Used to prevent sending SELLs when there is no position
-    and to prevent duplicate BUYs.
+    Used to prevent sending SELLs when there is no position, and
+    to confirm that exits actually closed the position.
     """
     try:
         pos = trading_client.get_open_position(symbol)
         qty = float(pos.qty)
         log(f"[POSITION] Open position detected for {symbol}: qty={qty}")
-        return qty != 0.0
+        return qty != 0
     except Exception:
-        # No open position or error (treated as flat)
         log(f"[POSITION] No open position for {symbol}.")
         return False
 
@@ -116,6 +108,7 @@ def has_open_position(symbol):
 def parse_webhook_payload(req):
     """
     Safely decode ANY incoming body as JSON.
+    Non-JSON payloads (e.g. "STEC Crossing 1.15") are just logged & rejected.
     """
     try:
         raw = req.data.decode("utf-8").strip()
@@ -126,44 +119,130 @@ def parse_webhook_payload(req):
         return payload
 
     except Exception as e:
-        log(f"[ERROR] JSON decode failed: {e}")
+        log(f"[ERROR] JSON decode failed.")
         traceback.print_exc()
         return None
 
 # =====================================================================
-# SEND LIMIT ORDER (with retries, safety)
+# PRICE / QUOTE HELPER
 # =====================================================================
 
-def submit_limit_order(symbol, qty, price, side):
+def get_latest_bid_ask(symbol):
     """
-    Sends a limit order with a 0.01 buffer for instant fill attempt.
-      - BUY: price + 0.01
-      - SELL: price - 0.01
-    Includes:
-      - basic validation
-      - retry logic
+    Returns (bid, ask, spread_pct).
+    If data is missing, returns (None, None, None).
+    Uses TradingClient.get_latest_quote (returns a Quote object).
+    """
+    try:
+        quote = trading_client.get_latest_quote(symbol)
+
+        # Quote object with attributes like bid_price / ask_price
+        bid = float(quote.bid_price) if quote.bid_price is not None else 0.0
+        ask = float(quote.ask_price) if quote.ask_price is not None else 0.0
+
+        # Handle missing or zero ask: synthetic ask slightly above bid
+        if ask <= 0 and bid > 0:
+            ask = round(bid + 0.01, 2)
+            log(f"[QUOTE-FIX] ask was 0 for {symbol}, using synthetic ask={ask} from bid={bid}")
+
+        if bid <= 0 or ask <= 0:
+            log(f"[QUOTE] Invalid bid/ask for {symbol}: bid={bid}, ask={ask}")
+            return None, None, None
+
+        spread = ask - bid
+        spread_pct = (spread / ask) * 100 if ask > 0 else None
+
+        log(f"[QUOTE] {symbol} bid={bid}, ask={ask}, spread={spread:.4f} ({spread_pct:.2f}%)")
+        return bid, ask, spread_pct
+
+    except Exception as e:
+        log(f"[ERROR] Quote failure: {e}")
+        traceback.print_exc()
+        return None, None, None
+
+# =====================================================================
+# PRICE HELPERS FOR BLIND LIMITS
+# =====================================================================
+
+def calc_entry_limit(entry_price: float) -> float:
+    """
+    Blind BUY limit:
+      - Above $1 : +0.3% (entry * 1.003)
+      - Below $1 : +$0.003
+    """
+    if entry_price >= 1.0:
+        return round(entry_price * 1.003, 4)
+    else:
+        return round(entry_price + 0.003, 4)
+
+def calc_target_limit(target_price: float) -> float:
+    """
+    Target SELL limit with small cushion to ensure fill:
+      - Above $1 : -0.3% (target * 0.997)
+      - Below $1 : -$0.003
+    """
+    if target_price >= 1.0:
+        return round(target_price * 0.997, 4)
+    else:
+        return round(target_price - 0.003, 4)
+
+def calc_trail_exit_limit(bid_price: float) -> float:
+    """
+    Trailing stop SELL at/just below current bid to exit quickly:
+      - Above $1 : bid * 0.997
+      - Below $1 : bid - $0.003
+    """
+    if bid_price >= 1.0:
+        return round(bid_price * 0.997, 4)
+    else:
+        return round(bid_price - 0.003, 4)
+
+def calc_stop_limit(stop_price: float, stage: int) -> float:
+    """
+    Two-stage hard stop SELL:
+      Stage 1 (tight):
+        - Above $1 : stop * 0.997
+        - Below $1 : stop - $0.003
+      Stage 2 (panic):
+        - Above $1 : stop * 0.99
+        - Below $1 : stop - $0.01
+    """
+    if stage == 1:
+        if stop_price >= 1.0:
+            return round(stop_price * 0.997, 4)
+        else:
+            return round(stop_price - 0.003, 4)
+    else:  # stage 2
+        if stop_price >= 1.0:
+            return round(stop_price * 0.99, 4)
+        else:
+            return round(stop_price - 0.01, 4)
+
+# =====================================================================
+# RAW LIMIT ORDER SENDER (no extra price logic here)
+# =====================================================================
+
+def submit_limit_order(symbol: str, qty: int, limit_price: float, side: OrderSide):
+    """
+    Sends a limit order as-is (blind limit).
+    Includes basic validation and retry logic.
     """
 
     try:
-        price = round(float(price), 4)
+        limit_price = round(float(limit_price), 4)
     except Exception:
-        log(f"[ORDER ERROR] Invalid price: {price}")
+        log(f"[ORDER ERROR] Invalid price: {limit_price}")
         return None
 
-    if price <= 0:
-        log(f"[ORDER ERROR] Refusing to send order with non-positive price: {price}")
+    if limit_price <= 0:
+        log(f"[ORDER ERROR] Refusing to send order with non-positive price: {limit_price}")
         return None
 
     if qty <= 0:
         log(f"[ORDER ERROR] Refusing to send order with non-positive qty: {qty}")
         return None
 
-    if side == OrderSide.BUY:
-        limit_price = round(price + 0.01, 4)
-    else:
-        limit_price = round(price - 0.01, 4)
-
-    log(f"Preparing {side} LIMIT order for {symbol} at {limit_price} (base={price})")
+    log(f"[ORDER PREP] {side} LIMIT {symbol} @ {limit_price} qty={qty}")
 
     for attempt in range(1, MAX_ORDER_ATTEMPTS + 1):
         try:
@@ -181,53 +260,10 @@ def submit_limit_order(symbol, qty, price, side):
         except Exception as e:
             log(f"[ORDER ERROR] Attempt {attempt} failed: {e}")
             traceback.print_exc()
-            time.sleep(1)  # short backoff
+            time.sleep(1)
 
     log("[ORDER ERROR] All retry attempts failed, giving up.")
     return None
-
-# =====================================================================
-# QUOTE / LIQUIDITY HELPER
-# =====================================================================
-
-def get_latest_bid_ask(symbol):
-    """
-    Returns (bid, ask, spread_pct).
-    Uses Alpaca's StockHistoricalDataClient for the latest quote.
-    Adds a fallback when ask == 0 but bid > 0, which can happen
-    with thin liquidity or limited data subscriptions.
-    """
-    try:
-        req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        latest = data_client.get_stock_latest_quote(req)
-
-        # If symbol_or_symbols is a string, response is a dict { symbol: Quote }
-        quote = latest[symbol] if isinstance(latest, dict) else latest
-
-        bid = float(getattr(quote, "bid_price", 0.0) or 0.0)
-        ask = float(getattr(quote, "ask_price", 0.0) or 0.0)
-
-        # If both are junk, bail
-        if bid <= 0 and ask <= 0:
-            log(f"[QUOTE] Both bid/ask invalid for {symbol}: bid={bid}, ask={ask}")
-            return None, None, None
-
-        # If bid is valid but ask is 0, synthesize a tiny ask above bid
-        if bid > 0 and ask <= 0:
-            synthetic_ask = round(bid + 0.01, 4)
-            log(f"[QUOTE-FIX] ask was 0 for {symbol}, using synthetic ask={synthetic_ask} from bid={bid}")
-            ask = synthetic_ask
-
-        spread = ask - bid
-        spread_pct = (spread / ask) * 100 if ask > 0 else None
-
-        log(f"[QUOTE] {symbol} bid={bid}, ask={ask}, spread={spread:.4f} ({spread_pct:.2f}%)")
-        return bid, ask, spread_pct
-
-    except Exception as e:
-        log(f"[ERROR] Quote failure: {e}")
-        traceback.print_exc()
-        return None, None, None
 
 # =====================================================================
 # ORDER EXECUTION LOGIC
@@ -237,22 +273,22 @@ def monitor_price():
     """
     Continuous trigger logic every second.
     Includes:
-      - time window check
-      - no duplicate buys
-      - position sanity checks
-      - trailing stop
-      - target overrides trail (priority)
+      - Time window check
+      - No duplicate buys if a position already exists
+      - Spread / liquidity guard
+      - Two-stage hard stop
+      - Target exit
+      - Trailing stop exit (lowest priority)
     """
     while True:
         try:
-            # No active plan
             if active_plan["ticker"] is None:
                 time.sleep(1)
                 continue
 
             symbol = active_plan["ticker"]
 
-            # Time guard: do nothing outside allowed hours
+            # Time guard
             if not is_trading_time():
                 time.sleep(5)
                 continue
@@ -262,107 +298,146 @@ def monitor_price():
                 time.sleep(1)
                 continue
 
-            # =============================================================
+            # =========================================================
             # ENTRY LOGIC
-            # =============================================================
+            # =========================================================
             if not active_plan["entry_filled"]:
-                # If Alpaca already shows a position, mark as in position (no duplicate BUY)
+                # Skip if we already have a position (no duplicate buys)
                 if has_open_position(symbol):
                     log("[ENTRY GUARD] Position already open; not sending another BUY.")
                     active_plan["entry_filled"] = True
                     active_plan["in_position"] = True
                 else:
-                    # Spread / liquidity check
+                    # Spread guard
                     if spread_pct is not None and spread_pct > MAX_SPREAD_PCT:
                         log(f"[SPREAD GUARD] Spread {spread_pct:.2f}% > max {MAX_SPREAD_PCT}%, entry paused.")
                     else:
+                        # Trigger only once price >= entry
                         if bid >= active_plan["entry"]:
-                            log("ENTRY TRIGGERED → sending BUY")
+                            log("[ENTRY] Triggered → sending blind BUY")
 
+                            buy_limit = calc_entry_limit(active_plan["entry"])
                             order = submit_limit_order(
                                 symbol=symbol,
                                 qty=active_plan["qty"],
-                                price=active_plan["entry"],
+                                limit_price=buy_limit,
                                 side=OrderSide.BUY
                             )
 
                             if order is not None:
-                                active_plan["entry_filled"] = True
-                                active_plan["in_position"] = True
-                                active_plan["highest_bid"] = bid
-                                active_plan["trail_active"] = (
-                                    active_plan["trail_pct"] is not None and
-                                    active_plan["trail_pct"] > 0
-                                )
-                                log(f"Entry filled flag set TRUE, trail_active={active_plan['trail_active']}")
+                                # Small wait then confirm via position
+                                time.sleep(0.6)
+                                if has_open_position(symbol):
+                                    active_plan["entry_filled"] = True
+                                    active_plan["in_position"] = True
+                                    active_plan["highest_bid"] = bid
+                                    active_plan["trail_active"] = (
+                                        active_plan["trail_pct"] is not None
+                                        and active_plan["trail_pct"] > 0
+                                    )
+                                    log(f"[ENTRY] Confirmed, trail_active={active_plan['trail_active']}")
+                                else:
+                                    log("[ENTRY WARNING] Buy order sent but no position detected yet.")
                             else:
-                                log("[ENTRY ERROR] Buy order failed; will retry on next ticks.")
+                                log("[ENTRY ERROR] Buy order failed; will retry on future ticks.")
 
-            # If we are not in position, no need to check exits
+            # If we are not in a position, no need to check exits
             if not active_plan["in_position"]:
                 time.sleep(1)
                 continue
 
-            # Additional sanity check: if Alpaca position disappeared, reset in_position
+            # Extra sync: if Alpaca position disappeared, mark flat
             if not has_open_position(symbol):
-                log("[POSITION SYNC] Marking flat since no open position detected at Alpaca.")
+                log("[POSITION SYNC] No open position found; marking flat.")
                 active_plan["in_position"] = False
                 time.sleep(1)
                 continue
 
-            # =============================================================
-            # EXIT LOGIC PRIORITY:
-            # 1) TARGET
-            # 2) HARD STOP
-            # 3) TRAILING STOP
-            # =============================================================
+            # =========================================================
+            # EXIT PRIORITY:
+            #   1) TARGET
+            #   2) HARD STOP (two-stage)
+            #   3) TRAILING STOP
+            # =========================================================
 
-            # 1) TARGET EXIT — overrides trailing if both hit on same tick
+            # 1) TARGET EXIT
             if active_plan["entry_filled"] and not active_plan["target_sent"]:
                 if bid >= active_plan["target"]:
-                    log("TARGET HIT → sending SELL")
+                    log("[TARGET] Hit → sending SELL")
 
                     if has_open_position(symbol):
+                        target_limit = calc_target_limit(active_plan["target"])
                         order = submit_limit_order(
                             symbol=symbol,
                             qty=active_plan["qty"],
-                            price=active_plan["target"],
+                            limit_price=target_limit,
                             side=OrderSide.SELL
                         )
                         if order is not None:
-                            active_plan["target_sent"] = True
-                            active_plan["in_position"] = False
-                            active_plan["trail_active"] = False
-                            log("Target sent, position closed. (Other exits logically cancelled)")
+                            time.sleep(0.6)
+                            if not has_open_position(symbol):
+                                active_plan["target_sent"] = True
+                                active_plan["in_position"] = False
+                                active_plan["trail_active"] = False
+                                log("[TARGET] Confirmed filled, position closed.")
+                            else:
+                                log("[TARGET WARNING] Target SELL sent but position still open.")
                     else:
-                        log("[TARGET EXIT] No open position at Alpaca, skipping SELL.")
+                        log("[TARGET] No open position at Alpaca, skipping SELL.")
 
-            # If we closed on target this loop, skip further logic
+            # If closed by target, skip further logic
             if not active_plan["in_position"]:
                 time.sleep(1)
                 continue
 
-            # 2) HARD STOP EXIT
+            # 2) HARD STOP EXIT (Two-stage)
             if active_plan["entry_filled"] and not active_plan["stop_sent"]:
                 if bid <= active_plan["stop"]:
-                    log("STOP HIT → sending SELL")
+                    log("[STOP] Hit → sending Stage 1 SELL")
 
                     if has_open_position(symbol):
-                        order = submit_limit_order(
+                        # Stage 1: tight limit
+                        stop_limit_stage1 = calc_stop_limit(active_plan["stop"], stage=1)
+                        order1 = submit_limit_order(
                             symbol=symbol,
                             qty=active_plan["qty"],
-                            price=active_plan["stop"],
+                            limit_price=stop_limit_stage1,
                             side=OrderSide.SELL
                         )
-                        if order is not None:
-                            active_plan["stop_sent"] = True
-                            active_plan["in_position"] = False
-                            active_plan["trail_active"] = False
-                            log("Stop sent, position closed. (Other exits logically cancelled)")
-                    else:
-                        log("[STOP EXIT] No open position at Alpaca, skipping SELL.")
 
-            # If we closed on stop this loop, skip further logic
+                        if order1 is not None:
+                            time.sleep(0.6)
+                            if not has_open_position(symbol):
+                                active_plan["stop_sent"] = True
+                                active_plan["in_position"] = False
+                                active_plan["trail_active"] = False
+                                log("[STOP] Stage 1 filled, position closed.")
+                            else:
+                                # Stage 2: panic limit
+                                log("[STOP] Stage 1 not fully filled → Stage 2 panic SELL")
+                                stop_limit_stage2 = calc_stop_limit(active_plan["stop"], stage=2)
+                                order2 = submit_limit_order(
+                                    symbol=symbol,
+                                    qty=active_plan["qty"],
+                                    limit_price=stop_limit_stage2,
+                                    side=OrderSide.SELL
+                                )
+                                if order2 is not None:
+                                    time.sleep(1.0)
+                                    if not has_open_position(symbol):
+                                        active_plan["stop_sent"] = True
+                                        active_plan["in_position"] = False
+                                        active_plan["trail_active"] = False
+                                        log("[STOP] Stage 2 filled, position closed.")
+                                    else:
+                                        log("[STOP WARNING] Stage 2 SELL sent but position still open; will keep managing.")
+                                else:
+                                    log("[STOP ERROR] Stage 2 order failed to send.")
+                        else:
+                            log("[STOP ERROR] Stage 1 order failed to send; will retry if stop condition persists.")
+                    else:
+                        log("[STOP] No open position at Alpaca, skipping SELL.")
+
             if not active_plan["in_position"]:
                 time.sleep(1)
                 continue
@@ -371,10 +446,9 @@ def monitor_price():
             if active_plan["entry_filled"] and active_plan["trail_active"] and not active_plan["trail_sent"]:
                 trail_pct = active_plan["trail_pct"]
                 if trail_pct is None or trail_pct <= 0:
-                    # No trail configured
                     active_plan["trail_active"] = False
                 else:
-                    # Update highest bid
+                    # Track highest bid since entry
                     if active_plan["highest_bid"] is None or bid > active_plan["highest_bid"]:
                         active_plan["highest_bid"] = bid
 
@@ -384,23 +458,28 @@ def monitor_price():
                     log(f"[TRAIL] highest={highest:.4f}, trail_level={trail_level:.4f}, bid={bid:.4f}")
 
                     if bid <= trail_level:
-                        log("TRAILING STOP HIT → sending SELL")
+                        log("[TRAIL] Hit → sending SELL")
 
                         if has_open_position(symbol):
-                            # trail exits at current bid
+                            # Exit near current bid with a small cushion
+                            trail_limit = calc_trail_exit_limit(bid)
                             order = submit_limit_order(
                                 symbol=symbol,
                                 qty=active_plan["qty"],
-                                price=bid,
+                                limit_price=trail_limit,
                                 side=OrderSide.SELL
                             )
                             if order is not None:
-                                active_plan["trail_sent"] = True
-                                active_plan["in_position"] = False
-                                active_plan["trail_active"] = False
-                                log("Trailing stop sent, position closed. (Other exits logically cancelled)")
+                                time.sleep(0.8)
+                                if not has_open_position(symbol):
+                                    active_plan["trail_sent"] = True
+                                    active_plan["in_position"] = False
+                                    active_plan["trail_active"] = False
+                                    log("[TRAIL] Filled, position closed.")
+                                else:
+                                    log("[TRAIL WARNING] Trailing SELL sent but position still open.")
                         else:
-                            log("[TRAIL EXIT] No open position at Alpaca, skipping SELL.")
+                            log("[TRAIL] No open position at Alpaca, skipping SELL.")
 
             time.sleep(1)
 
@@ -427,7 +506,7 @@ def tv_webhook():
 
     log("[SECRET] VALID")
 
-    # Extract and validate fields
+    # Extract & validate fields
     try:
         ticker = str(payload["ticker"]).upper()
         qty = int(payload["quantity"])
@@ -440,6 +519,7 @@ def tv_webhook():
             raise ValueError("Quantity must be > 0")
         if entry <= 0 or stop <= 0 or target <= 0:
             raise ValueError("Prices must be > 0")
+
         if not (stop < entry < target):
             log(f"[PAYLOAD WARNING] stop={stop}, entry={entry}, target={target} look unusual.")
 
@@ -448,7 +528,7 @@ def tv_webhook():
         traceback.print_exc()
         return jsonify({"status": "error", "message": "bad_payload"}), 400
 
-    # Store plan (reset all flags)
+    # Store plan & reset flags
     active_plan.update({
         "ticker": ticker,
         "qty": qty,
@@ -487,6 +567,7 @@ if __name__ == "__main__":
         f"MAX_SPREAD_PCT={MAX_SPREAD_PCT}"
     )
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
