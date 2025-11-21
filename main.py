@@ -1,192 +1,153 @@
 from flask import Flask, request, jsonify
-import os, time, json
+import os
+import time
+
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import LimitOrderRequest
+from alpaca.trading.requests import MarketOrderRequest, LimitOrderRequest
 from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockLatestTradeRequest
 
-# =========================
-# CONFIG
-# =========================
-API_KEY = os.getenv("ALPACA_API_KEY")
-SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
+from alpaca.data.live import StockDataStream
 
-trading_client = TradingClient(API_KEY, SECRET_KEY, paper=True)
-data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+# -----------------------------------
+# ENV
+# -----------------------------------
+
+API_KEY = os.environ.get("ALPACA_API_KEY")
+API_SECRET = os.environ.get("ALPACA_API_SECRET")
+BASE_URL = os.environ.get("ALPACA_BASE_URL", "https://paper-api.alpaca.markets")
+
+if not API_KEY or not API_SECRET:
+    raise Exception("Missing Alpaca API keys")
+
+# -----------------------------------
+# CLIENTS
+# -----------------------------------
+
+trading_client = TradingClient(API_KEY, API_SECRET, paper=True)
 
 app = Flask(__name__)
 
-active_trade = {
-    "symbol": None,
-    "entry": None,
-    "stop": None,
-    "target": None,
-    "qty": None,
-    "in_position": False,
-    "last_order_id": None
-}
+active_trades = {}
+last_order_time = {}
 
-# =========================
-# GET LIVE PRICE
-# =========================
+# -----------------------------------
+# SAFETY
+# -----------------------------------
+
+COOLDOWN_SECONDS = 30   # no duplicate orders within 30s
+
+def in_cooldown(symbol):
+    last_time = last_order_time.get(symbol)
+    if not last_time:
+        return False
+    return (time.time() - last_time) < COOLDOWN_SECONDS
+
+
+def position_exists(symbol):
+    positions = trading_client.get_all_positions()
+    for pos in positions:
+        if pos.symbol == symbol and float(pos.qty) > 0:
+            return True
+    return False
+
+
+# -----------------------------------
+# PRICE
+# -----------------------------------
 
 def get_last_price(symbol):
-    try:
-        req = StockLatestTradeRequest(symbol_or_symbols=[symbol])
-        trade = data_client.get_stock_latest_trade(req)
-        return float(trade[symbol].price)
-    except Exception as e:
-        print(f"[PRICE ERROR] {e}")
-        return None
+    from alpaca.data import StockHistoricalDataClient
+    from alpaca.data.requests import StockLatestTradeRequest
 
-# =========================
-# SAFETY CHECK
-# =========================
+    data_client = StockHistoricalDataClient(API_KEY, API_SECRET)
 
-def has_position(symbol):
-    try:
-        pos = trading_client.get_open_position(symbol)
-        return pos is not None
-    except:
-        return False
+    request_params = StockLatestTradeRequest(symbol_or_symbols=symbol)
+    latest_trade = data_client.get_stock_latest_trade(request_params)
 
-# =========================
-# PLACE LIMIT
-# =========================
+    if symbol in latest_trade:
+        return float(latest_trade[symbol].price)
 
-def place_limit_order(symbol, qty, price, side):
-    order_request = LimitOrderRequest(
-        symbol=symbol,
-        qty=qty,
-        side=side,
-        limit_price=str(price),
-        time_in_force=TimeInForce.DAY
-    )
-
-    try:
-        order = trading_client.submit_order(order_request)
-        print(f"[ORDER] {side} {qty} {symbol} @ {price}")
-        return order.id
-    except Exception as e:
-        print(f"[ORDER ERROR] {e}")
-        return None
-
-# =========================
-# OPTION A ENTRY (6 tries)
-# =========================
-
-def attempt_entry(symbol, entry, qty):
-    print("[ENTRY] Starting Option A ladder...")
-
-    for i in range(6):
-        step_price = round(entry + (i * 0.01), 2)
-        price = get_last_price(symbol)
-
-        print(f"Trying buy @ {step_price} | Current: {price}")
-
-        if price is None:
-            continue
-
-        if price <= step_price:
-            order_id = place_limit_order(symbol, qty, step_price, OrderSide.BUY)
-            if order_id:
-                return order_id
-
-        time.sleep(5)
-
-    print("[ENTRY] Missed move. Protect capital.")
     return None
 
-# =========================
-# OPTION A EXIT (LADDER)
-# =========================
 
-def attempt_exit(symbol, stop, qty):
-    print("[EXIT] Starting stop ladder...")
+# -----------------------------------
+# WEBHOOK
+# -----------------------------------
 
-    for i in range(6):
-        step_price = round(stop - (i * 0.01), 2)
-        price = get_last_price(symbol)
+@app.route("/", methods=["GET"])
+def home():
+    return "Bot is alive"
 
-        print(f"Trying sell @ {step_price} | Current: {price}")
 
-        if price is None:
-            continue
+@app.route("/webhook", methods=["POST"])
+def webhook():
 
-        if price >= step_price:
-            order_id = place_limit_order(symbol, qty, step_price, OrderSide.SELL)
-            if order_id:
-                return order_id
+    data = request.get_json()
+
+    if not data:
+        return jsonify({"error": "No JSON received"}), 400
+
+    secret = data.get("secret")
+
+    if secret != os.environ.get("WEBHOOK_SECRET"):
+        return jsonify({"error": "Unauthorized"}), 403
+
+    symbol = data.get("ticker").upper()
+    qty = int(data.get("quantity", 1))
+    entry = float(data.get("entry"))
+    stop = float(data.get("stop"))
+    target = float(data.get("target"))
+
+    print(f"[WEBHOOK] Received for {symbol}")
+
+    if in_cooldown(symbol):
+        return jsonify({"status": "Cooldown active, ignored"}), 200
+
+    if position_exists(symbol):
+        return jsonify({"status": "Position already exists"}), 200
+
+    last_price = get_last_price(symbol)
+
+    if not last_price:
+        return jsonify({"error": "No price available"}), 500
+
+    print(f"[PRICE] {symbol} = {last_price}")
+
+    if abs(last_price - entry) > (entry * 0.10):
+        print("[SAFETY] Too far from entry. Aborted.")
+        return jsonify({"status": "Price outside safe range"}), 200
+
+    # ----- LIMIT LADDER (OPTION A) -----
+
+    price_steps = [0, 0.01, 0.02, 0.03, 0.04, 0.05]
+
+    for i, offset in enumerate(price_steps):
+        limit_price = round(entry + offset, 2)
+
+        order = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            limit_price=limit_price,
+            time_in_force=TimeInForce.GTC
+        )
+
+        print(f"[TRY {i+1}] BUY {qty} @ {limit_price}")
+
+        trading_client.submit_order(order)
 
         time.sleep(5)
 
-    print("[EXIT] Aggressive final exit")
-    place_limit_order(symbol, qty, round(price - 0.05, 2), OrderSide.SELL)
+        if position_exists(symbol):
+            last_order_time[symbol] = time.time()
+            print("[SUCCESS] Position opened")
+            return jsonify({"status": "Bought", "price": limit_price}), 200
 
-# =========================
-# WEBHOOK
-# =========================
+    print("[FAILED] Entry not filled")
+    last_order_time[symbol] = time.time()
 
-@app.route('/webhook', methods=['POST'])
-def webhook():
+    return jsonify({"status": "Missed entry - protected capital"}), 200
 
-    try:
-        payload = request.get_json()
-    except:
-        return jsonify({"error": "Invalid JSON"}), 400
-
-    if payload.get("secret") != os.getenv("WEBHOOK_SECRET"):
-        return jsonify({"error": "Unauthorized"}), 401
-
-    symbol = payload.get("ticker")
-    qty = int(payload.get("quantity"))
-    entry = float(payload.get("entry"))
-    stop = float(payload.get("stop"))
-    target = float(payload.get("target"))
-    action = payload.get("action")
-
-    print(f"[WEBHOOK] {payload}")
-
-    if action == "PLAN":
-
-        if has_position(symbol) or active_trade["in_position"]:
-            print("[BLOCK] Existing position active")
-            return jsonify({"status": "blocked"})
-
-        order_id = attempt_entry(symbol, entry, qty)
-
-        if order_id:
-            active_trade.update({
-                "symbol": symbol,
-                "entry": entry,
-                "stop": stop,
-                "target": target,
-                "qty": qty,
-                "in_position": True,
-                "last_order_id": order_id
-            })
-
-        return jsonify({"status": "processed"})
-
-    if action == "STOP":
-
-        if not active_trade["in_position"]:
-            return jsonify({"status": "no position"})
-
-        attempt_exit(symbol, stop, qty)
-        active_trade["in_position"] = False
-        return jsonify({"status": "stopped"})
-
-    return jsonify({"status": "ignored"})
-
-# =========================
-# HEALTH CHECK
-# =========================
-
-@app.route('/')
-def home():
-    return "ATHENA BOT — LIVE ✅"
 
 
 
