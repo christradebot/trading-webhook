@@ -1,205 +1,130 @@
 import os
-import time
+import json
 import threading
 from flask import Flask, request, jsonify
+import requests
 
-from alpaca.trading.client import TradingClient
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType
-from alpaca.trading.requests import LimitOrderRequest
-
-# =============================
-# ENV VARIABLES (Railway)
-# =============================
-APCA_API_KEY_ID     = os.environ.get("APCA_API_KEY_ID")
-APCA_API_SECRET_KEY = os.environ.get("APCA_API_SECRET_KEY")
-APCA_API_BASE_URL   = os.environ.get("APCA_API_BASE_URL", "https://api.alpaca.markets")
-WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET")
-
-if not APCA_API_KEY_ID or not APCA_API_SECRET_KEY or not WEBHOOK_SECRET:
-    raise Exception("🚨 Missing environment variables in Railway")
-
-# =============================
-# ALPACA CLIENT (LIVE)
-# =============================
-trading_client = TradingClient(
-    api_key=APCA_API_KEY_ID,
-    secret_key=APCA_API_SECRET_KEY,
-    paper=False
-)
-
-# =============================
-# APP
-# =============================
 app = Flask(__name__)
 
-# Prevent duplicate trades
-open_trade_symbols = set()
+# ======================= ENV VARIABLES =======================
 
-# =============================
-# HELPERS
-# =============================
+APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
+APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-def has_open_position(symbol: str) -> bool:
+# ======================= ALPACA CONFIG ========================
+
+HEADERS = {
+    "APCA-API-KEY-ID": APCA_API_KEY_ID,
+    "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+    "Content-Type": "application/json"
+}
+
+ORDERS_URL = f"{APCA_API_BASE_URL}/v2/orders"
+POSITIONS_URL = f"{APCA_API_BASE_URL}/v2/positions"
+
+# ======================= LOCK =======================
+
+trade_lock = threading.Lock()
+
+# ======================= HELPERS =======================
+
+def get_positions():
     try:
-        positions = trading_client.get_all_positions()
-        for p in positions:
-            if p.symbol == symbol and float(p.qty) > 0:
-                return True
-        return False
+        r = requests.get(POSITIONS_URL, headers=HEADERS)
+        if r.status_code == 200:
+            return r.json()
+        return []
     except Exception as e:
-        print(f"[POSITION CHECK ERROR] {e}")
-        return False
+        print("POSITION ERROR:", str(e))
+        return []
 
 
-# =============================
-# ENTRY LADDER (Option A)
-# =============================
-
-def option_a_entry(symbol, qty, entry_price):
-
-    print(f"[ENTRY] Starting ladder for {symbol}")
-
-    increments = [0.01, 0.02, 0.03, 0.04, 0.05, 0.06]
-
-    for inc in increments:
-
-        price = round(entry_price + inc, 2)
-
-        try:
-            order = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                type=OrderType.LIMIT,
-                time_in_force=TimeInForce.GTC,
-                limit_price=price
-            )
-
-            trading_client.submit_order(order)
-            print(f"[BUY ATTEMPT] {symbol} @ {price}")
-
-        except Exception as e:
-            print(f"[BUY ERROR] {e}")
-
-        time.sleep(5)
-
-        if has_open_position(symbol):
-            print(f"[FILLED] {symbol} position opened")
-            return
-
-    print(f"[MISSED] Entry failed for {symbol}")
-    open_trade_symbols.discard(symbol)
+def position_exists(symbol):
+    positions = get_positions()
+    for pos in positions:
+        if pos["symbol"] == symbol:
+            return True
+    return False
 
 
-# =============================
-# EXIT LADDER (Option A)
-# =============================
+def place_limit_order(symbol, qty, side, limit_price):
 
-def option_a_exit(symbol, qty, stop_price):
+    order_data = {
+        "symbol": symbol,
+        "qty": int(qty),
+        "side": side,
+        "type": "limit",
+        "limit_price": str(limit_price),
+        "time_in_force": "gtc"
+    }
 
-    print(f"[EXIT] Starting ladder for {symbol}")
+    print("ORDER PAYLOAD:", order_data)
 
-    offsets = [0, -0.02, -0.05, -0.10]
+    r = requests.post(ORDERS_URL, json=order_data, headers=HEADERS)
 
-    for offset in offsets:
+    print("ALPACA RESPONSE:", r.status_code, r.text)
 
-        price = round(stop_price + offset, 2)
+    return r.status_code, r.text
 
-        try:
-            order = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.SELL,
-                type=OrderType.LIMIT,
-                time_in_force=TimeInForce.GTC,
-                limit_price=price
-            )
+# ======================= WEBHOOK =======================
 
-            trading_client.submit_order(order)
-            print(f"[SELL ATTEMPT] {symbol} @ {price}")
+@app.route("/", methods=["GET"])
+def health():
+    return "Bot is live", 200
 
-        except Exception as e:
-            print(f"[SELL ERROR] {e}")
-
-        time.sleep(5)
-
-        if not has_open_position(symbol):
-            print(f"[CLOSED] {symbol}")
-            open_trade_symbols.discard(symbol)
-            return
-
-
-# =========================================================
-# ✅ THIS MATCHES YOUR TRADINGVIEW:  /tv
-# =========================================================
 
 @app.route("/tv", methods=["POST"])
 def tradingview_webhook():
 
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data"}), 400
+    try:
+        data = request.get_json(force=True)
+        print("WEBHOOK RECEIVED:", data)
 
-    # ✅ SECRET CHECK
+    except Exception as e:
+        return jsonify({"error": "Invalid JSON", "details": str(e)}), 400
+
+    # Security check
     if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Invalid secret"}), 403
+        return jsonify({"error": "Unauthorized"}), 403
 
-    # ✅ PAYLOAD MATCH
-    action  = data.get("action")
-    symbol  = data.get("ticker", "").upper()
-    qty     = int(data.get("quantity", 1))
-    entry   = float(data.get("entry", 0))
-    stop    = float(data.get("stop", 0))
+    action = data.get("action")
+    symbol = data.get("ticker")
+    qty = data.get("quantity")
+    entry = data.get("entry")
 
-    print(f"[WEBHOOK] {action} {symbol} Qty:{qty} Entry:{entry} Stop:{stop}")
+    if not all([action, symbol, qty, entry]):
+        return jsonify({"error": "Missing fields"}), 400
 
-    if not symbol or qty <= 0:
-        return jsonify({"error": "Invalid input"}), 400
+    with trade_lock:
 
-    # ================= SAFETY
-    if symbol in open_trade_symbols:
-        return jsonify({"status": f"{symbol} already processing"})
+        if action == "PLAN" or action == "BUY":
 
-    # ================= BUY
-    if action == "BUY":
+            if position_exists(symbol):
+                return jsonify({"msg": f"Position already open for {symbol}"}), 200
 
-        if has_open_position(symbol):
-            return jsonify({"status": f"{symbol} already has position"})
+            status, msg = place_limit_order(symbol, qty, "buy", entry)
 
-        open_trade_symbols.add(symbol)
-
-        threading.Thread(
-            target=option_a_entry,
-            args=(symbol, qty, entry),
-            daemon=True
-        ).start()
-
-        return jsonify({"status": "BUY ladder started ✅"})
-
-    # ================= SELL
-    if action == "SELL":
-
-        if not has_open_position(symbol):
-            return jsonify({"status": "No position to sell"})
-
-        threading.Thread(
-            target=option_a_exit,
-            args=(symbol, qty, stop),
-            daemon=True
-        ).start()
-
-        return jsonify({"status": "SELL ladder started ✅"})
-
-    return jsonify({"error": "Invalid action"}), 400
+            return jsonify({"alpaca_status": status, "response": msg})
 
 
-# =============================
-# HEALTH CHECK
-# =============================
+        elif action == "SELL":
 
-@app.route("/")
-def home():
-    return "Chris Trading Bot - LIVE ✅"
+            if not position_exists(symbol):
+                return jsonify({"msg": f"No open position for {symbol}"}), 200
+
+            status, msg = place_limit_order(symbol, qty, "sell", entry)
+
+            return jsonify({"alpaca_status": status, "response": msg})
+
+        else:
+            return jsonify({"error": "Invalid action"}), 400
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+
 
 
 
