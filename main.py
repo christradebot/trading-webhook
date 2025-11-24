@@ -1,11 +1,11 @@
 import os
-import json
 import threading
 import time
 import asyncio
 from flask import Flask, request, jsonify
 import requests
-from alpaca_trade_api.stream import Stream
+
+from alpaca.data.live import StockDataStream
 
 app = Flask(__name__)
 
@@ -16,18 +16,14 @@ SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# Choose ONE depending on your plan
-DATA_URL = "wss://stream.data.alpaca.markets/v2/sip"   # SIP (paid)
-# DATA_URL = "wss://stream.data.alpaca.markets/v2/iex" # IEX (free)
+ORDERS_URL = f"{BASE_URL}/v2/orders"
+POSITIONS_URL = f"{BASE_URL}/v2/positions"
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
     "APCA-API-SECRET-KEY": SECRET_KEY,
     "Content-Type": "application/json"
 }
-
-ORDERS_URL = f"{BASE_URL}/v2/orders"
-POSITIONS_URL = f"{BASE_URL}/v2/positions"
 
 trade_lock = threading.Lock()
 active_trade = None
@@ -77,7 +73,7 @@ def ladder_exit(symbol, qty, start_price, side="sell"):
     price = float(start_price)
 
     for i in range(6):  # 30 seconds total
-        print(f"ATTEMPT {i+1} @ {price}")
+        print(f"ATTEMPT {i + 1} @ {price}")
 
         place_limit_order(symbol, qty, side, price)
         time.sleep(5)
@@ -95,11 +91,13 @@ def ladder_exit(symbol, qty, start_price, side="sell"):
 # ====================== WEBSOCKET ENGINE ======================
 
 def start_websocket(trade):
-
     print(f"📡 WEBSOCKET STARTED FOR: {trade['symbol']}")
 
     trail_active = False
     highest_price = trade["entry"]
+
+    # ✅ SIP feed (you paid for this)
+    stream = StockDataStream(API_KEY, SECRET_KEY, feed="sip")
 
     async def on_trade(data):
         nonlocal highest_price, trail_active
@@ -107,7 +105,7 @@ def start_websocket(trade):
         price = float(data.price)
         symbol = trade["symbol"]
 
-        print("LIVE:", symbol, price)
+        print(f"LIVE {symbol} : {price}")
 
         # Track highest price
         if price > highest_price:
@@ -121,21 +119,20 @@ def start_websocket(trade):
         stop = trade["stop"]
         target = trade["target"]
 
-        # Update trailing stop
+        # Trailing stop calculation
         if trail_active:
             stop = round(highest_price * (1 - trade["trail"] / 100), 4)
 
         print(f"STOP: {stop} | TARGET: {target}")
 
-        # Trigger on TOUCH
+        # Touch-based exit
         if price <= stop or price >= target:
-
             print("🚨 EXIT CONDITION HIT")
+
             ladder_exit(symbol, trade["qty"], price)
 
-            stream.stop_ws()
+            await stream.stop()
 
-    stream = Stream(API_KEY, SECRET_KEY, base_url=DATA_URL)
     stream.subscribe_trades(on_trade, trade["symbol"])
     stream.run()
 
@@ -149,7 +146,6 @@ def health():
 
 @app.route("/tv", methods=["POST"])
 def tradingview_webhook():
-
     global active_trade
 
     try:
@@ -199,6 +195,7 @@ def tradingview_webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
