@@ -1,74 +1,146 @@
 import os
 import json
 import threading
+import time
+import asyncio
 from flask import Flask, request, jsonify
 import requests
+from alpaca_trade_api.stream import Stream
 
 app = Flask(__name__)
 
-# ======================= ENV VARIABLES =======================
+# ====================== ENV ======================
 
-APCA_API_KEY_ID = os.getenv("APCA_API_KEY_ID")
-APCA_API_SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
-APCA_API_BASE_URL = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")
+API_KEY = os.getenv("APCA_API_KEY_ID")
+SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
+BASE_URL = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# ======================= ALPACA CONFIG ========================
+# CONFIRMED: SIP REAL-TIME DATA
+DATA_URL = "wss://stream.data.alpaca.markets/v2/sip"
 
 HEADERS = {
-    "APCA-API-KEY-ID": APCA_API_KEY_ID,
-    "APCA-API-SECRET-KEY": APCA_API_SECRET_KEY,
+    "APCA-API-KEY-ID": API_KEY,
+    "APCA-API-SECRET-KEY": SECRET_KEY,
     "Content-Type": "application/json"
 }
 
-ORDERS_URL = f"{APCA_API_BASE_URL}/v2/orders"
-POSITIONS_URL = f"{APCA_API_BASE_URL}/v2/positions"
-
-# ======================= LOCK =======================
+ORDERS_URL = f"{BASE_URL}/v2/orders"
+POSITIONS_URL = f"{BASE_URL}/v2/positions"
 
 trade_lock = threading.Lock()
+active_trade = None
 
-# ======================= HELPERS =======================
+
+# ====================== HELPERS ======================
 
 def get_positions():
     try:
         r = requests.get(POSITIONS_URL, headers=HEADERS)
         if r.status_code == 200:
             return r.json()
-        return []
     except Exception as e:
         print("POSITION ERROR:", str(e))
-        return []
+    return []
 
 
 def position_exists(symbol):
-    positions = get_positions()
-    for pos in positions:
-        if pos["symbol"] == symbol:
+    for pos in get_positions():
+        if pos.get("symbol") == symbol:
             return True
     return False
 
 
-def place_limit_order(symbol, qty, side, limit_price):
+def place_limit_order(symbol, qty, side, price):
 
-    order_data = {
+    order = {
         "symbol": symbol,
         "qty": int(qty),
         "side": side,
         "type": "limit",
-        "limit_price": str(limit_price),
+        "limit_price": str(round(float(price), 4)),
         "time_in_force": "gtc"
     }
 
-    print("ORDER PAYLOAD:", order_data)
+    r = requests.post(ORDERS_URL, json=order, headers=HEADERS)
+    print(f"[{side.upper()} ORDER] {symbol} @ {price} ->", r.status_code, r.text)
 
-    r = requests.post(ORDERS_URL, json=order_data, headers=HEADERS)
+    return r.status_code == 200
 
-    print("ALPACA RESPONSE:", r.status_code, r.text)
 
-    return r.status_code, r.text
+# ====================== LADDER EXIT ======================
 
-# ======================= WEBHOOK =======================
+def ladder_exit(symbol, qty, start_price):
+
+    print("🔥 LADDER EXIT STARTED 🔥")
+    price = float(start_price)
+
+    for i in range(6): # 30 seconds total
+        print(f"LADDER ATTEMPT {i+1} @ {price}")
+        place_limit_order(symbol, qty, "sell", round(price, 4))
+
+        time.sleep(5)
+
+        if not position_exists(symbol):
+            print("✅ POSITION CLOSED")
+            return
+
+        price -= 0.01
+
+    print("⚠ FINAL AGGRESSIVE EXIT")
+    place_limit_order(symbol, qty, "sell", round(price, 4))
+
+
+# ====================== WEBSOCKET ======================
+
+def start_websocket(trade):
+
+    print(f"📡 WEBSOCKET STARTED for {trade['symbol']}")
+
+    trail_active = False
+    highest_price = trade["entry"]
+
+    async def on_trade(data):
+        nonlocal highest_price, trail_active, active_trade
+
+        symbol = trade["symbol"]
+        price = float(data.price)
+
+        print(f"📈 {symbol} LIVE:", price)
+
+        # Track highest price (for trailing)
+        if price > highest_price:
+            highest_price = price
+
+        # Activate trailing after +20%
+        if not trail_active and price >= trade["entry"] * 1.20:
+            trail_active = True
+            print("✅ TRAILING ACTIVATED")
+
+        # Default stop/target
+        stop = trade["stop"]
+        target = trade["target"]
+
+        # Apply trailing stop if active
+        if trail_active:
+            stop = round(highest_price * (1 - trade["trail"] / 100), 4)
+            print(f"🔁 TRAILING STOP:", stop)
+
+        # TOUCH-BASED EXIT
+        if price <= stop or price >= target:
+
+            print("🚨 EXIT CONDITION HIT")
+            ladder_exit(symbol, trade["qty"], price)
+
+            stream.stop_ws()
+            active_trade = None
+
+    stream = Stream(API_KEY, SECRET_KEY, base_url=DATA_URL)
+    stream.subscribe_trades(on_trade, trade["symbol"])
+    stream.run()
+
+
+# ====================== FLASK ======================
 
 @app.route("/", methods=["GET"])
 def health():
@@ -78,48 +150,50 @@ def health():
 @app.route("/tv", methods=["POST"])
 def tradingview_webhook():
 
+    global active_trade
+
     try:
         data = request.get_json(force=True)
         print("WEBHOOK RECEIVED:", data)
-
     except Exception as e:
         return jsonify({"error": "Invalid JSON", "details": str(e)}), 400
 
-    # Security check
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
 
-    action = data.get("action")
     symbol = data.get("ticker")
     qty = data.get("quantity")
-    entry = data.get("entry")
+    entry = float(data.get("entry"))
+    stop = float(data.get("stop"))
+    target = float(data.get("target"))
+    trail = float(data.get("trail", 15))
 
-    if not all([action, symbol, qty, entry]):
-        return jsonify({"error": "Missing fields"}), 400
+    if not all([symbol, qty, entry, stop, target]):
+        return jsonify({"error": "Missing required fields"}), 400
+
+    if position_exists(symbol):
+        return jsonify({"msg": f"Position already open for {symbol}"}), 200
 
     with trade_lock:
 
-        if action == "PLAN" or action == "BUY":
+        buy_ok = place_limit_order(symbol, qty, "buy", entry)
+        if not buy_ok:
+            return jsonify({"error": "BUY order failed"}), 500
 
-            if position_exists(symbol):
-                return jsonify({"msg": f"Position already open for {symbol}"}), 200
+        active_trade = {
+            "symbol": symbol,
+            "qty": qty,
+            "entry": entry,
+            "stop": stop,
+            "target": target,
+            "trail": trail
+        }
 
-            status, msg = place_limit_order(symbol, qty, "buy", entry)
+        ws_thread = threading.Thread(target=start_websocket, args=(active_trade,))
+        ws_thread.daemon = True
+        ws_thread.start()
 
-            return jsonify({"alpaca_status": status, "response": msg})
-
-
-        elif action == "SELL":
-
-            if not position_exists(symbol):
-                return jsonify({"msg": f"No open position for {symbol}"}), 200
-
-            status, msg = place_limit_order(symbol, qty, "sell", entry)
-
-            return jsonify({"alpaca_status": status, "response": msg})
-
-        else:
-            return jsonify({"error": "Invalid action"}), 400
+        return jsonify({"msg": f"{symbol} trade live & monitored via WebSocket"}), 200
 
 
 if __name__ == "__main__":
