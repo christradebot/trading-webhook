@@ -16,8 +16,9 @@ SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
-# CONFIRMED: SIP REAL-TIME DATA
-DATA_URL = "wss://stream.data.alpaca.markets/v2/sip"
+# Choose ONE depending on your plan
+DATA_URL = "wss://stream.data.alpaca.markets/v2/sip"   # SIP (paid)
+# DATA_URL = "wss://stream.data.alpaca.markets/v2/iex" # IEX (free)
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
@@ -36,7 +37,7 @@ active_trade = None
 
 def get_positions():
     try:
-        r = requests.get(POSITIONS_URL, headers=HEADERS)
+        r = requests.get(POSITIONS_URL, headers=HEADERS, timeout=5)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
@@ -46,13 +47,12 @@ def get_positions():
 
 def position_exists(symbol):
     for pos in get_positions():
-        if pos.get("symbol") == symbol:
+        if pos["symbol"] == symbol:
             return True
     return False
 
 
 def place_limit_order(symbol, qty, side, price):
-
     order = {
         "symbol": symbol,
         "qty": int(qty),
@@ -62,53 +62,54 @@ def place_limit_order(symbol, qty, side, price):
         "time_in_force": "gtc"
     }
 
+    print("SENDING ORDER:", order)
     r = requests.post(ORDERS_URL, json=order, headers=HEADERS)
-    print(f"[{side.upper()} ORDER] {symbol} @ {price} ->", r.status_code, r.text)
 
-    return r.status_code == 200
+    print("ALPACA:", r.status_code, r.text)
+    return r.status_code in [200, 201]
 
 
 # ====================== LADDER EXIT ======================
 
-def ladder_exit(symbol, qty, start_price):
+def ladder_exit(symbol, qty, start_price, side="sell"):
+    print("🪜 LADDER EXIT STARTED")
 
-    print("🔥 LADDER EXIT STARTED 🔥")
     price = float(start_price)
 
-    for i in range(6): # 30 seconds total
-        print(f"LADDER ATTEMPT {i+1} @ {price}")
-        place_limit_order(symbol, qty, "sell", round(price, 4))
+    for i in range(6):  # 30 seconds total
+        print(f"ATTEMPT {i+1} @ {price}")
 
+        place_limit_order(symbol, qty, side, price)
         time.sleep(5)
 
         if not position_exists(symbol):
             print("✅ POSITION CLOSED")
             return
 
-        price -= 0.01
+        price = round(price - 0.01, 4)
 
-    print("⚠ FINAL AGGRESSIVE EXIT")
-    place_limit_order(symbol, qty, "sell", round(price, 4))
+    print("⚠️ FINAL AGGRESSIVE EXIT")
+    place_limit_order(symbol, qty, side, price)
 
 
-# ====================== WEBSOCKET ======================
+# ====================== WEBSOCKET ENGINE ======================
 
 def start_websocket(trade):
 
-    print(f"📡 WEBSOCKET STARTED for {trade['symbol']}")
+    print(f"📡 WEBSOCKET STARTED FOR: {trade['symbol']}")
 
     trail_active = False
     highest_price = trade["entry"]
 
     async def on_trade(data):
-        nonlocal highest_price, trail_active, active_trade
+        nonlocal highest_price, trail_active
 
-        symbol = trade["symbol"]
         price = float(data.price)
+        symbol = trade["symbol"]
 
-        print(f"📈 {symbol} LIVE:", price)
+        print("LIVE:", symbol, price)
 
-        # Track highest price (for trailing)
+        # Track highest price
         if price > highest_price:
             highest_price = price
 
@@ -117,23 +118,22 @@ def start_websocket(trade):
             trail_active = True
             print("✅ TRAILING ACTIVATED")
 
-        # Default stop/target
         stop = trade["stop"]
         target = trade["target"]
 
-        # Apply trailing stop if active
+        # Update trailing stop
         if trail_active:
             stop = round(highest_price * (1 - trade["trail"] / 100), 4)
-            print(f"🔁 TRAILING STOP:", stop)
 
-        # TOUCH-BASED EXIT
+        print(f"STOP: {stop} | TARGET: {target}")
+
+        # Trigger on TOUCH
         if price <= stop or price >= target:
 
             print("🚨 EXIT CONDITION HIT")
             ladder_exit(symbol, trade["qty"], price)
 
             stream.stop_ws()
-            active_trade = None
 
     stream = Stream(API_KEY, SECRET_KEY, base_url=DATA_URL)
     stream.subscribe_trades(on_trade, trade["symbol"])
@@ -144,7 +144,7 @@ def start_websocket(trade):
 
 @app.route("/", methods=["GET"])
 def health():
-    return "Bot is live", 200
+    return "Bot is live ✅", 200
 
 
 @app.route("/tv", methods=["POST"])
@@ -154,9 +154,9 @@ def tradingview_webhook():
 
     try:
         data = request.get_json(force=True)
-        print("WEBHOOK RECEIVED:", data)
+        print("WEBHOOK:", data)
     except Exception as e:
-        return jsonify({"error": "Invalid JSON", "details": str(e)}), 400
+        return jsonify({"error": "Bad JSON", "details": str(e)}), 400
 
     if data.get("secret") != WEBHOOK_SECRET:
         return jsonify({"error": "Unauthorized"}), 403
@@ -169,16 +169,17 @@ def tradingview_webhook():
     trail = float(data.get("trail", 15))
 
     if not all([symbol, qty, entry, stop, target]):
-        return jsonify({"error": "Missing required fields"}), 400
+        return jsonify({"error": "Missing fields"}), 400
 
     if position_exists(symbol):
-        return jsonify({"msg": f"Position already open for {symbol}"}), 200
+        return jsonify({"msg": f"Position already exists for {symbol}"}), 200
 
     with trade_lock:
 
-        buy_ok = place_limit_order(symbol, qty, "buy", entry)
-        if not buy_ok:
-            return jsonify({"error": "BUY order failed"}), 500
+        ok = place_limit_order(symbol, qty, "buy", entry)
+
+        if not ok:
+            return jsonify({"error": "Buy order failed"}), 500
 
         active_trade = {
             "symbol": symbol,
@@ -193,11 +194,12 @@ def tradingview_webhook():
         ws_thread.daemon = True
         ws_thread.start()
 
-        return jsonify({"msg": f"{symbol} trade live & monitored via WebSocket"}), 200
+    return jsonify({"msg": f"{symbol} trade live & monitored"}), 200
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
