@@ -54,7 +54,10 @@ def place_limit_order(symbol, qty, side, price):
         "side": side,
         "type": "limit",
         "limit_price": str(round(float(price), 4)),
-        "time_in_force": "gtc"
+
+        # ✅ REQUIRED FOR PRE/POST MARKET
+        "time_in_force": "day",
+        "extended_hours": True
     }
 
     print("SENDING ORDER:", order)
@@ -91,16 +94,15 @@ def ladder_exit(symbol, qty, start_price):
 # ====================== WEBSOCKET ENGINE ======================
 
 def start_websocket(trade):
-
     print(f"📡 WEBSOCKET STARTED FOR: {trade['symbol']}")
 
     highest_price = trade["entry"]
     trail_active = False
 
+    # ✅ SIP feed (you paid for this)
     stream = StockDataStream(API_KEY, SECRET_KEY, feed="sip")
 
     async def on_trade(data):
-
         nonlocal highest_price, trail_active
 
         price = float(data.price)
@@ -108,9 +110,11 @@ def start_websocket(trade):
 
         print(f"LIVE {symbol} : {price}")
 
+        # Track highest price
         if price > highest_price:
             highest_price = price
 
+        # Activate trailing after +20%
         if not trail_active and price >= trade["entry"] * 1.20:
             trail_active = True
             print("✅ TRAILING ACTIVATED")
@@ -118,11 +122,13 @@ def start_websocket(trade):
         stop = trade["stop"]
         target = trade["target"]
 
+        # Adjust stop once trailing is active
         if trail_active:
             stop = round(highest_price * (1 - trade["trail"] / 100), 4)
 
         print(f"STOP: {stop} | TARGET: {target}")
 
+        # Touch-based exit
         if price <= stop or price >= target:
             print("🚨 EXIT CONDITION HIT")
 
@@ -132,7 +138,6 @@ def start_websocket(trade):
 
     stream.subscribe_trades(on_trade, trade["symbol"])
     stream.run()
-
 
 
 # ====================== FLASK ======================
@@ -193,9 +198,9 @@ def tradingview_webhook():
 
 if __name__ == "__main__":
     print("USING BASE URL:", BASE_URL)
-    print("USING KEY:", "SET" if API_KEY else "MISSING")
-
+    print("API KEY STATUS:", "SET ✅" if API_KEY else "MISSING ❌")
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
