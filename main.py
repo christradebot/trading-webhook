@@ -1,10 +1,12 @@
 import os
 import threading
 import time
+import asyncio
 from flask import Flask, request, jsonify
 import requests
 
 from alpaca.data.live import StockDataStream
+from alpaca.data.enums import DataFeed
 
 app = Flask(__name__)
 
@@ -54,14 +56,11 @@ def place_limit_order(symbol, qty, side, price):
         "side": side,
         "type": "limit",
         "limit_price": str(round(float(price), 4)),
-
-        # ✅ REQUIRED FOR PRE/POST MARKET
-        "time_in_force": "day",
-        "extended_hours": True
+        "time_in_force": "day",      # ✅ DAY for extended hours
+        "extended_hours": True        # ✅ PRE/AFTER MARKET
     }
 
     print("SENDING ORDER:", order)
-
     r = requests.post(ORDERS_URL, json=order, headers=HEADERS)
 
     print("ALPACA:", r.status_code, r.text)
@@ -70,15 +69,15 @@ def place_limit_order(symbol, qty, side, price):
 
 # ====================== LADDER EXIT ======================
 
-def ladder_exit(symbol, qty, start_price):
+def ladder_exit(symbol, qty, start_price, side="sell"):
     print("🪜 LADDER EXIT STARTED")
 
-    price = round(float(start_price), 4)
+    price = float(start_price)
 
     for i in range(6):  # 30 seconds total
         print(f"ATTEMPT {i + 1} @ {price}")
 
-        place_limit_order(symbol, qty, "sell", price)
+        place_limit_order(symbol, qty, side, price)
         time.sleep(5)
 
         if not position_exists(symbol):
@@ -88,7 +87,7 @@ def ladder_exit(symbol, qty, start_price):
         price = round(price - 0.01, 4)
 
     print("⚠️ FINAL AGGRESSIVE EXIT")
-    place_limit_order(symbol, qty, "sell", price)
+    place_limit_order(symbol, qty, side, price)
 
 
 # ====================== WEBSOCKET ENGINE ======================
@@ -96,11 +95,10 @@ def ladder_exit(symbol, qty, start_price):
 def start_websocket(trade):
     print(f"📡 WEBSOCKET STARTED FOR: {trade['symbol']}")
 
-    highest_price = trade["entry"]
     trail_active = False
+    highest_price = trade["entry"]
 
-    # ✅ SIP feed (you paid for this)
-    stream = StockDataStream(API_KEY, SECRET_KEY, feed="sip")
+    stream = StockDataStream(API_KEY, SECRET_KEY, feed=DataFeed.SIP)  # ✅ FIXED
 
     async def on_trade(data):
         nonlocal highest_price, trail_active
@@ -110,11 +108,10 @@ def start_websocket(trade):
 
         print(f"LIVE {symbol} : {price}")
 
-        # Track highest price
         if price > highest_price:
             highest_price = price
 
-        # Activate trailing after +20%
+        # ✅ Activate trailing at +20%
         if not trail_active and price >= trade["entry"] * 1.20:
             trail_active = True
             print("✅ TRAILING ACTIVATED")
@@ -122,18 +119,14 @@ def start_websocket(trade):
         stop = trade["stop"]
         target = trade["target"]
 
-        # Adjust stop once trailing is active
         if trail_active:
             stop = round(highest_price * (1 - trade["trail"] / 100), 4)
 
         print(f"STOP: {stop} | TARGET: {target}")
 
-        # Touch-based exit
         if price <= stop or price >= target:
             print("🚨 EXIT CONDITION HIT")
-
             ladder_exit(symbol, trade["qty"], price)
-
             await stream.stop()
 
     stream.subscribe_trades(on_trade, trade["symbol"])
@@ -197,9 +190,8 @@ def tradingview_webhook():
 
 
 if __name__ == "__main__":
-    print("USING BASE URL:", BASE_URL)
-    print("API KEY STATUS:", "SET ✅" if API_KEY else "MISSING ❌")
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
