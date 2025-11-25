@@ -6,7 +6,6 @@ from flask import Flask, request, jsonify
 import requests
 
 from alpaca.data.live import StockDataStream
-from alpaca.data.enums import DataFeed
 
 app = Flask(__name__)
 
@@ -19,6 +18,7 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 
 ORDERS_URL = f"{BASE_URL}/v2/orders"
 POSITIONS_URL = f"{BASE_URL}/v2/positions"
+ORDER_STATUS_URL = f"{BASE_URL}/v2/orders/"
 
 HEADERS = {
     "APCA-API-KEY-ID": API_KEY,
@@ -28,7 +28,6 @@ HEADERS = {
 
 trade_lock = threading.Lock()
 active_trade = None
-
 
 # ====================== HELPERS ======================
 
@@ -42,11 +41,21 @@ def get_positions():
     return []
 
 
-def position_exists(symbol):
+def get_position_qty(symbol):
     for pos in get_positions():
         if pos["symbol"] == symbol:
-            return True
-    return False
+            return float(pos["qty"])
+    return 0
+
+
+def get_order_status(order_id):
+    try:
+        r = requests.get(f"{ORDER_STATUS_URL}{order_id}", headers=HEADERS, timeout=5)
+        if r.status_code == 200:
+            return r.json()
+    except Exception as e:
+        print("ORDER STATUS ERROR:", str(e))
+    return None
 
 
 def place_limit_order(symbol, qty, side, price):
@@ -56,20 +65,24 @@ def place_limit_order(symbol, qty, side, price):
         "side": side,
         "type": "limit",
         "limit_price": str(round(float(price), 4)),
-        "time_in_force": "day",      # ✅ DAY for extended hours
-        "extended_hours": True        # ✅ PRE/AFTER MARKET
+        "time_in_force": "day",
+        "extended_hours": True
     }
 
     print("SENDING ORDER:", order)
     r = requests.post(ORDERS_URL, json=order, headers=HEADERS)
 
     print("ALPACA:", r.status_code, r.text)
-    return r.status_code in [200, 201]
+
+    if r.status_code in [200, 201]:
+        return r.json().get("id")
+
+    return None
 
 
 # ====================== LADDER EXIT ======================
 
-def ladder_exit(symbol, qty, start_price, side="sell"):
+def ladder_exit(symbol, qty, start_price):
     print("🪜 LADDER EXIT STARTED")
 
     price = float(start_price)
@@ -77,41 +90,57 @@ def ladder_exit(symbol, qty, start_price, side="sell"):
     for i in range(6):  # 30 seconds total
         print(f"ATTEMPT {i + 1} @ {price}")
 
-        place_limit_order(symbol, qty, side, price)
+        place_limit_order(symbol, qty, "sell", price)
         time.sleep(5)
 
-        if not position_exists(symbol):
+        if get_position_qty(symbol) <= 0:
             print("✅ POSITION CLOSED")
             return
 
         price = round(price - 0.01, 4)
 
-    print("⚠️ FINAL AGGRESSIVE EXIT")
-    place_limit_order(symbol, qty, side, price)
+    print("⚠️ FINAL EXIT ATTEMPT")
+    place_limit_order(symbol, qty, "sell", price)
 
 
 # ====================== WEBSOCKET ENGINE ======================
 
-def start_websocket(trade):
+def start_websocket(trade, order_id):
     print(f"📡 WEBSOCKET STARTED FOR: {trade['symbol']}")
 
-    trail_active = False
     highest_price = trade["entry"]
+    trail_active = False
+    entry_filled = False
 
-    stream = StockDataStream(API_KEY, SECRET_KEY, feed=DataFeed.SIP)  # ✅ FIXED
+    stream = StockDataStream(API_KEY, SECRET_KEY, feed="sip")
 
     async def on_trade(data):
-        nonlocal highest_price, trail_active
+        nonlocal highest_price, trail_active, entry_filled
 
         price = float(data.price)
         symbol = trade["symbol"]
 
         print(f"LIVE {symbol} : {price}")
 
+        # ---- CHECK IF BUY HAS FILLED ----
+        if not entry_filled:
+            order_info = get_order_status(order_id)
+
+            if order_info and order_info.get("status") == "filled":
+                if get_position_qty(symbol) > 0:
+                    entry_filled = True
+                    print("✅ BUY ORDER FILLED — POSITION CONFIRMED")
+                else:
+                    return
+            else:
+                print("⌛ Waiting for BUY fill...")
+                return
+
+        # Track highest price after fill
         if price > highest_price:
             highest_price = price
 
-        # ✅ Activate trailing at +20%
+        # Activate trailing after +20%
         if not trail_active and price >= trade["entry"] * 1.20:
             trail_active = True
             print("✅ TRAILING ACTIVATED")
@@ -126,8 +155,12 @@ def start_websocket(trade):
 
         if price <= stop or price >= target:
             print("🚨 EXIT CONDITION HIT")
-            ladder_exit(symbol, trade["qty"], price)
-            await stream.stop()
+
+            if get_position_qty(symbol) > 0:
+                ladder_exit(symbol, trade["qty"], price)
+                await stream.stop()
+            else:
+                print("NO POSITION — SKIPPING EXIT")
 
     stream.subscribe_trades(on_trade, trade["symbol"])
     stream.run()
@@ -154,7 +187,7 @@ def tradingview_webhook():
         return jsonify({"error": "Unauthorized"}), 403
 
     symbol = data.get("ticker")
-    qty = data.get("quantity")
+    qty = int(data.get("quantity"))
     entry = float(data.get("entry"))
     stop = float(data.get("stop"))
     target = float(data.get("target"))
@@ -163,14 +196,11 @@ def tradingview_webhook():
     if not all([symbol, qty, entry, stop, target]):
         return jsonify({"error": "Missing fields"}), 400
 
-    if position_exists(symbol):
-        return jsonify({"msg": f"Position already exists for {symbol}"}), 200
-
     with trade_lock:
 
-        ok = place_limit_order(symbol, qty, "buy", entry)
+        order_id = place_limit_order(symbol, qty, "buy", entry)
 
-        if not ok:
+        if not order_id:
             return jsonify({"error": "Buy order failed"}), 500
 
         active_trade = {
@@ -182,7 +212,7 @@ def tradingview_webhook():
             "trail": trail
         }
 
-        ws_thread = threading.Thread(target=start_websocket, args=(active_trade,))
+        ws_thread = threading.Thread(target=start_websocket, args=(active_trade, order_id))
         ws_thread.daemon = True
         ws_thread.start()
 
