@@ -5,10 +5,9 @@ from flask import Flask, request, jsonify
 import requests
 from alpaca.data.live import StockDataStream
 
-app = Flask(__name__)
-
-# ===================== ENV ======================
-
+# -----------------------------
+# ENVIRONMENT
+# -----------------------------
 API_KEY = os.getenv("APCA_API_KEY_ID")
 SECRET_KEY = os.getenv("APCA_API_SECRET_KEY")
 BASE_URL = os.getenv("APCA_API_BASE_URL", "https://api.alpaca.markets")
@@ -23,36 +22,45 @@ HEADERS = {
     "Content-Type": "application/json"
 }
 
+app = Flask(__name__)
+
 trade_lock = threading.Lock()
 active_trade = None
 
-# ===================== HELPERS ======================
 
-def safe_request(method, url, **kwargs):
+# ================================
+# SAFE REQUEST WRAPPER
+# ================================
+def safe(method, url, **kwargs):
     try:
-        return requests.request(method, url, headers=HEADERS, timeout=5, **kwargs)
-    except:
+        r = requests.request(method, url, headers=HEADERS, timeout=5, **kwargs)
+        return r
+    except Exception as e:
+        print(f"REQUEST ERROR: {e}")
         return None
 
 
+# ================================
+# ORDER HELPERS (blocking)
+# ================================
 def place_limit_order(symbol, qty, side, price):
-    qty = int(qty)
-
     order = {
         "symbol": symbol,
-        "qty": qty,
+        "qty": int(qty),
         "side": side,
         "type": "limit",
-        "limit_price": str(round(float(price), 4)),
+        "limit_price": f"{price:.2f}",
         "time_in_force": "day",
         "extended_hours": True
     }
 
-    print(f"📤 {side.upper()} ORDER → {symbol} @ {price}")
-    r = safe_request("POST", ORDERS_URL, json=order)
+    print(f"SEND ORDER: {order}")
 
+    r = safe("POST", ORDERS_URL, json=order)
     if r is None:
         return None, 500
+
+    print("ALPACA:", r.status_code, r.text)
 
     try:
         return r.json(), r.status_code
@@ -60,203 +68,236 @@ def place_limit_order(symbol, qty, side, price):
         return {"error": r.text}, r.status_code
 
 
+def cancel_order(order_id):
+    safe("DELETE", f"{ORDERS_URL}/{order_id}")
+
+
 def get_position(symbol):
-    r = safe_request("GET", POSITIONS_URL)
+    r = safe("GET", POSITIONS_URL)
     if not r or r.status_code != 200:
         return None
-    for p in r.json():
-        if p["symbol"] == symbol:
-            return p
+
+    try:
+        for p in r.json():
+            if p["symbol"] == symbol:
+                return p
+    except:
+        return None
     return None
 
 
 def has_position(symbol):
-    pos = get_position(symbol)
-    return pos and float(pos.get("qty", 0)) > 0
+    p = get_position(symbol)
+    if not p:
+        return False
+    return float(p.get("qty", 0)) > 0
 
 
-def get_order_status(order_id):
-    r = safe_request("GET", f"{ORDERS_URL}/{order_id}")
-    return r.json() if r and r.status_code == 200 else None
+def get_order(order_id):
+    r = safe("GET", f"{ORDERS_URL}/{order_id}")
+    if r and r.status_code == 200:
+        return r.json()
+    return None
 
 
-# ===================== WAIT FOR FILL ======================
-
-async def wait_for_fill(symbol, order_id):
-    print(f"⏳ Waiting for {symbol} fill...")
+# ================================
+# WAIT FOR FILL (async)
+# ================================
+async def wait_for_fill(symbol, order_ids):
+    print("WAITING FOR BUY FILL...")
 
     while True:
-        order = await asyncio.to_thread(get_order_status, order_id)
-
-        if order and order.get("status") in ["rejected", "canceled", "expired"]:
-            print(f"❌ ORDER {order['status'].upper()}")
-            return None, None
+        # Check all ladder orders
+        for oid in order_ids:
+            o = await asyncio.to_thread(get_order, oid)
+            if o and o.get("status") in ["canceled", "rejected", "expired"]:
+                continue
 
         pos = await asyncio.to_thread(get_position, symbol)
-
         if pos and float(pos["qty"]) > 0:
-            entry = float(pos["avg_entry_price"])
+            price = float(pos["avg_entry_price"])
             qty = float(pos["qty"])
-            print(f"✅ BUY FILLED → {symbol} @ {entry}")
-            print(f"👀 Monitoring STOP: {active_trade['stop']} | TARGET: {active_trade['target']}")
-            return entry, qty
+            print(f"BUY FILLED @ {price} | QTY {qty}")
+            return price, qty
 
-        await asyncio.sleep(2)
+        await asyncio.sleep(1)
 
 
-# ===================== LADDER EXIT ======================
+# ================================
+# LADDER BUY (async)
+# ================================
+async def ladder_buy(symbol, qty, entry_price):
+    print("LADDER BUY STARTING")
 
-async def ladder_exit(symbol, start_price, hard_stop):
-    print("🪜 Ladder exit started")
+    order_ids = []
+    price = entry_price
 
-    price = float(start_price)
+    for step in range(6):
+        o, s = await asyncio.to_thread(
+            place_limit_order, symbol, qty, "buy", price
+        )
+        if s in [200, 201] and "id" in o:
+            order_ids.append(o["id"])
+        await asyncio.sleep(5)
+        price += 0.01  # upward ladder
 
-    for _ in range(6):
+        # If filled already → stop laddering
+        if await asyncio.to_thread(has_position, symbol):
+            break
+
+    # Cancel any remaining unfilled orders
+    for oid in order_ids:
+        await asyncio.to_thread(cancel_order, oid)
+
+    return await wait_for_fill(symbol, order_ids)
+
+
+# ================================
+# LADDER EXIT (async)
+# ================================
+async def ladder_exit(symbol, current_price, hard_stop):
+    print("EXIT SEQUENCE STARTED")
+
+    price = current_price
+
+    for step in range(6):
         pos = await asyncio.to_thread(get_position, symbol)
-
         if not pos or float(pos["qty"]) <= 0:
-            print("✅ POSITION CLOSED")
+            print("EXIT COMPLETE")
             return
 
-        qty_to_sell = float(pos["qty"])
-        price = max(price, hard_stop)
+        qty = float(pos["qty"])
 
-        print(f"🔴 EXIT ATTEMPT → {symbol} @ {round(price,4)}")
+        if price < hard_stop:
+            price = hard_stop
 
-        await asyncio.to_thread(place_limit_order, symbol, qty_to_sell, "sell", price)
+        await asyncio.to_thread(place_limit_order, symbol, qty, "sell", price)
+
         await asyncio.sleep(5)
 
         if not await asyncio.to_thread(has_position, symbol):
-            print("✅ POSITION CLOSED")
+            print("EXIT COMPLETE")
             return
 
-        price = round(price - 0.01, 4)
+        price -= 0.01
 
-    print("⚠️ Final exit attempt")
-    final_pos = await asyncio.to_thread(get_position, symbol)
+    # FINAL AGGRESSIVE EXIT
+    pos = await asyncio.to_thread(get_position, symbol)
+    if pos:
+        qty = float(pos["qty"])
+        await asyncio.to_thread(place_limit_order, symbol, qty, "sell", price)
 
-    if final_pos and float(final_pos["qty"]) > 0:
-        await asyncio.to_thread(place_limit_order, symbol, final_pos["qty"], "sell", price)
 
-
-# ===================== WEBSOCKET ======================
-
-def start_websocket(trade):
-    global active_trade
-
+# ================================
+# WEBSOCKET MONITOR
+# ================================
+def websocket_thread(trade):
     asyncio.set_event_loop(asyncio.new_event_loop())
     loop = asyncio.get_event_loop()
 
-    async def runner():
+    async def run():
+        print(f"MONITORING {trade['symbol']}")
+
+        stream = StockDataStream(API_KEY, SECRET_KEY, feed="sip")
+
+        filled_entry = trade["filled_entry"]
+        qty = trade["filled_qty"]
+        highest = filled_entry
+        trail_active = False
+
+        async def handler(msg):
+            nonlocal highest, trail_active
+
+            price = float(msg.price)
+            symbol = trade["symbol"]
+
+            if price > highest:
+                highest = price
+
+            stop = trade["stop"]
+            target = trade["target"]
+
+            if price >= filled_entry * 1.2:
+                trail_active = True
+
+            if trail_active:
+                trail_stop = round(highest * (1 - trade["trail"]), 2)
+                stop = max(stop, trail_stop)
+
+            # STOP / TARGET
+            if price <= stop or price >= target:
+                print(f"EXIT TRIGGER @ {price}")
+                await ladder_exit(symbol, price, trade["stop"])
+
+                pos = await asyncio.to_thread(get_position, symbol)
+                if not pos:
+                    pnl = round((price - filled_entry) * qty, 2)
+                    pct = round((price / filled_entry - 1) * 100, 2)
+                    print(f"P/L: ${pnl} ({pct}%)")
+                await stream.stop()
+
         try:
-            stream = StockDataStream(API_KEY, SECRET_KEY, feed="sip")
-
-            entry_price, _ = await wait_for_fill(trade["symbol"], trade["order_id"])
-            if entry_price is None:
-                return
-
-            highest = entry_price
-            trail_active = False
-
-            async def on_trade(data):
-                nonlocal highest, trail_active
-
-                price = float(data.price)
-                symbol = trade["symbol"]
-
-                if price > highest:
-                    highest = price
-
-                if not trail_active and price >= entry_price * 1.2:
-                    trail_active = True
-                    print("🔥 Trailing activated")
-
-                stop = trade["stop"]
-                target = trade["target"]
-
-                if trail_active:
-                    trail_stop = round(highest * (1 - trade["trail"] / 100), 4)
-                    stop = max(stop, trail_stop)
-
-                print(f"📈 {symbol} → {price}")
-
-                if price <= stop:
-                    print("🚨 STOP HIT")
-                    await ladder_exit(symbol, price, trade["stop"])
-                    await stream.stop()
-
-                if price >= target:
-                    print("🎯 TARGET HIT")
-                    await ladder_exit(symbol, price, trade["stop"])
-                    await stream.stop()
-
-            stream.subscribe_trades(on_trade, trade["symbol"])
+            stream.subscribe_trades(handler, trade["symbol"])
             await stream.run()
-
-        except Exception as e:
-            print(f"CRITICAL ERROR: {str(e)}")
-
         finally:
+            global active_trade
             with trade_lock:
-                print("🧹 ACTIVE TRADE CLEARED")
                 active_trade = None
 
-    loop.run_until_complete(runner())
+    loop.run_until_complete(run())
 
 
-# ===================== FLASK ======================
-
+# ================================
+# FLASK ENDPOINTS
+# ================================
 @app.route("/")
 def health():
-    return "Bot Online ✅", 200
+    return "Bot OK", 200
 
 
 @app.route("/tv", methods=["POST"])
-def webhook():
+def tv():
     global active_trade
 
     data = request.get_json(force=True)
-    print(f"✅ SIGNAL RECEIVED: {data}")
+    print("SIGNAL RECEIVED:", data)
 
     if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 403
+        return jsonify({"error": "unauthorized"}), 403
 
-    try:
-        symbol = data["ticker"]
-        qty = int(data["quantity"])
-        entry = float(data["entry"])
-        stop = float(data["stop"])
-        target = float(data["target"])
-        trail = float(data.get("trail", 15))
-    except:
-        return jsonify({"error": "Invalid payload"}), 400
+    symbol = data["ticker"]
+    qty = int(data["quantity"])
+    entry = float(data["entry"])
+    stop = float(data["stop"])
+    target = float(data["target"])
+    trail = float(data.get("trail", 0.15))
 
     with trade_lock:
         if active_trade:
-            return jsonify({"error": "Trade already running"}), 429
+            return jsonify({"error": "trade already active"}), 409
 
-        order_json, status = place_limit_order(symbol, qty, "buy", entry)
-
-        if status not in [200, 201] or "id" not in order_json:
-            return jsonify({"error": "Buy rejected", "alpaca": order_json}), 500
+        filled_price, filled_qty = asyncio.new_event_loop().run_until_complete(
+            ladder_buy(symbol, qty, entry)
+        )
 
         active_trade = {
             "symbol": symbol,
-            "entry": entry,
+            "filled_entry": filled_price,
+            "filled_qty": filled_qty,
             "stop": stop,
             "target": target,
             "trail": trail,
-            "order_id": order_json["id"]
         }
 
-        t = threading.Thread(target=start_websocket, args=(active_trade,), daemon=True)
+        t = threading.Thread(target=websocket_thread, args=(active_trade,), daemon=True)
         t.start()
 
-    return jsonify({"msg": f"{symbol} BUY SENT - Monitoring started"}), 200
+    return jsonify({"status": "ok"}), 200
 
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
+
 
 
 
