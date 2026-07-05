@@ -22,7 +22,7 @@ client = TradingClient(API_KEY, SECRET_KEY, paper=paper)
 
 @app.route("/", methods=["GET"])
 def home():
-    return "Trading Bot Running"
+    return "Trading Bot Running" 
 
 @app.route("/tv", methods=["POST"])
 def webhook():
