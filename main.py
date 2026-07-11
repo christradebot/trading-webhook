@@ -1,67 +1,61 @@
 from flask import Flask, request
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import StopLimitOrderRequest, ReplaceOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass
+from alpaca.trading.requests import StopLimitOrderRequest, ReplaceOrderRequest, GetOrdersRequest
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderClass, OrderStatus
 import os
 import threading
 import time
+from datetime import datetime
 
 app = Flask(__name__)
 
-# Initialize Alpaca Client
 trading_client = TradingClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=True)
 
-# --- Background Manager Thread ---
+# Tracks the highest price reached for each symbol to calculate trailing stop
+high_water_marks = {}
+
 def position_manager():
-    print("Manager thread started...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Manager active: Breakeven + 10% Trailing.")
     while True:
         try:
             positions = trading_client.get_all_positions()
             for pos in positions:
-                # Calculate current profit vs entry
+                symbol = pos.symbol
                 current_price = float(pos.current_price)
                 entry_price = float(pos.avg_entry_price)
                 
-                # Check if profit >= $0.04 AND we are not already at breakeven
-                # We check if the current stop_price is still below entry_price
+                # 1. Update High Water Mark
+                if symbol not in high_water_marks or current_price > high_water_marks[symbol]:
+                    high_water_marks[symbol] = current_price
+                
+                # 2. Breakeven Move (Profit >= $0.04)
                 if current_price >= (entry_price + 0.04):
-                    # Fetch orders to find the associated Stop Loss order
-                    orders = trading_client.get_orders(status="open")
+                    request_params = GetOrdersRequest(status=OrderStatus.OPEN)
+                    orders = trading_client.get_orders(filter=request_params)
                     for order in orders:
-                        if order.symbol == pos.symbol and order.type == "stop_limit":
-                            # Replace existing Stop Loss with new price at Entry
-                            req = ReplaceOrderRequest(stop_price=entry_price)
-                            trading_client.replace_order_by_id(order_id=order.id, order_data=req)
-                            print(f"MOVED STOP TO BE: {pos.symbol} at {entry_price}")
+                        if order.symbol == symbol and order.type == "stop_limit":
+                            if float(order.stop_price) < entry_price:
+                                trading_client.replace_order_by_id(order.id, ReplaceOrderRequest(stop_price=entry_price))
+                                print(f"[{datetime.now().strftime('%H:%M:%S')}] MOVED TO BE: {symbol}")
+
+                # 3. 10% Trailing Stop Logic (Active once above BE)
+                if current_price >= (entry_price + 0.04):
+                    trail_trigger = high_water_marks[symbol] * 0.90
+                    # If current price drops to or below the trailing trigger, market close position
+                    if current_price <= trail_trigger:
+                        trading_client.close_position(symbol)
+                        print(f"[{datetime.now().strftime('%H:%M:%S')}] TRAILING STOP HIT: {symbol} at ${current_price:.2f}")
+                        if symbol in high_water_marks: del high_water_marks[symbol]
+
         except Exception as e:
             print(f"Manager error: {e}")
-        time.sleep(10) # Checks every 10 seconds
+        time.sleep(10)
 
-# Start the management thread
 threading.Thread(target=position_manager, daemon=True).start()
 
-# --- Webhook Entry ---
 @app.route("/", methods=["POST"])
 def webhook():
-    data = request.get_json(force=True)
-    if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
-        return "Unauthorized", 401
-
-    # Submit Bracket Order (Entry, Stop Loss, Take Profit)
-    order_data = StopLimitOrderRequest(
-        symbol=data.get("symbol"),
-        qty=float(data.get("qty")),
-        side=OrderSide.BUY,
-        type="stop_limit",
-        stop_price=float(data.get("buy_stop")),
-        limit_price=float(data.get("buy_limit")),
-        time_in_force=TimeInForce.GTC,
-        order_class=OrderClass.BRACKET,
-        take_profit={"limit_price": float(data.get("take_profit"))},
-        stop_loss={"stop_price": float(data.get("stop_loss"))}
-    )
-    
-    trading_client.submit_order(order_data)
+    # ... (Keep existing webhook code here)
     return "Success", 200
 
 if __name__ == "__main__":
