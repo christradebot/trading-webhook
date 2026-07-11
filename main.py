@@ -6,8 +6,14 @@ import requests
 from datetime import datetime
 from flask import Flask, request
 from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import ReplaceOrderRequest, GetOrdersRequest, LimitOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType
+from alpaca.trading.requests import (
+    ReplaceOrderRequest,
+    GetOrdersRequest,
+    StopLimitOrderRequest,
+    TakeProfitRequest,
+    StopLossRequest,
+)
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass
 
 app = Flask(__name__)
 
@@ -85,10 +91,14 @@ def position_manager():
             manager_status["is_alive"] = True
 
             positions = trading_client.get_all_positions()
+            # NOTE: filtering for OrderType.STOP (plain stop, market-on-trigger),
+            # not STOP_LIMIT. The entry order placement (in the webhook route)
+            # must also use a plain StopOrderRequest for the initial stop-loss,
+            # so this filter actually finds it.
             open_orders = {
                 o.symbol: o
                 for o in trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN))
-                if o.type == OrderType.STOP_LIMIT
+                if o.type == OrderType.STOP
             }
 
             for pos in positions:
@@ -102,16 +112,20 @@ def position_manager():
                         save_hwm(hwm)
 
                     # 1. Breakeven move (2% gain trigger)
+                    # A plain STOP order only has a stop_price (no limit_price to
+                    # manage) — once triggered it becomes a market order, so this
+                    # guarantees the breakeven exit fills instead of risking it
+                    # sitting unfilled in a fast move.
                     if current >= (entry * 1.02) and symbol in open_orders:
                         order = open_orders[symbol]
                         if float(order.stop_price) < entry:
                             trading_client.replace_order_by_id(
                                 order.id,
-                                ReplaceOrderRequest(stop_price=entry, limit_price=entry - 0.01),
+                                ReplaceOrderRequest(stop_price=entry),
                             )
                             print(f"MOVED TO BE: {symbol}")
 
-                    # 2. 10% Trailing Stop -> Marketable Limit Exit
+                    # 2. 10% Trailing Stop -> Market Order Exit
                     if current >= (entry * 1.02) and current <= (hwm[symbol] * 0.90):
                         print(f"TRAILING HIT: Exiting {symbol}")
 
@@ -129,20 +143,15 @@ def position_manager():
                                     f"possible duplicate orders on this position: {e}"
                                 )
 
-                        # Step B: submit the exit order. This is handled separately
-                        # from the cancel so a failure here is caught on its own,
-                        # since it means the position may now have NO protective
-                        # order at all.
+                        # Step B: submit the exit as a MARKET order. This is a crash-exit
+                        # path, not a take-profit path — we need to guarantee we're
+                        # flat, not guarantee a price. A limit order can sit unfilled
+                        # while price gaps straight through it, leaving the position
+                        # open during exactly the move we're trying to escape.
+                        # This is handled separately from the cancel above so a
+                        # failure here is caught on its own.
                         try:
-                            trading_client.submit_order(
-                                LimitOrderRequest(
-                                    symbol=symbol,
-                                    qty=pos.qty,
-                                    side=OrderSide.SELL,
-                                    limit_price=round(current * 0.98, 2),
-                                    time_in_force=TimeInForce.GTC,
-                                )
-                            )
+                            trading_client.close_position(symbol)
                             # Only clear HWM once the exit order is actually placed.
                             if symbol in hwm:
                                 del hwm[symbol]
@@ -180,7 +189,68 @@ def webhook():
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
         send_alert("REJECTED SIGNAL: Manager thread offline.")
         return "System Offline", 503
-    # ... [Insert order submission logic] ...
+
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        send_alert("REJECTED SIGNAL: No/invalid JSON body received.")
+        return "Bad Request: no JSON body", 400
+
+    # Shared secret check — this is a public URL, so anyone who finds it could
+    # otherwise submit real orders on your account.
+    if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
+        send_alert("REJECTED SIGNAL: Invalid webhook secret.")
+        return "Unauthorized", 401
+
+    # Levels come in fresh on every alert since you trade different tickers
+    # and prices daily — nothing here is hardcoded.
+    try:
+        symbol = str(data["symbol"]).upper()
+        qty = int(data["qty"])
+        buy_stop = float(data["buy_stop"])
+        buy_limit = float(data["buy_limit"])
+        take_profit = float(data["take_profit"])
+        stop_loss = float(data["stop_loss"])
+    except (KeyError, ValueError, TypeError) as e:
+        send_alert(f"REJECTED SIGNAL: Malformed payload — {e}")
+        return "Bad Request: malformed payload", 400
+
+    # Sanity check the levels are in a sensible order before risking a real
+    # order. Catches a bad Pine input or a fat-fingered value before it hits
+    # the market.
+    if not (stop_loss < buy_stop <= buy_limit < take_profit):
+        send_alert(
+            f"REJECTED SIGNAL: {symbol} levels out of order — "
+            f"stop_loss={stop_loss}, buy_stop={buy_stop}, "
+            f"buy_limit={buy_limit}, take_profit={take_profit}"
+        )
+        return "Bad Request: price levels out of order", 400
+
+    try:
+        order = StopLimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY,
+            stop_price=buy_stop,
+            limit_price=buy_limit,
+            order_class=OrderClass.BRACKET,
+            take_profit=TakeProfitRequest(limit_price=take_profit),
+            # stop_price only, no limit_price -> this creates a plain STOP
+            # order (market-on-trigger) for the stop-loss leg, matching what
+            # position_manager filters for (OrderType.STOP) and avoiding a
+            # stop-limit exit that can sit unfilled in a fast drop.
+            stop_loss=StopLossRequest(stop_price=stop_loss),
+        )
+        submitted = trading_client.submit_order(order)
+        send_alert(
+            f"Entry placed: {symbol} qty={qty} stop={buy_stop} limit={buy_limit} "
+            f"| TP={take_profit} SL={stop_loss}"
+        )
+        print(f"Order submitted: {submitted.id}")
+    except Exception as e:
+        send_alert(f"CRITICAL: Failed to submit entry order for {symbol}: {e}")
+        return "Order submission failed", 500
+
     return "Success", 200
 
 
