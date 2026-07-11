@@ -48,6 +48,15 @@ TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")  # ET, 24h for
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "20:00")      # ET, 24h format
 NY_TZ = ZoneInfo("America/New_York")
 
+# Idempotency: a lock serializes the check-then-submit sequence so two
+# near-simultaneous webhook deliveries can't both pass has_open_exposure()
+# before either has submitted an order. The recent-signal cache is a second,
+# belt-and-braces layer in case Alpaca's own position/order data lags by a
+# moment right after submission.
+order_lock = threading.Lock()
+recent_signals = {}  # symbol -> timestamp of last accepted signal
+SIGNAL_DEDUPE_WINDOW_SECONDS = 5
+
 # HWM disk writes are throttled so a fast-moving position doesn't hammer disk
 # on every tick. In-memory value is always current; only the write is delayed.
 HWM_SAVE_INTERVAL_SECONDS = 20
@@ -309,61 +318,77 @@ def webhook():
         send_alert(f"REJECTED SIGNAL: {symbol} qty={qty} exceeds MAX_POSITION_SIZE={MAX_POSITION_SIZE}.")
         return "Qty exceeds max position size", 200
 
-    # Duplicate protection — TradingView can resend the same alert (retries,
-    # network hiccups). If we already hold a position or have an open BUY
-    # order for this symbol, don't enter again. If the check itself fails,
-    # we fail CLOSED (reject) rather than risk a silent double entry.
-    try:
-        if has_open_exposure(symbol):
-            send_alert(f"Duplicate signal ignored for {symbol} — existing position/order found.")
-            return "Duplicate", 200
-    except Exception as e:
-        send_alert(f"CRITICAL: Could not verify duplicate protection for {symbol}, rejecting for safety: {e}")
-        return "Duplicate check failed", 500
+    # Everything from here through order submission runs under a single lock.
+    # This closes the race where two near-simultaneous webhook deliveries
+    # could both pass has_open_exposure() before either has actually
+    # submitted an order — the lock makes "check, then submit" atomic.
+    with order_lock:
+        # Fast-path rejection: if this exact symbol was accepted within the
+        # last few seconds, treat it as a duplicate delivery without even
+        # hitting Alpaca. Covers the moment right after submission where
+        # Alpaca's own position/order data might not have caught up yet.
+        last_seen = recent_signals.get(symbol)
+        if last_seen and (time.time() - last_seen) < SIGNAL_DEDUPE_WINDOW_SECONDS:
+            send_alert(f"Duplicate signal ignored for {symbol} — received again within {SIGNAL_DEDUPE_WINDOW_SECONDS}s.")
+            return "Duplicate (rate-limited)", 200
 
-    # Buying power check — avoids submitting an order you already know
-    # Alpaca will reject, and surfaces the reason clearly via alert instead
-    # of just seeing an opaque Alpaca error later.
-    try:
-        account = trading_client.get_account()
-        buying_power = float(account.buying_power)
-    except Exception as e:
-        send_alert(f"CRITICAL: Could not check buying power for {symbol}, rejecting for safety: {e}")
-        return "Buying power check failed", 500
+        # Duplicate protection — TradingView can resend the same alert
+        # (retries, network hiccups). If we already hold a position or have
+        # an open BUY order for this symbol, don't enter again. If the check
+        # itself fails, we fail CLOSED (reject) rather than risk a silent
+        # double entry.
+        try:
+            if has_open_exposure(symbol):
+                send_alert(f"Duplicate signal ignored for {symbol} — existing position/order found.")
+                return "Duplicate", 200
+        except Exception as e:
+            send_alert(f"CRITICAL: Could not verify duplicate protection for {symbol}, rejecting for safety: {e}")
+            return "Duplicate check failed", 500
 
-    required = qty * buy_limit
-    if buying_power < required:
-        send_alert(
-            f"REJECTED SIGNAL: {symbol} insufficient buying power — "
-            f"need ${required:.2f}, have ${buying_power:.2f}"
-        )
-        return "Insufficient buying power", 200
+        # Buying power check — avoids submitting an order you already know
+        # Alpaca will reject, and surfaces the reason clearly via alert
+        # instead of just seeing an opaque Alpaca error later.
+        try:
+            account = trading_client.get_account()
+            buying_power = float(account.buying_power)
+        except Exception as e:
+            send_alert(f"CRITICAL: Could not check buying power for {symbol}, rejecting for safety: {e}")
+            return "Buying power check failed", 500
 
-    try:
-        order = StopLimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            stop_price=buy_stop,
-            limit_price=buy_limit,
-            order_class=OrderClass.BRACKET,
-            take_profit=TakeProfitRequest(limit_price=take_profit),
-            # stop_price only, no limit_price -> this creates a plain STOP
-            # order (market-on-trigger) for the stop-loss leg, matching what
-            # position_manager filters for (OrderType.STOP) and avoiding a
-            # stop-limit exit that can sit unfilled in a fast drop.
-            stop_loss=StopLossRequest(stop_price=stop_loss),
-        )
-        submitted = trading_client.submit_order(order)
-        send_alert(
-            f"Entry placed: {symbol} qty={qty} stop={buy_stop} limit={buy_limit} "
-            f"| TP={take_profit} SL={stop_loss}"
-        )
-        logger.info(f"Order submitted: {submitted.id}")
-    except Exception as e:
-        send_alert(f"CRITICAL: Failed to submit entry order for {symbol}: {e}")
-        return "Order submission failed", 500
+        required = qty * buy_limit
+        if buying_power < required:
+            send_alert(
+                f"REJECTED SIGNAL: {symbol} insufficient buying power — "
+                f"need ${required:.2f}, have ${buying_power:.2f}"
+            )
+            return "Insufficient buying power", 200
+
+        try:
+            order = StopLimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                stop_price=buy_stop,
+                limit_price=buy_limit,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit),
+                # stop_price only, no limit_price -> this creates a plain STOP
+                # order (market-on-trigger) for the stop-loss leg, matching what
+                # position_manager filters for (OrderType.STOP) and avoiding a
+                # stop-limit exit that can sit unfilled in a fast drop.
+                stop_loss=StopLossRequest(stop_price=stop_loss),
+            )
+            submitted = trading_client.submit_order(order)
+            recent_signals[symbol] = time.time()
+            send_alert(
+                f"Entry placed: {symbol} qty={qty} stop={buy_stop} limit={buy_limit} "
+                f"| TP={take_profit} SL={stop_loss}"
+            )
+            logger.info(f"Order submitted: {submitted.id}")
+        except Exception as e:
+            send_alert(f"CRITICAL: Failed to submit entry order for {symbol}: {e}")
+            return "Order submission failed", 500
 
     return "Success", 200
 
