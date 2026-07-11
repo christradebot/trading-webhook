@@ -17,7 +17,7 @@ from alpaca.trading.requests import (
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass
 
 # ============================================================
-# Logging — persistent file log + console, for Railway log history.
+# Logging
 # ============================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -117,7 +117,9 @@ def position_manager():
                         logger.info(f"TRAILING HIT: Exiting {symbol}")
                         if symbol in open_orders: trading_client.cancel_order_by_id(open_orders[symbol].id)
                         trading_client.close_position(symbol)
-                        if symbol in hwm: del hwm[symbol]; maybe_save_hwm(hwm, force=True)
+                        if symbol in hwm:
+                            del hwm[symbol]
+                            maybe_save_hwm(hwm, force=True)
                         logger.info(f"Position {symbol} closed via Trailing Stop.")
                         symbol_error_counts[symbol] = 0
                 except Exception as e:
@@ -129,8 +131,14 @@ def position_manager():
 
 threading.Thread(target=position_manager, daemon=True).start()
 
+@app.route("/health", methods=["GET"])
+def health():
+    return "OK", 200
+
 @app.route("/", methods=["POST"])
 def webhook():
+    global recent_signals
+    
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
         logger.error("REJECTED SIGNAL: Manager thread offline.")
         return "System Offline", 503
@@ -148,12 +156,17 @@ def webhook():
         return "Bad Request", 400
 
     if not (stop_loss < buy_stop <= buy_limit < take_profit) or not within_trading_window() or qty > MAX_POSITION_SIZE:
+        logger.info(f"Rejected signal for {symbol}: SL={stop_loss}, BuyStop={buy_stop}, BuyLimit={buy_limit}, TP={take_profit}, Qty={qty}")
         return "Rejected: Gating/Validation", 200
 
+    now = time.time()
+    recent_signals = {s: t for s, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
+    last_seen = recent_signals.get(symbol)
+    
+    if last_seen is not None:
+        return "Duplicate", 200
+
     with order_lock:
-        last_seen = recent_signals.get(symbol)
-        if last_seen and (time.time() - last_seen) < SIGNAL_DEDUPE_WINDOW_SECONDS:
-            return "Duplicate", 200
         try:
             if has_open_exposure(symbol): return "Duplicate", 200
             account = trading_client.get_account()
@@ -164,7 +177,7 @@ def webhook():
                                           take_profit=TakeProfitRequest(limit_price=take_profit),
                                           stop_loss=StopLossRequest(stop_price=stop_loss))
             trading_client.submit_order(order)
-            recent_signals[symbol] = time.time()
+            recent_signals[symbol] = now
             logger.info(f"Entry placed: {symbol} qty={qty}")
         except Exception as e:
             logger.error(f"CRITICAL: Failed to submit order for {symbol}: {e}")
