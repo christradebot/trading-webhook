@@ -23,7 +23,7 @@ from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType,
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("bot.log"), logging.StreamHandler()],
+    handlers=[logging.StreamHandler()],
 )
 logger = logging.getLogger("trading_bot")
 
@@ -37,6 +37,8 @@ HWM_FILE = "hwm_data.json"
 manager_status = {"last_heartbeat": time.time(), "is_alive": True}
 symbol_error_counts = {}
 symbol_alert_cooldown = {}
+# Tracks symbols that have already had their stop moved to BE
+be_moved = set() 
 ERROR_ALERT_INTERVAL = 10
 
 MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "500"))
@@ -48,7 +50,7 @@ order_lock = threading.Lock()
 recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 5
 
-HWM_SAVE_INTERVAL_SECONDS = 20
+HWM_SAVE_INTERVAL_SECONDS = 5
 _last_hwm_save = 0.0
 
 def load_hwm():
@@ -110,42 +112,51 @@ def position_manager():
         try:
             manager_status["last_heartbeat"] = time.time()
             manager_status["is_alive"] = True
+            
             positions = trading_client.get_all_positions()
-            open_orders = {
-                o.symbol: o for o in trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN)) 
-                if o.type == OrderType.STOP
-            }
-            for pos in positions:
-                symbol = pos.symbol
-                try:
-                    current, entry = float(pos.current_price), float(pos.avg_entry_price)
-                    if symbol not in hwm or current > hwm[symbol]:
-                        hwm[symbol] = current
-                        maybe_save_hwm(hwm)
-                    if current >= (entry * 1.02) and symbol in open_orders:
-                        order = open_orders[symbol]
-                        if float(order.stop_price) < entry:
+            # Prune be_moved if the position no longer exists (TP/SL/Manual close)
+            active_symbols = {p.symbol for p in positions}
+            be_moved.intersection_update(active_symbols)
+            
+            if positions:
+                open_orders = {
+                    o.symbol: o for o in trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN)) 
+                    if o.type == OrderType.STOP
+                }
+                for pos in positions:
+                    symbol = pos.symbol
+                    try:
+                        current, entry = float(pos.current_price), float(pos.avg_entry_price)
+                        if symbol not in hwm or current > hwm[symbol]:
+                            hwm[symbol] = current
+                            maybe_save_hwm(hwm)
+                        
+                        # Move to Breakeven (Exactly Once)
+                        if current >= (entry * 1.02) and symbol in open_orders and symbol not in be_moved:
+                            order = open_orders[symbol]
                             trading_client.replace_order_by_id(order.id, ReplaceOrderRequest(stop_price=entry))
+                            be_moved.add(symbol)
                             logger.info(f"MOVED TO BE: {symbol}")
-                    if current >= (entry * 1.02) and current <= (hwm[symbol] * 0.90):
-                        logger.info(f"TRAILING HIT: Exiting {symbol}")
-                        if symbol in open_orders: trading_client.cancel_order_by_id(open_orders[symbol].id)
-                        trading_client.close_position(symbol)
-                        if symbol in hwm:
-                            del hwm[symbol]
-                            maybe_save_hwm(hwm, force=True)
-                        send_alert(f"Position {symbol} closed via Trailing Stop.")
-                        symbol_error_counts[symbol] = 0
-                        symbol_alert_cooldown.pop(symbol, None)
-                except Exception as e:
-                    handle_symbol_error(symbol, e)
+                            
+                        # 10% Trailing Stop -> Market Order Exit
+                        if current >= (entry * 1.02) and current <= (hwm[symbol] * 0.90):
+                            logger.info(f"TRAILING HIT: Exiting {symbol}")
+                            if symbol in open_orders: trading_client.cancel_order_by_id(open_orders[symbol].id)
+                            trading_client.close_position(symbol)
+                            if symbol in hwm:
+                                del hwm[symbol]
+                                maybe_save_hwm(hwm, force=True)
+                            send_alert(f"Position {symbol} closed via Trailing Stop.")
+                            symbol_error_counts[symbol] = 0
+                            symbol_alert_cooldown.pop(symbol, None)
+                    except Exception as e:
+                        handle_symbol_error(symbol, e)
         except Exception as e:
             if any(code in str(e) for code in ["401", "403"]):
                 emergency_flatten()
                 break
             logger.warning(f"Transient error: {e}. Retrying...")
         
-        # 2-second polling interval
         time.sleep(2)
 
 threading.Thread(target=position_manager, daemon=True).start()
@@ -172,12 +183,23 @@ def webhook():
     if not (stop_loss < buy_stop <= buy_limit < take_profit): return "Bad Request: prices", 400
     if not within_trading_window(): return "Outside trading hours", 200
     if qty > MAX_POSITION_SIZE: return "Qty exceeds max", 200
+    
     with order_lock:
         now = time.time()
         recent_signals = {s: t for s, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
-        if recent_signals.get(symbol) is not None: return "Duplicate", 200
+        if recent_signals.get(symbol) is not None:
+            logger.info(f"Duplicate signal ignored for {symbol}")
+            return "Duplicate", 200
         try:
-            if has_open_exposure(symbol): return "Duplicate", 200
+            if has_open_exposure(symbol):
+                logger.info(f"Duplicate signal ignored for {symbol}")
+                return "Duplicate", 200
+            
+            account = trading_client.get_account()
+            if float(account.buying_power) < (qty * buy_limit):
+                send_alert(f"REJECTED: Insufficient buying power for {symbol}")
+                return "Insufficient buying power", 200
+
             order = StopLimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
                                           stop_price=buy_stop, limit_price=buy_limit, order_class=OrderClass.BRACKET,
                                           take_profit=TakeProfitRequest(limit_price=take_profit),
