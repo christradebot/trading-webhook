@@ -11,11 +11,12 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     ReplaceOrderRequest,
     GetOrdersRequest,
+    GetCalendarRequest,
     StopLimitOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus
 
 # ============================================================
 # Logging
@@ -51,7 +52,7 @@ TRAIL_GIVEBACK_PCT = 0.90      # exit if price falls to 90% of the high-water ma
 
 MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "500"))
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
-TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "20:00")
+TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
 NY_TZ = ZoneInfo("America/New_York")
 
 order_lock = threading.Lock()
@@ -137,23 +138,16 @@ def within_trading_window():
     return start <= now_ny <= end
 
 
-def market_is_open_today():
-    """Uses Alpaca's clock endpoint so weekends/holidays are handled correctly
-    instead of relying on a hand-rolled calendar."""
-    try:
-        clock = trading_client.get_clock()
-        return clock.is_open or True  # is_open reflects live session; date validity checked below
-    except Exception as e:
-        logger.error(f"Failed to fetch market clock, failing safe (rejecting signal): {e}")
-        return False
-
-
 def is_trading_day():
+    """Uses Alpaca's market calendar (not the clock endpoint) so weekends and
+    market holidays are correctly rejected regardless of what time of day the
+    check runs, including after-hours on a valid trading day."""
     try:
-        clock = trading_client.get_clock()
-        # next_open / next_close being on the same calendar date as "now" confirms today is a trading day
-        now_date = clock.timestamp.date()
-        return clock.next_close.date() == now_date or clock.next_open.date() > now_date
+        today_ny = datetime.now(NY_TZ).date()
+        calendar_days = trading_client.get_calendar(
+            filters=GetCalendarRequest(start=today_ny, end=today_ny)
+        )
+        return len(calendar_days) > 0
     except Exception as e:
         logger.error(f"Failed to verify trading day, failing safe (rejecting signal): {e}")
         return False
@@ -163,7 +157,7 @@ def has_open_exposure(symbol):
     positions = trading_client.get_all_positions()
     if any(p.symbol == symbol for p in positions):
         return True
-    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN))
+    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
     if any(o.symbol == symbol and o.side == OrderSide.BUY for o in open_orders):
         return True
     return False
@@ -175,7 +169,7 @@ def safe_close_position(symbol):
     trading_client.close_position(symbol)
     try:
         leftover_orders = trading_client.get_orders(
-            filter=GetOrdersRequest(status=OrderStatus.OPEN)
+            filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)
         )
         for o in leftover_orders:
             if o.symbol == symbol:
@@ -200,7 +194,7 @@ def position_manager():
 
             if positions:
                 open_orders = {
-                    o.symbol: o for o in trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN))
+                    o.symbol: o for o in trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
                     if o.type == OrderType.STOP
                 }
                 for pos in positions:
@@ -317,7 +311,7 @@ def webhook():
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), threaded=True)
 
 
 
