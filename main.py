@@ -38,8 +38,16 @@ manager_status = {"last_heartbeat": time.time(), "is_alive": True}
 symbol_error_counts = {}
 symbol_alert_cooldown = {}
 # Tracks symbols that have already had their stop moved to BE
-be_moved = set() 
+be_moved = set()
+# Tracks symbols pulled out of automated management after repeated errors -
+# require manual intervention before the bot will touch them again.
+quarantined_symbols = set()
+
 ERROR_ALERT_INTERVAL = 10
+QUARANTINE_THRESHOLD = 5  # consecutive errors before we stop touching a symbol
+
+BREAKEVEN_TRIGGER_PCT = 0.02   # move stop to entry once up 2%
+TRAIL_GIVEBACK_PCT = 0.90      # exit if price falls to 90% of the high-water mark
 
 MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "500"))
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
@@ -53,15 +61,21 @@ SIGNAL_DEDUPE_WINDOW_SECONDS = 5
 HWM_SAVE_INTERVAL_SECONDS = 5
 _last_hwm_save = 0.0
 
+
 def load_hwm():
     if os.path.exists(HWM_FILE):
         try:
-            with open(HWM_FILE, "r") as f: return json.load(f)
-        except Exception: return {}
+            with open(HWM_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
     return {}
 
+
 def save_hwm(hwm):
-    with open(HWM_FILE, "w") as f: json.dump(hwm, f)
+    with open(HWM_FILE, "w") as f:
+        json.dump(hwm, f)
+
 
 def maybe_save_hwm(hwm, force=False):
     global _last_hwm_save
@@ -70,8 +84,10 @@ def maybe_save_hwm(hwm, force=False):
         save_hwm(hwm)
         _last_hwm_save = now
 
+
 def send_alert(message):
     logger.info(f"ALERT: {message}")
+
 
 def emergency_flatten():
     send_alert("CRITICAL: Emergency Flatten Triggered!")
@@ -82,16 +98,37 @@ def emergency_flatten():
     finally:
         manager_status["is_alive"] = False
 
+
+def is_auth_error(e):
+    """Check for auth/permission failures without relying only on string matching."""
+    status_code = getattr(e, "status_code", None)
+    if status_code in (401, 403):
+        return True
+    return any(code in str(e) for code in ["401", "403"])
+
+
 def handle_symbol_error(symbol, e):
     symbol_error_counts[symbol] = symbol_error_counts.get(symbol, 0) + 1
     count = symbol_error_counts[symbol]
     logger.error(f"Error managing {symbol}: {e}")
+
     if count == 3:
-        send_alert(f"CRITICAL: Symbol {symbol} failing repeatedly ({count} consecutive errors).")
+        send_alert(f"WARNING: Symbol {symbol} failing repeatedly ({count} consecutive errors).")
         symbol_alert_cooldown[symbol] = count
-    elif count > 3 and (count - symbol_alert_cooldown.get(symbol, 3)) >= ERROR_ALERT_INTERVAL:
-        send_alert(f"CRITICAL: Symbol {symbol} still failing ({count} consecutive errors).")
+    elif 3 < count < QUARANTINE_THRESHOLD and (count - symbol_alert_cooldown.get(symbol, 3)) >= ERROR_ALERT_INTERVAL:
+        send_alert(f"WARNING: Symbol {symbol} still failing ({count} consecutive errors).")
         symbol_alert_cooldown[symbol] = count
+
+    if count >= QUARANTINE_THRESHOLD and symbol not in quarantined_symbols:
+        quarantined_symbols.add(symbol)
+        send_alert(
+            f"CRITICAL: Symbol {symbol} quarantined after {count} consecutive errors. "
+            f"Automated management STOPPED for this symbol. Manual intervention required."
+        )
+    elif count > QUARANTINE_THRESHOLD and (count - symbol_alert_cooldown.get(symbol, QUARANTINE_THRESHOLD)) >= ERROR_ALERT_INTERVAL:
+        send_alert(f"CRITICAL: Symbol {symbol} still quarantined and failing ({count} consecutive errors).")
+        symbol_alert_cooldown[symbol] = count
+
 
 def within_trading_window():
     now_ny = datetime.now(NY_TZ).time()
@@ -99,12 +136,54 @@ def within_trading_window():
     end = datetime.strptime(TRADING_WINDOW_END, "%H:%M").time()
     return start <= now_ny <= end
 
+
+def market_is_open_today():
+    """Uses Alpaca's clock endpoint so weekends/holidays are handled correctly
+    instead of relying on a hand-rolled calendar."""
+    try:
+        clock = trading_client.get_clock()
+        return clock.is_open or True  # is_open reflects live session; date validity checked below
+    except Exception as e:
+        logger.error(f"Failed to fetch market clock, failing safe (rejecting signal): {e}")
+        return False
+
+
+def is_trading_day():
+    try:
+        clock = trading_client.get_clock()
+        # next_open / next_close being on the same calendar date as "now" confirms today is a trading day
+        now_date = clock.timestamp.date()
+        return clock.next_close.date() == now_date or clock.next_open.date() > now_date
+    except Exception as e:
+        logger.error(f"Failed to verify trading day, failing safe (rejecting signal): {e}")
+        return False
+
+
 def has_open_exposure(symbol):
     positions = trading_client.get_all_positions()
-    if any(p.symbol == symbol for p in positions): return True
+    if any(p.symbol == symbol for p in positions):
+        return True
     open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN))
-    if any(o.symbol == symbol and o.side == OrderSide.BUY for o in open_orders): return True
+    if any(o.symbol == symbol and o.side == OrderSide.BUY for o in open_orders):
+        return True
     return False
+
+
+def safe_close_position(symbol):
+    """Closes a position and defensively cleans up any lingering open orders
+    for that symbol, in case the OCO sibling-cancel didn't fire as expected."""
+    trading_client.close_position(symbol)
+    try:
+        leftover_orders = trading_client.get_orders(
+            filter=GetOrdersRequest(status=OrderStatus.OPEN)
+        )
+        for o in leftover_orders:
+            if o.symbol == symbol:
+                trading_client.cancel_order_by_id(o.id)
+                logger.warning(f"Cancelled leftover order {o.id} for {symbol} after close_position.")
+    except Exception as e:
+        logger.error(f"Failed cleanup check for leftover orders on {symbol}: {e}")
+
 
 def position_manager():
     hwm = load_hwm()
@@ -112,37 +191,47 @@ def position_manager():
         try:
             manager_status["last_heartbeat"] = time.time()
             manager_status["is_alive"] = True
-            
+
             positions = trading_client.get_all_positions()
-            # Prune be_moved if the position no longer exists (TP/SL/Manual close)
+            # Prune be_moved / quarantined_symbols if the position no longer exists
             active_symbols = {p.symbol for p in positions}
             be_moved.intersection_update(active_symbols)
-            
+            quarantined_symbols.intersection_update(active_symbols)
+
             if positions:
                 open_orders = {
-                    o.symbol: o for o in trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN)) 
+                    o.symbol: o for o in trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN))
                     if o.type == OrderType.STOP
                 }
                 for pos in positions:
                     symbol = pos.symbol
+
+                    if symbol in quarantined_symbols:
+                        # Skip automated management entirely - already alerted loudly.
+                        continue
+
                     try:
                         current, entry = float(pos.current_price), float(pos.avg_entry_price)
                         if symbol not in hwm or current > hwm[symbol]:
                             hwm[symbol] = current
                             maybe_save_hwm(hwm)
-                        
+
                         # Move to Breakeven (Exactly Once)
-                        if current >= (entry * 1.02) and symbol in open_orders and symbol not in be_moved:
+                        if current >= (entry * (1 + BREAKEVEN_TRIGGER_PCT)) and symbol in open_orders and symbol not in be_moved:
                             order = open_orders[symbol]
                             trading_client.replace_order_by_id(order.id, ReplaceOrderRequest(stop_price=entry))
                             be_moved.add(symbol)
                             logger.info(f"MOVED TO BE: {symbol}")
-                            
+
                         # 10% Trailing Stop -> Market Order Exit
-                        if current >= (entry * 1.02) and current <= (hwm[symbol] * 0.90):
+                        # Decoupled from the BE trigger: once BE has been locked in,
+                        # any 10% giveback from the high-water mark exits, regardless
+                        # of how far price has run since.
+                        if symbol in be_moved and current <= (hwm[symbol] * TRAIL_GIVEBACK_PCT):
                             logger.info(f"TRAILING HIT: Exiting {symbol}")
-                            if symbol in open_orders: trading_client.cancel_order_by_id(open_orders[symbol].id)
-                            trading_client.close_position(symbol)
+                            if symbol in open_orders:
+                                trading_client.cancel_order_by_id(open_orders[symbol].id)
+                            safe_close_position(symbol)
                             if symbol in hwm:
                                 del hwm[symbol]
                                 maybe_save_hwm(hwm, force=True)
@@ -152,18 +241,21 @@ def position_manager():
                     except Exception as e:
                         handle_symbol_error(symbol, e)
         except Exception as e:
-            if any(code in str(e) for code in ["401", "403"]):
+            if is_auth_error(e):
                 emergency_flatten()
                 break
             logger.warning(f"Transient error: {e}. Retrying...")
-        
+
         time.sleep(2)
 
+
 threading.Thread(target=position_manager, daemon=True).start()
+
 
 @app.route("/health", methods=["GET"])
 def health():
     return "OK", 200
+
 
 @app.route("/", methods=["POST"])
 def webhook():
@@ -172,18 +264,29 @@ def webhook():
         send_alert("REJECTED SIGNAL: Manager thread offline.")
         return "System Offline", 503
     data = request.get_json(force=True, silent=True)
-    if not data: return "Bad Request", 400
-    if data.get("secret") != os.getenv("WEBHOOK_SECRET"): return "Unauthorized", 401
+    if not data:
+        return "Bad Request", 400
+    if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
+        return "Unauthorized", 401
     try:
         symbol = str(data["symbol"]).upper()
         qty, buy_stop = int(data["qty"]), float(data["buy_stop"])
         buy_limit, take_profit = float(data["buy_limit"]), float(data["take_profit"])
         stop_loss = float(data["stop_loss"])
-    except (KeyError, ValueError, TypeError): return "Bad Request", 400
-    if not (stop_loss < buy_stop <= buy_limit < take_profit): return "Bad Request: prices", 400
-    if not within_trading_window(): return "Outside trading hours", 200
-    if qty > MAX_POSITION_SIZE: return "Qty exceeds max", 200
-    
+    except (KeyError, ValueError, TypeError):
+        return "Bad Request", 400
+    if not (stop_loss < buy_stop <= buy_limit < take_profit):
+        return "Bad Request: prices", 400
+    if symbol in quarantined_symbols:
+        send_alert(f"REJECTED SIGNAL: {symbol} is quarantined pending manual review.")
+        return "Symbol quarantined", 200
+    if not is_trading_day():
+        return "Not a trading day", 200
+    if not within_trading_window():
+        return "Outside trading hours", 200
+    if qty > MAX_POSITION_SIZE:
+        return "Qty exceeds max", 200
+
     with order_lock:
         now = time.time()
         recent_signals = {s: t for s, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
@@ -194,7 +297,7 @@ def webhook():
             if has_open_exposure(symbol):
                 logger.info(f"Duplicate signal ignored for {symbol}")
                 return "Duplicate", 200
-            
+
             account = trading_client.get_account()
             if float(account.buying_power) < (qty * buy_limit):
                 send_alert(f"REJECTED: Insufficient buying power for {symbol}")
@@ -211,6 +314,7 @@ def webhook():
             send_alert(f"CRITICAL: Failed to submit entry for {symbol}: {e}")
             return "Order failed", 500
     return "Success", 200
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
