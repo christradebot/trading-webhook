@@ -179,16 +179,51 @@ def safe_close_position(symbol):
         logger.error(f"Failed cleanup check for leftover orders on {symbol}: {e}")
 
 
+def log_untracked_closure(symbol):
+    """Called when a position disappears without the bot itself having closed it -
+    meaning the resting stop-loss or take-profit leg filled on Alpaca's side.
+    Looks up the most recent filled order for the symbol so the log shows what
+    actually happened, instead of going silent."""
+    try:
+        closed_orders = trading_client.get_orders(
+            filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], limit=10)
+        )
+        filled = [o for o in closed_orders if o.filled_qty and float(o.filled_qty) > 0]
+        if filled:
+            o = filled[0]  # most recent, since direction defaults to desc
+            send_alert(
+                f"Position {symbol} closed (stop-loss or take-profit filled): "
+                f"{o.side.value} {o.filled_qty}@{o.filled_avg_price} ({o.type.value})"
+            )
+        else:
+            send_alert(f"Position {symbol} closed - no recent fill details found on lookup.")
+    except Exception as e:
+        logger.error(f"Failed to look up closure detail for {symbol}: {e}")
+        send_alert(f"Position {symbol} closed - could not fetch fill details ({e}).")
+
+
 def position_manager():
     hwm = load_hwm()
+    previous_active_symbols = set()
+    bot_initiated_closes = set()
     while True:
         try:
             manager_status["last_heartbeat"] = time.time()
             manager_status["is_alive"] = True
 
             positions = trading_client.get_all_positions()
-            # Prune be_moved / quarantined_symbols if the position no longer exists
             active_symbols = {p.symbol for p in positions}
+
+            # Detect positions that vanished since last check WITHOUT the bot itself
+            # closing them (i.e. the resting stop-loss or take-profit leg filled).
+            # Without this, those closures produce zero log output.
+            externally_closed = previous_active_symbols - active_symbols - bot_initiated_closes
+            for sym in externally_closed:
+                log_untracked_closure(sym)
+            bot_initiated_closes.clear()
+            previous_active_symbols = active_symbols
+
+            # Prune be_moved / quarantined_symbols if the position no longer exists
             be_moved.intersection_update(active_symbols)
             quarantined_symbols.intersection_update(active_symbols)
 
@@ -226,6 +261,7 @@ def position_manager():
                             if symbol in open_orders:
                                 trading_client.cancel_order_by_id(open_orders[symbol].id)
                             safe_close_position(symbol)
+                            bot_initiated_closes.add(symbol)
                             if symbol in hwm:
                                 del hwm[symbol]
                                 maybe_save_hwm(hwm, force=True)
