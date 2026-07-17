@@ -86,6 +86,16 @@ def maybe_save_hwm(hwm, force=False):
         _last_hwm_save = now
 
 
+def round_to_tick(price):
+    """Rounds a price to Alpaca's required increment: whole cents for prices
+    >= $1.00, sub-penny (4dp) allowed only below $1.00. Applied server-side
+    as a safety net regardless of whether the upstream signal already rounded
+    correctly - percentage-based stop/target math will rarely land on a
+    clean increment on its own."""
+    tick = 0.01 if price >= 1.0 else 0.0001
+    return round(round(price / tick) * tick, 4)
+
+
 def send_alert(message):
     logger.info(f"ALERT: {message}")
 
@@ -300,9 +310,9 @@ def webhook():
         return "Unauthorized", 401
     try:
         symbol = str(data["symbol"]).upper()
-        qty, buy_stop = int(data["qty"]), float(data["buy_stop"])
-        buy_limit, take_profit = float(data["buy_limit"]), float(data["take_profit"])
-        stop_loss = float(data["stop_loss"])
+        qty, buy_stop = int(data["qty"]), round_to_tick(float(data["buy_stop"]))
+        buy_limit, take_profit = round_to_tick(float(data["buy_limit"])), round_to_tick(float(data["take_profit"]))
+        stop_loss = round_to_tick(float(data["stop_loss"]))
     except (KeyError, ValueError, TypeError):
         return "Bad Request", 400
     if not (stop_loss < buy_stop <= buy_limit < take_profit):
