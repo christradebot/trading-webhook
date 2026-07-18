@@ -50,7 +50,29 @@ QUARANTINE_THRESHOLD = 5  # consecutive errors before we stop touching a symbol
 BREAKEVEN_TRIGGER_PCT = 0.02   # move stop to entry once up 2%
 TRAIL_GIVEBACK_PCT = 0.90      # exit if price falls to 90% of the high-water mark
 
-MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "500"))
+def calculate_qty(buy_limit, buying_power):
+    """Sizes the position to use available buying power in full, based on
+    buy_limit (the worst-case fill price for a stop-limit buy) rather than
+    buy_stop, so the order never risks exceeding actual funds. A small
+    buffer is held back to absorb fees/slippage and avoid an
+    insufficient-buying-power rejection right at the edge."""
+    usable = buying_power * 0.98
+    return int(usable // buy_limit)
+
+
+def any_position_open():
+    """True if there is any open position or pending buy order for ANY
+    symbol - used to enforce a strict one-trade-at-a-time rule across the
+    whole account, not just per-symbol deduplication."""
+    positions = trading_client.get_all_positions()
+    if positions:
+        return True
+    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    if any(o.side == OrderSide.BUY for o in open_orders):
+        return True
+    return False
+
+
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
 NY_TZ = ZoneInfo("America/New_York")
@@ -161,16 +183,6 @@ def is_trading_day():
     except Exception as e:
         logger.error(f"Failed to verify trading day, failing safe (rejecting signal): {e}")
         return False
-
-
-def has_open_exposure(symbol):
-    positions = trading_client.get_all_positions()
-    if any(p.symbol == symbol for p in positions):
-        return True
-    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
-    if any(o.symbol == symbol and o.side == OrderSide.BUY for o in open_orders):
-        return True
-    return False
 
 
 def safe_close_position(symbol):
@@ -310,7 +322,7 @@ def webhook():
         return "Unauthorized", 401
     try:
         symbol = str(data["symbol"]).upper()
-        qty, buy_stop = int(data["qty"]), round_to_tick(float(data["buy_stop"]))
+        buy_stop = round_to_tick(float(data["buy_stop"]))
         buy_limit, take_profit = round_to_tick(float(data["buy_limit"])), round_to_tick(float(data["take_profit"]))
         stop_loss = round_to_tick(float(data["stop_loss"]))
     except (KeyError, ValueError, TypeError):
@@ -324,8 +336,6 @@ def webhook():
         return "Not a trading day", 200
     if not within_trading_window():
         return "Outside trading hours", 200
-    if qty > MAX_POSITION_SIZE:
-        return "Qty exceeds max", 200
 
     with order_lock:
         now = time.time()
@@ -334,13 +344,14 @@ def webhook():
             logger.info(f"Duplicate signal ignored for {symbol}")
             return "Duplicate", 200
         try:
-            if has_open_exposure(symbol):
-                logger.info(f"Duplicate signal ignored for {symbol}")
-                return "Duplicate", 200
+            if any_position_open():
+                logger.info(f"Signal ignored for {symbol}: another position/order is already open (one-trade-at-a-time)")
+                return "Another position already open", 200
 
             account = trading_client.get_account()
-            if float(account.buying_power) < (qty * buy_limit):
-                send_alert(f"REJECTED: Insufficient buying power for {symbol}")
+            qty = calculate_qty(buy_limit, float(account.buying_power))
+            if qty < 1:
+                send_alert(f"REJECTED: Insufficient buying power for {symbol} at {buy_limit}")
                 return "Insufficient buying power", 200
 
             order = StopLimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
@@ -349,7 +360,10 @@ def webhook():
                                           stop_loss=StopLossRequest(stop_price=stop_loss))
             trading_client.submit_order(order)
             recent_signals[symbol] = now
-            send_alert(f"Entry placed: {symbol} qty={qty}")
+            send_alert(
+                f"Entry placed: {symbol} qty={qty} buy_stop={buy_stop} buy_limit={buy_limit} "
+                f"stop_loss={stop_loss} take_profit={take_profit}"
+            )
         except Exception as e:
             send_alert(f"CRITICAL: Failed to submit entry for {symbol}: {e}")
             return "Order failed", 500
