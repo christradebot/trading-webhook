@@ -47,7 +47,7 @@ quarantined_symbols = set()
 ERROR_ALERT_INTERVAL = 10
 QUARANTINE_THRESHOLD = 5  # consecutive errors before we stop touching a symbol
 
-BREAKEVEN_TRIGGER_PCT = 0.02   # move stop to entry once up 2%
+BREAKEVEN_TRIGGER_PCT = 0.02    # move stop to entry once up 2%
 TRAIL_GIVEBACK_PCT = 0.90      # exit if price falls to 90% of the high-water mark
 
 def calculate_qty(buy_limit, buying_power):
@@ -73,7 +73,7 @@ def any_position_open():
     return False
 
 
-TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
+TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:40")
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
 NY_TZ = ZoneInfo("America/New_York")
 
