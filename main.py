@@ -13,10 +13,18 @@ from alpaca.trading.requests import (
     GetOrdersRequest,
     GetCalendarRequest,
     StopLimitOrderRequest,
+    LimitOrderRequest,
+    StopOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus, OrderStatus
+
+# Level-1 quote client for the ORB spread check.
+# (Package path can vary slightly by alpaca-py version — adjust if your
+# install differs, e.g. `from alpaca.data.historical.stock import StockHistoricalDataClient`)
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 
 # ============================================================
 # Logging
@@ -33,6 +41,7 @@ app = Flask(__name__)
 is_live = os.getenv("LIVE_TRADING", "False") == "True"
 logger.info(f"--- BOT STARTED: LIVE_TRADING={is_live} ---")
 trading_client = TradingClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=not is_live)
+data_client = StockHistoricalDataClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"))
 
 HWM_FILE = "hwm_data.json"
 manager_status = {"last_heartbeat": time.time(), "is_alive": True}
@@ -44,8 +53,25 @@ quarantined_symbols = set()
 ERROR_ALERT_INTERVAL = 10
 QUARANTINE_THRESHOLD = 5
 
+# Already matches the ORB design (2% breakeven arm, 10% trailing giveback) —
+# reused as-is for ORB positions, no separate constants needed.
 BREAKEVEN_TRIGGER_PCT = 0.02
 TRAIL_GIVEBACK_PCT = 0.90
+
+# ============================================================
+# ORB-specific config
+# ============================================================
+ORB_SPREAD_MAX = float(os.getenv("ORB_SPREAD_MAX", "0.02"))          # flat $0.02 cap, confirmed
+ORB_STOP_LOSS_PCT_DEFAULT = float(os.getenv("ORB_STOP_LOSS_PCT", "0.05"))
+ORB_COOLDOWN_MINUTES = float(os.getenv("ORB_COOLDOWN_MINUTES", "60"))  # placeholder — you were between 60-90, tune via env var
+ORB_WEBHOOK_SECRET = os.getenv("ORB_WEBHOOK_SECRET", os.getenv("WEBHOOK_SECRET"))
+
+# symbol -> unix timestamp until which new ORB entries are blocked
+orb_cooldown_until = {}
+# symbol -> {"stop_loss_pct": float} for positions still waiting on their
+# real stop-loss order to be submitted once the fill price is known
+orb_pending_stop = {}
+
 
 def calculate_qty(buy_limit, buying_power):
     usable = buying_power * 0.98
@@ -179,7 +205,22 @@ def safe_close_position(symbol):
         logger.error(f"Failed cleanup check for leftover orders on {symbol}: {e}")
 
 
+def start_orb_cooldown(symbol):
+    """Called whenever an ORB position exits via stop-loss or trailing —
+    blocks re-entry on this symbol for ORB_COOLDOWN_MINUTES."""
+    orb_cooldown_until[symbol] = time.time() + ORB_COOLDOWN_MINUTES * 60
+    logger.info(f"ORB cooldown started for {symbol}: blocked until {ORB_COOLDOWN_MINUTES} min from now")
+
+
+def orb_in_cooldown(symbol):
+    until = orb_cooldown_until.get(symbol)
+    return until is not None and time.time() < until
+
+
 def log_untracked_closure(symbol):
+    """A position vanished without the bot having closed it itself — i.e.
+    the broker-side stop order (or breakeven-moved stop) filled. This is
+    the 'stopped out' event for ORB cooldown purposes."""
     try:
         closed_orders = trading_client.get_orders(
             filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], limit=10)
@@ -196,6 +237,41 @@ def log_untracked_closure(symbol):
     except Exception as e:
         logger.error(f"Failed to look up closure detail for {symbol}: {e}")
         send_alert(f"Position {symbol} closed - could not fetch fill details ({e}).")
+    finally:
+        # Any stop-driven exit (PMH or ORB) starts the ORB cooldown for this
+        # symbol. Harmless no-op for symbols that were never an ORB trade.
+        start_orb_cooldown(symbol)
+
+
+def submit_orb_stop_if_needed(symbol, avg_entry_price, open_orders):
+    """For ORB positions: the entry went in as a plain limit order (no
+    bracket), because the stop-loss has to be computed from the REAL fill
+    price, not an estimate set before the order went live. Once the
+    position shows up with no STOP order yet, compute and submit it now."""
+    pending = orb_pending_stop.get(symbol)
+    if not pending:
+        return
+    if symbol in open_orders:
+        # Stop already exists (shouldn't normally happen for ORB, but safe)
+        orb_pending_stop.pop(symbol, None)
+        return
+    try:
+        stop_pct = pending["stop_loss_pct"]
+        stop_price = round_to_tick(avg_entry_price * (1 - stop_pct))
+        position = trading_client.get_open_position(symbol)
+        qty = abs(float(position.qty))
+        order = StopOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            stop_price=stop_price,
+        )
+        trading_client.submit_order(order)
+        send_alert(f"ORB stop-loss submitted for {symbol}: entry={avg_entry_price} stop={stop_price}")
+        orb_pending_stop.pop(symbol, None)
+    except Exception as e:
+        logger.error(f"Failed to submit ORB stop-loss for {symbol}: {e}")
 
 
 def position_manager():
@@ -232,6 +308,12 @@ def position_manager():
 
                     try:
                         current, entry = float(pos.current_price), float(pos.avg_entry_price)
+
+                        # ORB positions arrive with no STOP order yet — submit
+                        # the real one now that we know the actual fill price.
+                        if symbol in orb_pending_stop:
+                            submit_orb_stop_if_needed(symbol, entry, open_orders)
+
                         if symbol not in hwm or current > hwm[symbol]:
                             hwm[symbol] = current
                             maybe_save_hwm(hwm)
@@ -248,6 +330,7 @@ def position_manager():
                                 trading_client.cancel_order_by_id(open_orders[symbol].id)
                             safe_close_position(symbol)
                             bot_initiated_closes.add(symbol)
+                            start_orb_cooldown(symbol)
                             if symbol in hwm:
                                 del hwm[symbol]
                                 maybe_save_hwm(hwm, force=True)
@@ -273,6 +356,9 @@ def health():
     return "OK", 200
 
 
+# ============================================================
+# Existing PMH breakout webhook — unchanged
+# ============================================================
 @app.route("/", methods=["POST"])
 def webhook():
     global recent_signals
@@ -330,6 +416,111 @@ def webhook():
             )
         except Exception as e:
             send_alert(f"CRITICAL: Failed to submit entry for {symbol}: {e}")
+            return "Order failed", 500
+    return "Success", 200
+
+
+# ============================================================
+# New ORB webhook
+# Payload from Pine: {"ticker","action","signal_close","limit_price",
+#                      "stop_loss_pct","trailing_pct","cancel_after_sec"}
+# No "secret" field in the Pine alert body — auth is via a query-string
+# secret instead. Point the TradingView alert's Webhook URL at:
+#   https://yourdomain/orb?secret=YOUR_SECRET
+# ============================================================
+def cancel_if_unfilled(order_id, symbol):
+    try:
+        order = trading_client.get_order_by_id(order_id)
+        if order.status not in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED):
+            trading_client.cancel_order_by_id(order_id)
+            logger.info(f"Cancelled unfilled ORB entry for {symbol} after timeout")
+            send_alert(f"ORB entry for {symbol} cancelled — unfilled after timeout window")
+    except Exception as e:
+        logger.error(f"Error checking/cancelling ORB entry for {symbol}: {e}")
+
+
+def get_current_spread(symbol):
+    req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+    quote = data_client.get_stock_latest_quote(req)[symbol]
+    return float(quote.ask_price) - float(quote.bid_price)
+
+
+@app.route("/orb", methods=["POST"])
+def orb_webhook():
+    global recent_signals
+    if request.args.get("secret") != ORB_WEBHOOK_SECRET:
+        return "Unauthorized", 401
+    if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
+        send_alert("REJECTED ORB SIGNAL: Manager thread offline.")
+        return "System Offline", 503
+
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        return "Bad Request", 400
+    try:
+        symbol = str(data["ticker"]).upper()
+        action = str(data["action"]).upper()
+        limit_price = round_to_tick(float(data["limit_price"]))
+        stop_loss_pct = float(data.get("stop_loss_pct", ORB_STOP_LOSS_PCT_DEFAULT * 100)) / 100
+        cancel_after_sec = float(data.get("cancel_after_sec", 10))
+    except (KeyError, ValueError, TypeError):
+        return "Bad Request", 400
+
+    if action != "BUY":
+        return "Ignored (non-BUY action)", 200
+    if symbol in quarantined_symbols:
+        send_alert(f"REJECTED ORB SIGNAL: {symbol} is quarantined pending manual review.")
+        return "Symbol quarantined", 200
+    if not is_trading_day():
+        return "Not a trading day", 200
+    if not within_trading_window():
+        return "Outside trading hours", 200
+    if orb_in_cooldown(symbol):
+        logger.info(f"ORB signal for {symbol} ignored: still in cooldown")
+        return "Cooldown active", 200
+
+    with order_lock:
+        now = time.time()
+        recent_signals = {s: t for s, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
+        if recent_signals.get(symbol) is not None:
+            logger.info(f"Duplicate ORB signal ignored for {symbol}")
+            return "Duplicate", 200
+        try:
+            if any_position_open():
+                logger.info(f"ORB signal ignored for {symbol}: another position/order is already open")
+                return "Another position already open", 200
+
+            # Spread check — right before submission, using live L1 quotes.
+            # This is the ORB-specific slippage guard Pine can't perform itself.
+            spread = get_current_spread(symbol)
+            if spread > ORB_SPREAD_MAX:
+                send_alert(f"REJECTED ORB SIGNAL: {symbol} spread ${spread:.4f} exceeds ${ORB_SPREAD_MAX:.2f} cap")
+                return "Spread too wide", 200
+
+            account = trading_client.get_account()
+            qty = calculate_qty(limit_price, float(account.buying_power))
+            if qty < 1:
+                send_alert(f"REJECTED: Insufficient buying power for {symbol} at {limit_price}")
+                return "Insufficient buying power", 200
+
+            # Plain marketable limit order — no bracket. The stop-loss is
+            # submitted separately once the real fill price is known.
+            order = LimitOrderRequest(
+                symbol=symbol, qty=qty, side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY, limit_price=limit_price,
+            )
+            submitted = trading_client.submit_order(order)
+            recent_signals[symbol] = now
+            orb_pending_stop[symbol] = {"stop_loss_pct": stop_loss_pct}
+
+            threading.Timer(cancel_after_sec, cancel_if_unfilled, args=[submitted.id, symbol]).start()
+
+            send_alert(
+                f"ORB entry placed: {symbol} qty={qty} limit={limit_price} "
+                f"stop_pct={stop_loss_pct*100:.1f}% cancel_after={cancel_after_sec}s"
+            )
+        except Exception as e:
+            send_alert(f"CRITICAL: Failed to submit ORB entry for {symbol}: {e}")
             return "Order failed", 500
     return "Success", 200
 
