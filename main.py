@@ -422,11 +422,11 @@ def webhook():
 
 # ============================================================
 # New ORB webhook
-# Payload from Pine: {"ticker","action","signal_close","limit_price",
+# Payload from Pine: {"ticker","secret","action","signal_close","limit_price",
 #                      "stop_loss_pct","trailing_pct","cancel_after_sec"}
-# No "secret" field in the Pine alert body — auth is via a query-string
-# secret instead. Point the TradingView alert's Webhook URL at:
-#   https://yourdomain/orb?secret=YOUR_SECRET
+# Secret is checked in the JSON body, same convention as the PMH webhook —
+# set the "Webhook Secret" input in the ORB indicator to match
+# ORB_WEBHOOK_SECRET (or WEBHOOK_SECRET) below. No query string needed.
 # ============================================================
 def cancel_if_unfilled(order_id, symbol):
     try:
@@ -448,8 +448,6 @@ def get_current_spread(symbol):
 @app.route("/orb", methods=["POST"])
 def orb_webhook():
     global recent_signals
-    if request.args.get("secret") != ORB_WEBHOOK_SECRET:
-        return "Unauthorized", 401
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
         send_alert("REJECTED ORB SIGNAL: Manager thread offline.")
         return "System Offline", 503
@@ -457,6 +455,8 @@ def orb_webhook():
     data = request.get_json(force=True, silent=True)
     if not data:
         return "Bad Request", 400
+    if data.get("secret") != ORB_WEBHOOK_SECRET:
+        return "Unauthorized", 401
     try:
         symbol = str(data["ticker"]).upper()
         action = str(data["action"]).upper()
