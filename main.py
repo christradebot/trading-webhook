@@ -94,6 +94,7 @@ NY_TZ = ZoneInfo("America/New_York")
 
 order_lock = threading.Lock()
 recent_signals = {}
+orb_recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 5
 
 HWM_SAVE_INTERVAL_SECONDS = 5
@@ -435,6 +436,11 @@ def cancel_if_unfilled(order_id, symbol):
             trading_client.cancel_order_by_id(order_id)
             logger.info(f"Cancelled unfilled ORB entry for {symbol} after timeout")
             send_alert(f"ORB entry for {symbol} cancelled — unfilled after timeout window")
+            # Only clear pending-stop state if nothing filled at all — a
+            # partial fill still needs its stop submitted by the position
+            # manager once it sees the resulting position.
+            if not order.filled_qty or float(order.filled_qty) == 0:
+                orb_pending_stop.pop(symbol, None)
     except Exception as e:
         logger.error(f"Error checking/cancelling ORB entry for {symbol}: {e}")
 
@@ -442,12 +448,18 @@ def cancel_if_unfilled(order_id, symbol):
 def get_current_spread(symbol):
     req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
     quote = data_client.get_stock_latest_quote(req)[symbol]
-    return float(quote.ask_price) - float(quote.bid_price)
+    bid = float(quote.bid_price or 0)
+    ask = float(quote.ask_price or 0)
+    if bid <= 0 or ask <= 0:
+        # No usable quote right now — treat as an unsafe/unknown spread
+        # rather than risk a wrong or negative number.
+        return float("inf")
+    return ask - bid
 
 
 @app.route("/orb", methods=["POST"])
 def orb_webhook():
-    global recent_signals
+    global orb_recent_signals
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
         send_alert("REJECTED ORB SIGNAL: Manager thread offline.")
         return "System Offline", 503
@@ -463,6 +475,11 @@ def orb_webhook():
         limit_price = round_to_tick(float(data["limit_price"]))
         stop_loss_pct = float(data.get("stop_loss_pct", ORB_STOP_LOSS_PCT_DEFAULT * 100)) / 100
         cancel_after_sec = float(data.get("cancel_after_sec", 10))
+        # NOTE: Pine also sends "trailing_pct" and "signal_close" — neither
+        # is read here. Trailing is handled by the global TRAIL_GIVEBACK_PCT
+        # constant above (already matches ORB's design), not per-request.
+        # If you ever change the trailingPct input in Pine expecting it to
+        # change bot behavior, it won't — update TRAIL_GIVEBACK_PCT instead.
     except (KeyError, ValueError, TypeError):
         return "Bad Request", 400
 
@@ -481,8 +498,8 @@ def orb_webhook():
 
     with order_lock:
         now = time.time()
-        recent_signals = {s: t for s, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
-        if recent_signals.get(symbol) is not None:
+        orb_recent_signals = {s: t for s, t in orb_recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
+        if orb_recent_signals.get(symbol) is not None:
             logger.info(f"Duplicate ORB signal ignored for {symbol}")
             return "Duplicate", 200
         try:
@@ -510,7 +527,7 @@ def orb_webhook():
                 time_in_force=TimeInForce.DAY, limit_price=limit_price,
             )
             submitted = trading_client.submit_order(order)
-            recent_signals[symbol] = now
+            orb_recent_signals[symbol] = now
             orb_pending_stop[symbol] = {"stop_loss_pct": stop_loss_pct}
 
             threading.Timer(cancel_after_sec, cancel_if_unfilled, args=[submitted.id, symbol]).start()
