@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 from datetime import datetime
+from typing import Any, Callable, Dict, Optional, Set, TypeVar
 from zoneinfo import ZoneInfo
 
 from flask import Flask, request
@@ -27,7 +28,7 @@ from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 
 # ============================================================
-# Logging
+# Logging Configuration
 # ============================================================
 logging.basicConfig(
     level=logging.INFO,
@@ -38,19 +39,80 @@ logger = logging.getLogger("trading_bot")
 
 app = Flask(__name__)
 
-is_live = os.getenv("LIVE_TRADING", "False") == "True"
+is_live: bool = os.getenv("LIVE_TRADING", "False") == "True"
 logger.info(f"--- BOT STARTED: LIVE_TRADING={is_live} ---")
 
-try:
-    trading_client = TradingClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=not is_live)
-    data_client = StockHistoricalDataClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"))
-except Exception as e:
-    logger.error(f"CRITICAL: Failed to initialize Alpaca clients: {e}")
-    raise SystemExit(1)
+# ============================================================
+# Environment / Config Constants
+# ============================================================
+API_TIMEOUT: float = float(os.getenv("API_TIMEOUT", "15"))
+RETRY_ATTEMPTS: int = int(os.getenv("RETRY_ATTEMPTS", "3"))
+RETRY_BASE_DELAY: float = float(os.getenv("RETRY_BASE_DELAY", "0.5"))
+MANAGER_LOOP_INTERVAL: float = float(os.getenv("MANAGER_LOOP_INTERVAL", "0.5"))
+HWM_SAVE_INTERVAL_SECONDS: int = int(os.getenv("HWM_SAVE_INTERVAL_SECONDS", "1"))
+
+TRADING_WINDOW_START: str = os.getenv("TRADING_WINDOW_START", "09:40")
+TRADING_WINDOW_END: str = os.getenv("TRADING_WINDOW_END", "16:00")
+NY_TZ = ZoneInfo("America/New_York")
+
+HWM_FILE: str = "hwm_data.json"
+manager_status: dict[str, Any] = {"last_heartbeat": time.time(), "is_alive": True}
+symbol_error_counts: dict[str, int] = {}
+symbol_alert_cooldown: dict[str, int] = {}
+be_moved: set[str] = set()
+quarantined_symbols: set[str] = set()
+
+ERROR_ALERT_INTERVAL: int = 10
+QUARANTINE_THRESHOLD: int = 5
+
+BREAKEVEN_TRIGGER_PCT: float = 0.02
+TRAIL_GIVEBACK_PCT: float = 0.90
+
+ORB_SPREAD_MAX: float = float(os.getenv("ORB_SPREAD_MAX", "0.02"))
+ORB_STOP_LOSS_PCT_DEFAULT: float = float(os.getenv("ORB_STOP_LOSS_PCT", "0.05"))
+ORB_COOLDOWN_MINUTES: float = float(os.getenv("ORB_COOLDOWN_MINUTES", "60"))
+ORB_WEBHOOK_SECRET: str = os.getenv("ORB_WEBHOOK_SECRET", os.getenv("WEBHOOK_SECRET", ""))
+
+orb_cooldown_until: dict[str, float] = {}
+orb_pending_stop: dict[str, dict[str, float]] = {}
 
 # ============================================================
-# 2. Startup Account Verification & Abort on Failure
+# Response String Constants
 # ============================================================
+RESP_SUCCESS: str = "Success"
+RESP_BAD_REQUEST: str = "Bad Request"
+RESP_UNAUTHORIZED: str = "Unauthorized"
+RESP_OFFLINE: str = "System Offline"
+RESP_QUARANTINED: str = "Symbol quarantined"
+RESP_NOT_TRADING_DAY: str = "Not a trading day"
+RESP_OUTSIDE_HOURS: str = "Outside trading hours"
+RESP_DUPLICATE: str = "Duplicate"
+RESP_POSITION_OPEN: str = "Another position already open"
+RESP_INSUFFICIENT_BP: str = "Insufficient buying power"
+RESP_ORDER_FAILED: str = "Order failed"
+RESP_SPREAD_WIDE: str = "Spread too wide"
+RESP_COOLDOWN: str = "Cooldown active"
+
+# ============================================================
+# Alpaca Client Initialization with Native Timeouts
+# ============================================================
+try:
+    trading_client = TradingClient(
+        os.getenv("APCA_API_KEY_ID"),
+        os.getenv("APCA_API_SECRET_KEY"),
+        paper=not is_live,
+        timeout=API_TIMEOUT
+    )
+    data_client = StockHistoricalDataClient(
+        os.getenv("APCA_API_KEY_ID"),
+        os.getenv("APCA_API_SECRET_KEY"),
+        timeout=API_TIMEOUT
+    )
+except Exception:
+    logger.exception("CRITICAL: Failed to initialize Alpaca clients.")
+    raise SystemExit(1)
+
+# Startup Account Verification & Abort on Failure
 try:
     account_info = trading_client.get_account()
     logger.info(f"Account Status: {account_info.status}")
@@ -59,50 +121,16 @@ try:
     if account_info.trading_blocked:
         logger.error("CRITICAL: Alpaca account is currently trading blocked!")
         raise SystemExit(1)
-except Exception as e:
-    logger.error(f"CRITICAL: Failed to verify account status on startup: {e}")
+except Exception:
+    logger.exception("CRITICAL: Failed to verify account status on startup.")
     raise SystemExit(1)
 
-HWM_FILE = "hwm_data.json"
-manager_status = {"last_heartbeat": time.time(), "is_alive": True}
-symbol_error_counts = {}
-symbol_alert_cooldown = {}
-be_moved = set()
-quarantined_symbols = set()
+order_lock = threading.Lock()
+recent_signals: dict[str, float] = {}
+orb_recent_signals: dict[str, float] = {}
+SIGNAL_DEDUPE_WINDOW_SECONDS: float = 5.0
 
-ERROR_ALERT_INTERVAL = 10
-QUARANTINE_THRESHOLD = 5
-
-BREAKEVEN_TRIGGER_PCT = 0.02
-TRAIL_GIVEBACK_PCT = 0.90
-
-# ============================================================
-# ORB-specific config
-# ============================================================
-ORB_SPREAD_MAX = float(os.getenv("ORB_SPREAD_MAX", "0.02"))
-ORB_STOP_LOSS_PCT_DEFAULT = float(os.getenv("ORB_STOP_LOSS_PCT", "0.05"))
-ORB_COOLDOWN_MINUTES = float(os.getenv("ORB_COOLDOWN_MINUTES", "60"))
-ORB_WEBHOOK_SECRET = os.getenv("ORB_WEBHOOK_SECRET", os.getenv("WEBHOOK_SECRET"))
-
-orb_cooldown_until = {}
-orb_pending_stop = {}
-
-# ============================================================
-# Response string constants
-# ============================================================
-RESP_SUCCESS = "Success"
-RESP_BAD_REQUEST = "Bad Request"
-RESP_UNAUTHORIZED = "Unauthorized"
-RESP_OFFLINE = "System Offline"
-RESP_QUARANTINED = "Symbol quarantined"
-RESP_NOT_TRADING_DAY = "Not a trading day"
-RESP_OUTSIDE_HOURS = "Outside trading hours"
-RESP_DUPLICATE = "Duplicate"
-RESP_POSITION_OPEN = "Another position already open"
-RESP_INSUFFICIENT_BP = "Insufficient buying power"
-RESP_ORDER_FAILED = "Order failed"
-RESP_SPREAD_WIDE = "Spread too wide"
-RESP_COOLDOWN = "Cooldown active"
+_last_hwm_save: float = 0.0
 
 
 def calculate_qty(buy_limit: float, buying_power: float) -> int:
@@ -112,6 +140,7 @@ def calculate_qty(buy_limit: float, buying_power: float) -> int:
 
 
 def any_position_open() -> bool:
+    """Checks if any positions or open buy orders currently exist."""
     positions = alpaca_retry(trading_client.get_all_positions)
     if positions:
         return True
@@ -121,35 +150,26 @@ def any_position_open() -> bool:
     return False
 
 
-TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:40")
-TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
-NY_TZ = ZoneInfo("America/New_York")
-
-order_lock = threading.Lock()
-recent_signals = {}
-orb_recent_signals = {}
-SIGNAL_DEDUPE_WINDOW_SECONDS = 5
-
-HWM_SAVE_INTERVAL_SECONDS = 1
-_last_hwm_save = 0.0
-
-
-def load_hwm() -> dict:
+def load_hwm() -> dict[str, float]:
+    """Loads high-water mark records from persistent storage."""
     if os.path.exists(HWM_FILE):
         try:
             with open(HWM_FILE, "r") as f:
                 return json.load(f)
         except Exception:
+            logger.exception("Failed to load HWM file.")
             return {}
     return {}
 
 
-def save_hwm(hwm: dict):
+def save_hwm(hwm: dict[str, float]) -> None:
+    """Saves high-water mark records to persistent storage."""
     with open(HWM_FILE, "w") as f:
         json.dump(hwm, f)
 
 
-def maybe_save_hwm(hwm: dict, force: bool = False):
+def maybe_save_hwm(hwm: dict[str, float], force: bool = False) -> None:
+    """Conditionally saves HWM data based on elapsed time or forced updates."""
     global _last_hwm_save
     now = time.time()
     if force or (now - _last_hwm_save) >= HWM_SAVE_INTERVAL_SECONDS:
@@ -158,65 +178,51 @@ def maybe_save_hwm(hwm: dict, force: bool = False):
 
 
 def round_to_tick(price: float) -> float:
+    """Rounds a given price to standard US equity tick increments."""
     tick = 0.01 if price >= 1.0 else 0.0001
     return round(round(price / tick) * tick, 4)
 
 
-def send_alert(message: str):
+def send_alert(message: str) -> None:
+    """Dispatches operational alert messages to logging streams."""
     logger.info(f"ALERT: {message}")
 
 
+T = TypeVar("T")
+
 # ============================================================
-# 1. Exponential Backoff with Jitter & Timeout Protection
+# Robust Retry Wrapper with Exponential Backoff and Jitter
 # ============================================================
-def alpaca_retry(func, *args, retries=3, base_delay=0.5, timeout=15, **kwargs):
-    """Executes Alpaca API calls with exponential backoff, jitter, and timeout protection."""
-    for attempt in range(retries):
+def alpaca_retry(func: Callable[..., T], *args: Any, **kwargs: Any) -> T:
+    """Executes Alpaca API calls with exponential backoff and jitter using native client timeouts."""
+    for attempt in range(RETRY_ATTEMPTS):
         try:
-            result_container = []
-            exception_container = []
-
-            def target():
-                try:
-                    res = func(*args, **kwargs)
-                    result_container.append(res)
-                except Exception as ex:
-                    exception_container.append(ex)
-
-            t = threading.Thread(target=target)
-            t.daemon = True
-            t.start()
-            t.join(timeout=timeout)
-
-            if t.is_alive():
-                raise TimeoutError(f"Alpaca API call timed out after {timeout} seconds")
-
-            if exception_container:
-                raise exception_container[0]
-
-            return result_container[0]
+            return func(*args, **kwargs)
         except Exception as e:
-            if attempt == retries - 1:
+            if attempt == RETRY_ATTEMPTS - 1:
                 raise e
-            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.25)
-            logger.warning(f"Alpaca API call failed ({e}). Retrying in {delay:.2f}s... (Attempt {attempt + 1}/{retries})")
+            delay = RETRY_BASE_DELAY * (2 ** attempt) + random.uniform(0, 0.25)
+            logger.warning(f"Alpaca API call failed ({e}). Retrying in {delay:.2f}s... (Attempt {attempt + 1}/{RETRY_ATTEMPTS})")
             time.sleep(delay)
+    raise RuntimeError("Unreachable retry state")
 
 
-def emergency_flatten():
+def emergency_flatten() -> None:
+    """Flattens all open positions and cancels open orders during a critical failure."""
     send_alert("CRITICAL: Emergency Flatten Triggered!")
     try:
         alpaca_retry(trading_client.close_all_positions, cancel_orders=True)
-    except Exception as e:
-        logger.error(f"Flattening failed: {e}")
+    except Exception:
+        logger.exception("Flattening failed during emergency shutdown.")
     finally:
         manager_status["is_alive"] = False
 
 
 # ============================================================
-# 7. Graceful Shutdown Handler (SIGTERM / SIGINT)
+# Graceful Shutdown Handler (SIGTERM / SIGINT)
 # ============================================================
-def handle_shutdown(signum, frame):
+def handle_shutdown(signum: int, frame: Any) -> None:
+    """Handles termination signals for clean container shutdowns."""
     logger.info(f"Received signal {signum}. Shutting down gracefully...")
     manager_status["is_alive"] = False
     sys.exit(0)
@@ -225,17 +231,19 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 signal.signal(signal.SIGINT, handle_shutdown)
 
 
-def is_auth_error(e) -> bool:
+def is_auth_error(e: Exception) -> bool:
+    """Determines if an exception is related to authentication failures."""
     status_code = getattr(e, "status_code", None)
     if status_code in (401, 403):
         return True
     return any(code in str(e) for code in ["401", "403"])
 
 
-def handle_symbol_error(symbol: str, e):
+def handle_symbol_error(symbol: str, e: Exception) -> None:
+    """Tracks consecutive errors per symbol and quarantines if necessary."""
     symbol_error_counts[symbol] = symbol_error_counts.get(symbol, 0) + 1
     count = symbol_error_counts[symbol]
-    logger.error(f"Error managing {symbol}: {e}")
+    logger.exception(f"Error managing {symbol}: {e}")
 
     if count == 3:
         send_alert(f"WARNING: Symbol {symbol} failing repeatedly ({count} consecutive errors).")
@@ -256,6 +264,7 @@ def handle_symbol_error(symbol: str, e):
 
 
 def within_trading_window() -> bool:
+    """Checks if current Eastern Time falls within the configured trading window."""
     now_ny = datetime.now(NY_TZ).time()
     start = datetime.strptime(TRADING_WINDOW_START, "%H:%M").time()
     end = datetime.strptime(TRADING_WINDOW_END, "%H:%M").time()
@@ -263,6 +272,7 @@ def within_trading_window() -> bool:
 
 
 def is_trading_day() -> bool:
+    """Verifies with Alpaca calendar if today is an active trading session."""
     try:
         today_ny = datetime.now(NY_TZ).date()
         calendar_days = alpaca_retry(
@@ -270,12 +280,13 @@ def is_trading_day() -> bool:
             filters=GetCalendarRequest(start=today_ny, end=today_ny)
         )
         return len(calendar_days) > 0
-    except Exception as e:
-        logger.error(f"Failed to verify trading day, failing safe (rejecting signal): {e}")
+    except Exception:
+        logger.exception("Failed to verify trading day, failing safe (rejecting signal).")
         return False
 
 
-def safe_close_position(symbol: str):
+def safe_close_position(symbol: str) -> None:
+    """Closes a specific position and cancels any leftover bracket orders."""
     alpaca_retry(trading_client.close_position, symbol)
     try:
         leftover_orders = alpaca_retry(
@@ -286,21 +297,24 @@ def safe_close_position(symbol: str):
             if o.symbol == symbol:
                 alpaca_retry(trading_client.cancel_order_by_id, o.id)
                 logger.warning(f"Cancelled leftover order {o.id} for {symbol} after close_position.")
-    except Exception as e:
-        logger.error(f"Failed cleanup check for leftover orders on {symbol}: {e}")
+    except Exception:
+        logger.exception(f"Failed cleanup check for leftover orders on {symbol}.")
 
 
-def start_orb_cooldown(symbol: str):
+def start_orb_cooldown(symbol: str) -> None:
+    """Initiates an ORB trading cooldown period for a given symbol."""
     orb_cooldown_until[symbol] = time.time() + ORB_COOLDOWN_MINUTES * 60
     logger.info(f"ORB cooldown started for {symbol}: blocked until {ORB_COOLDOWN_MINUTES} min from now")
 
 
 def orb_in_cooldown(symbol: str) -> bool:
+    """Checks whether an ORB symbol is currently under cooldown restriction."""
     until = orb_cooldown_until.get(symbol)
     return until is not None and time.time() < until
 
 
-def log_untracked_closure(symbol: str):
+def log_untracked_closure(symbol: str) -> None:
+    """Logs details when a position closes externally (e.g., via standalone stop-loss or take-profit)."""
     try:
         closed_orders = alpaca_retry(
             trading_client.get_orders,
@@ -315,14 +329,15 @@ def log_untracked_closure(symbol: str):
             )
         else:
             send_alert(f"Position {symbol} closed - no recent fill details found on lookup.")
-    except Exception as e:
-        logger.error(f"Failed to look up closure detail for {symbol}: {e}")
-        send_alert(f"Position {symbol} closed - could not fetch fill details ({e}).")
+    except Exception:
+        logger.exception(f"Failed to look up closure detail for {symbol}.")
+        send_alert(f"Position {symbol} closed - could not fetch fill details.")
     finally:
         start_orb_cooldown(symbol)
 
 
-def submit_orb_stop_if_needed(symbol: str, avg_entry_price: float, open_orders: dict):
+def submit_orb_stop_if_needed(symbol: str, avg_entry_price: float, open_orders: dict[str, Any]) -> None:
+    """Submits a trailing stop leg for ORB orders once filled."""
     with order_lock:
         pending = orb_pending_stop.get(symbol)
         if not pending:
@@ -346,15 +361,15 @@ def submit_orb_stop_if_needed(symbol: str, avg_entry_price: float, open_orders: 
         send_alert(f"ORB stop-loss submitted for {symbol}: entry={avg_entry_price} stop={stop_price}")
         with order_lock:
             orb_pending_stop.pop(symbol, None)
-    except Exception as e:
-        logger.error(f"Failed to submit ORB stop-loss for {symbol}: {e}")
+    except Exception:
+        logger.exception(f"Failed to submit ORB stop-loss for {symbol}.")
 
 
-def position_manager():
-    """Background thread managing high-water marks, breakeven adjustments, and trailing stops."""
+def position_manager() -> None:
+    """Background worker thread managing high-water marks, breakeven adjustments, and trailing stops."""
     hwm = load_hwm()
-    previous_active_symbols = set()
-    bot_initiated_closes = set()
+    previous_active_symbols: set[str] = set()
+    bot_initiated_closes: set[str] = set()
     while manager_status["is_alive"]:
         loop_start = time.time()
         try:
@@ -391,7 +406,6 @@ def position_manager():
                         if symbol in orb_pending_stop:
                             submit_orb_stop_if_needed(symbol, entry, open_orders)
 
-                        # 3. Forced HWM save on new highs
                         if symbol not in hwm or current > hwm[symbol]:
                             hwm[symbol] = current
                             maybe_save_hwm(hwm, force=True)
@@ -425,26 +439,26 @@ def position_manager():
             if is_auth_error(e):
                 emergency_flatten()
                 break
-            logger.warning(f"Transient error: {e}. Retrying...")
+            logger.warning(f"Transient error in position manager: {e}. Retrying...")
 
-        # 6. Log execution timing only if loop exceeds 1.0 second
         loop_duration = time.time() - loop_start
         if loop_duration > 1.0:
             logger.warning(f"Position manager loop took high duration: {loop_duration:.3f}s")
 
-        time.sleep(0.5)
+        time.sleep(MANAGER_LOOP_INTERVAL)
 
 
 threading.Thread(target=position_manager, daemon=True).start()
 
 
 @app.route("/health", methods=["GET"])
-def health():
+def health() -> tuple[str, int]:
+    """Health check endpoint for container orchestration."""
     return "OK", 200
 
 
 @app.route("/", methods=["POST"])
-def webhook():
+def webhook() -> tuple[str, int]:
     """Standard PMH breakout webhook endpoint."""
     global recent_signals
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
@@ -489,23 +503,26 @@ def webhook():
                 send_alert(f"REJECTED: Insufficient buying power for {symbol} at {buy_limit}")
                 return RESP_INSUFFICIENT_BP, 200
 
-            order = StopLimitOrderRequest(symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
-                                         stop_price=buy_stop, limit_price=buy_limit, order_class=OrderClass.BRACKET,
-                                         take_profit=TakeProfitRequest(limit_price=take_profit),
-                                         stop_loss=StopLossRequest(stop_price=stop_loss))
+            order = StopLimitOrderRequest(
+                symbol=symbol, qty=qty, side=OrderSide.BUY, time_in_force=TimeInForce.DAY,
+                stop_price=buy_stop, limit_price=buy_limit, order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit),
+                stop_loss=StopLossRequest(stop_price=stop_loss)
+            )
             alpaca_retry(trading_client.submit_order, order)
             recent_signals[symbol] = now
             send_alert(
                 f"Entry placed: {symbol} qty={qty} buy_stop={buy_stop} buy_limit={buy_limit} "
                 f"stop_loss={stop_loss} take_profit={take_profit}"
             )
-        except Exception as e:
-            send_alert(f"CRITICAL: Failed to submit entry for {symbol}: {e}")
+        except Exception:
+            logger.exception(f"CRITICAL: Failed to submit entry for {symbol}.")
             return RESP_ORDER_FAILED, 500
     return RESP_SUCCESS, 200
 
 
-def cancel_if_unfilled(order_id: str, symbol: str):
+def cancel_if_unfilled(order_id: str, symbol: str) -> None:
+    """Cancels an unfilled ORB limit entry after the timeout window elapses."""
     try:
         order = alpaca_retry(trading_client.get_order_by_id, order_id)
         if order.status not in (OrderStatus.FILLED, OrderStatus.CANCELED, OrderStatus.EXPIRED):
@@ -515,15 +532,13 @@ def cancel_if_unfilled(order_id: str, symbol: str):
             with order_lock:
                 if not order.filled_qty or float(order.filled_qty) == 0:
                     orb_pending_stop.pop(symbol, None)
-    except Exception as e:
-        logger.error(f"Error checking/cancelling ORB entry for {symbol}: {e}")
+    except Exception:
+        logger.exception(f"Error checking/cancelling ORB entry for {symbol}.")
 
 
-# ============================================================
-# 4. Retries around Quote Requests
-# ============================================================
 def get_current_spread(symbol: str) -> float:
-    def fetch_quote():
+    """Fetches the latest bid-ask spread for a given symbol with retry protection."""
+    def fetch_quote() -> Any:
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
         return data_client.get_stock_latest_quote(req)[symbol]
 
@@ -534,13 +549,13 @@ def get_current_spread(symbol: str) -> float:
         if bid <= 0 or ask <= 0:
             return float("inf")
         return ask - bid
-    except Exception as e:
-        logger.error(f"Failed fetching latest quote spread for {symbol}: {e}")
+    except Exception:
+        logger.exception(f"Failed fetching latest quote spread for {symbol}.")
         return float("inf")
 
 
 @app.route("/orb", methods=["POST"])
-def orb_webhook():
+def orb_webhook() -> tuple[str, int]:
     """Opening Range Breakout (ORB) webhook endpoint."""
     global orb_recent_signals
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
@@ -610,8 +625,8 @@ def orb_webhook():
                 f"ORB entry placed: {symbol} qty={qty} limit={limit_price} "
                 f"stop_pct={stop_loss_pct*100:.1f}% cancel_after={cancel_after_sec}s"
             )
-        except Exception as e:
-            send_alert(f"CRITICAL: Failed to submit ORB entry for {symbol}: {e}")
+        except Exception:
+            logger.exception(f"CRITICAL: Failed to submit ORB entry for {symbol}.")
             return RESP_ORDER_FAILED, 500
     return RESP_SUCCESS, 200
 
