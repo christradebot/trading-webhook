@@ -1,6 +1,9 @@
 import json
 import logging
 import os
+import random
+import signal
+import sys
 import threading
 import time
 from datetime import datetime
@@ -38,11 +41,15 @@ app = Flask(__name__)
 is_live = os.getenv("LIVE_TRADING", "False") == "True"
 logger.info(f"--- BOT STARTED: LIVE_TRADING={is_live} ---")
 
-trading_client = TradingClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=not is_live)
-data_client = StockHistoricalDataClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"))
+try:
+    trading_client = TradingClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=not is_live)
+    data_client = StockHistoricalDataClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"))
+except Exception as e:
+    logger.error(f"CRITICAL: Failed to initialize Alpaca clients: {e}")
+    raise SystemExit(1)
 
 # ============================================================
-# 10. Startup Account Verification
+# 2. Startup Account Verification & Abort on Failure
 # ============================================================
 try:
     account_info = trading_client.get_account()
@@ -51,8 +58,10 @@ try:
     logger.info(f"Trading Blocked: {account_info.trading_blocked}")
     if account_info.trading_blocked:
         logger.error("CRITICAL: Alpaca account is currently trading blocked!")
+        raise SystemExit(1)
 except Exception as e:
     logger.error(f"CRITICAL: Failed to verify account status on startup: {e}")
+    raise SystemExit(1)
 
 HWM_FILE = "hwm_data.json"
 manager_status = {"last_heartbeat": time.time(), "is_alive": True}
@@ -79,7 +88,7 @@ orb_cooldown_until = {}
 orb_pending_stop = {}
 
 # ============================================================
-# Minor Cleanup: Response string constants
+# Response string constants
 # ============================================================
 RESP_SUCCESS = "Success"
 RESP_BAD_REQUEST = "Bad Request"
@@ -97,16 +106,16 @@ RESP_COOLDOWN = "Cooldown active"
 
 
 def calculate_qty(buy_limit: float, buying_power: float) -> int:
-    """Calculates integer share quantity leaving a 5% safety buffer for price fluctuations."""
-    usable = buying_power * 0.95
+    """Calculates integer share quantity leaving a 2% safety buffer for price fluctuations."""
+    usable = buying_power * 0.98
     return int(usable // buy_limit)
 
 
 def any_position_open() -> bool:
-    positions = trading_client.get_all_positions()
+    positions = alpaca_retry(trading_client.get_all_positions)
     if positions:
         return True
-    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    open_orders = alpaca_retry(trading_client.get_orders, filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
     if any(o.side == OrderSide.BUY for o in open_orders):
         return True
     return False
@@ -121,9 +130,6 @@ recent_signals = {}
 orb_recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 5
 
-# ============================================================
-# 1. HWM Fix: Reduced save interval to 1 second
-# ============================================================
 HWM_SAVE_INTERVAL_SECONDS = 1
 _last_hwm_save = 0.0
 
@@ -161,17 +167,39 @@ def send_alert(message: str):
 
 
 # ============================================================
-# 2. Alpaca API Retry Helper
+# 1. Exponential Backoff with Jitter & Timeout Protection
 # ============================================================
-def alpaca_retry(func, *args, retries=3, delay=0.5, **kwargs):
-    """Executes Alpaca API calls with built-in retries for network hiccups or transient errors."""
+def alpaca_retry(func, *args, retries=3, base_delay=0.5, timeout=15, **kwargs):
+    """Executes Alpaca API calls with exponential backoff, jitter, and timeout protection."""
     for attempt in range(retries):
         try:
-            return func(*args, **kwargs)
+            result_container = []
+            exception_container = []
+
+            def target():
+                try:
+                    res = func(*args, **kwargs)
+                    result_container.append(res)
+                except Exception as ex:
+                    exception_container.append(ex)
+
+            t = threading.Thread(target=target)
+            t.daemon = True
+            t.start()
+            t.join(timeout=timeout)
+
+            if t.is_alive():
+                raise TimeoutError(f"Alpaca API call timed out after {timeout} seconds")
+
+            if exception_container:
+                raise exception_container[0]
+
+            return result_container[0]
         except Exception as e:
             if attempt == retries - 1:
                 raise e
-            logger.warning(f"Alpaca API call failed ({e}). Retrying in {delay}s... (Attempt {attempt + 1}/{retries})")
+            delay = base_delay * (2 ** attempt) + random.uniform(0, 0.25)
+            logger.warning(f"Alpaca API call failed ({e}). Retrying in {delay:.2f}s... (Attempt {attempt + 1}/{retries})")
             time.sleep(delay)
 
 
@@ -183,6 +211,18 @@ def emergency_flatten():
         logger.error(f"Flattening failed: {e}")
     finally:
         manager_status["is_alive"] = False
+
+
+# ============================================================
+# 7. Graceful Shutdown Handler (SIGTERM / SIGINT)
+# ============================================================
+def handle_shutdown(signum, frame):
+    logger.info(f"Received signal {signum}. Shutting down gracefully...")
+    manager_status["is_alive"] = False
+    sys.exit(0)
+
+signal.signal(signal.SIGTERM, handle_shutdown)
+signal.signal(signal.SIGINT, handle_shutdown)
 
 
 def is_auth_error(e) -> bool:
@@ -315,11 +355,10 @@ def position_manager():
     hwm = load_hwm()
     previous_active_symbols = set()
     bot_initiated_closes = set()
-    while True:
+    while manager_status["is_alive"]:
         loop_start = time.time()
         try:
             manager_status["last_heartbeat"] = time.time()
-            manager_status["is_alive"] = True
 
             positions = alpaca_retry(trading_client.get_all_positions)
             active_symbols = {p.symbol for p in positions}
@@ -352,9 +391,10 @@ def position_manager():
                         if symbol in orb_pending_stop:
                             submit_orb_stop_if_needed(symbol, entry, open_orders)
 
+                        # 3. Forced HWM save on new highs
                         if symbol not in hwm or current > hwm[symbol]:
                             hwm[symbol] = current
-                            maybe_save_hwm(hwm)
+                            maybe_save_hwm(hwm, force=True)
 
                         if current >= (entry * (1 + BREAKEVEN_TRIGGER_PCT)) and symbol in open_orders and symbol not in be_moved:
                             order = open_orders[symbol]
@@ -387,11 +427,11 @@ def position_manager():
                 break
             logger.warning(f"Transient error: {e}. Retrying...")
 
-        # 9. Logging execution timing
+        # 6. Log execution timing only if loop exceeds 1.0 second
         loop_duration = time.time() - loop_start
-        logger.debug(f"Position manager loop took {loop_duration:.3f}s")
+        if loop_duration > 1.0:
+            logger.warning(f"Position manager loop took high duration: {loop_duration:.3f}s")
 
-        # 4. Shortened loop delay to 0.5s for faster momentum reaction
         time.sleep(0.5)
 
 
@@ -479,10 +519,16 @@ def cancel_if_unfilled(order_id: str, symbol: str):
         logger.error(f"Error checking/cancelling ORB entry for {symbol}: {e}")
 
 
+# ============================================================
+# 4. Retries around Quote Requests
+# ============================================================
 def get_current_spread(symbol: str) -> float:
-    try:
+    def fetch_quote():
         req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-        quote = data_client.get_stock_latest_quote(req)[symbol]
+        return data_client.get_stock_latest_quote(req)[symbol]
+
+    try:
+        quote = alpaca_retry(fetch_quote)
         bid = float(quote.bid_price or 0)
         ask = float(quote.ask_price or 0)
         if bid <= 0 or ask <= 0:
