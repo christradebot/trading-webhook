@@ -24,7 +24,7 @@ from requests.exceptions import Timeout, ConnectionError
 # ============================================================
 # Logging — persistent rotating file log + console
 # ============================================================
-log_handler = RotatingFileHandler("bot.log", max_bytes=10 * 1024 * 1024, backupCount=10)
+log_handler = RotatingFileHandler("bot.log", maxBytes=10 * 1024 * 1024, backupCount=10)
 log_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 
 logging.basicConfig(
