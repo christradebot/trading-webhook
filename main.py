@@ -46,15 +46,15 @@ symbol_error_counts = {}
 symbol_alert_cooldown = {}
 ERROR_ALERT_INTERVAL = 10
 
-# Risk / gating config
+# Risk / gating config — window start 09:45 ET, close entries at 16:00 ET
 MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "500"))
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
-TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "20:00")
+TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
 NY_TZ = ZoneInfo("America/New_York")
 
 # Idempotency & deduplication
 order_lock = threading.Lock()
-hwm_lock = threading.RLock()  # RLock prevents deadlock on nested calls within the same thread
+hwm_lock = threading.RLock()
 recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 15
 
@@ -66,12 +66,9 @@ global_hwm = {}
 
 
 def is_transient_error(e):
-    """Determine if an API exception represents a transient failure worth retrying."""
     if isinstance(e, (Timeout, ConnectionError)):
         return True
-    
     err_str = str(e)
-    # Check for HTTP status codes or common transient network/server glitches
     transient_indicators = ["429", "500", "502", "503", "504", "timeout", "reset", "temporarily unavailable"]
     return any(indicator in err_str for indicator in transient_indicators)
 
@@ -206,12 +203,31 @@ def position_manager_loop():
     global_hwm = load_hwm()
     last_equity_log = 0.0
     last_pl_log = 0.0
+    eod_flatten_triggered_date = None
 
     while True:
         try:
             manager_status["last_heartbeat"] = time.time()
             manager_status["is_alive"] = True
             now = time.time()
+            now_ny_dt = datetime.now(NY_TZ)
+
+            # EOD Hard Close: Flatten all positions and cancel open orders at 15:55 ET
+            current_date_str = now_ny_dt.strftime("%Y-%m-%d")
+            current_time_val = now_ny_dt.time()
+            eod_target_time = datetime.strptime("15:55", "%H:%M").time()
+
+            if current_time_val >= eod_target_time and eod_flatten_triggered_date != current_date_str:
+                send_alert("EOD FLATTEN: Reached 15:55 ET. Flattening all positions and cancelling open orders.")
+                try:
+                    trading_client.close_all_positions(cancel_orders=True)
+                    with hwm_lock:
+                        global_hwm.clear()
+                        maybe_save_hwm(global_hwm, force=True)
+                    send_alert("EOD FLATTEN: Successfully closed all positions and cleared HWM.")
+                except Exception as e:
+                    send_alert(f"CRITICAL: EOD Flatten failed: {e}")
+                eod_flatten_triggered_date = current_date_str
 
             if now - last_equity_log >= 3600:
                 try:
