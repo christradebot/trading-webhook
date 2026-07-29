@@ -18,7 +18,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
     StopLossRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass, QueryOrderStatus
 from requests.exceptions import Timeout, ConnectionError
 
 # ============================================================
@@ -158,7 +158,7 @@ def has_open_exposure(symbol):
     if any(p.symbol == symbol for p in positions):
         return True
 
-    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN))
+    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
     if any(o.symbol == symbol and o.side == OrderSide.BUY for o in open_orders):
         return True
 
@@ -245,7 +245,7 @@ def position_manager_loop():
                 last_pl_log = now
 
             open_orders_map = {}
-            for o in trading_client.get_orders(filter=GetOrdersRequest(status=OrderStatus.OPEN)):
+            for o in trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)):
                 if o.type == OrderType.STOP:
                     open_orders_map.setdefault(o.symbol, []).append(o)
 
