@@ -47,10 +47,15 @@ symbol_alert_cooldown = {}
 ERROR_ALERT_INTERVAL = 10
 
 # Risk / gating config — window start 09:45 ET, close entries at 16:00 ET
-MAX_POSITION_SIZE = int(os.getenv("MAX_POSITION_SIZE", "500"))
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
 NY_TZ = ZoneInfo("America/New_York")
+
+# Position sizing — qty is computed server-side from available equity rather
+# than supplied by Pine. EQUITY_FRACTION is the share of buying power to
+# commit per trade; kept below 1.0 as a small buffer against price movement
+# between the buying-power check and the actual fill.
+EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
 
 # Idempotency & deduplication
 order_lock = threading.Lock()
@@ -104,11 +109,11 @@ def save_hwm(hwm):
 def maybe_save_hwm(hwm, symbol=None, current_price=0.0, force=False):
     global _last_hwm_save
     now = time.time()
-    
+
     should_save = force
     if not should_save and (now - _last_hwm_save) >= HWM_SAVE_INTERVAL_SECONDS:
         should_save = True
-        
+
     if not should_save and symbol and symbol in hwm:
         last_saved = _last_saved_hwm_values.get(symbol, 0.0)
         if last_saved == 0.0 or current_price >= last_saved * 1.01:
@@ -360,7 +365,7 @@ def health():
         "positions": positions_count,
         "uptime_hours": round(uptime_hours, 2)
     }
-    
+
     if not is_healthy:
         return payload, 500
     return payload, 200
@@ -369,7 +374,7 @@ def health():
 @app.route("/", methods=["POST"])
 def webhook():
     start_time = time.time()
-    
+
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
         send_alert("REJECTED SIGNAL: Manager thread offline.")
         return "System Offline", 503
@@ -383,9 +388,11 @@ def webhook():
         send_alert("REJECTED SIGNAL: Invalid webhook secret.")
         return "Unauthorized", 401
 
+    # NOTE: qty is intentionally NOT read from the payload. Position sizing
+    # is computed server-side from available equity (see below), so Pine
+    # never needs to send — or guess — a share count.
     try:
         symbol = str(data["symbol"]).upper()
-        qty = int(data["qty"])
         buy_stop = float(data["buy_stop"])
         buy_limit = float(data["buy_limit"])
         take_profit = float(data["take_profit"])
@@ -405,10 +412,6 @@ def webhook():
     if not within_trading_window():
         send_alert(f"REJECTED SIGNAL: {symbol} arrived outside trading window ({TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET).")
         return "Outside trading hours", 200
-
-    if qty > MAX_POSITION_SIZE:
-        send_alert(f"REJECTED SIGNAL: {symbol} qty={qty} exceeds MAX_POSITION_SIZE={MAX_POSITION_SIZE}.")
-        return "Qty exceeds max position size", 200
 
     with order_lock:
         now = time.time()
@@ -430,6 +433,10 @@ def webhook():
             send_alert(f"CRITICAL: Could not verify duplicate protection for {symbol}, rejecting for safety: {e}")
             return "Duplicate check failed", 500
 
+        # Position sizing: qty = (EQUITY_FRACTION * buying_power) / buy_limit,
+        # using buy_limit as the worst-case fill price (same conservative
+        # assumption the old fixed-qty buying-power check used). Rounded
+        # down so we never commit more than the available buying power.
         try:
             account = trading_client.get_account()
             buying_power = float(account.buying_power)
@@ -437,11 +444,11 @@ def webhook():
             send_alert(f"CRITICAL: Could not check buying power for {symbol}, rejecting for safety: {e}")
             return "Buying power check failed", 500
 
-        required = qty * buy_limit * 1.05
-        if buying_power < required:
+        qty = int((buying_power * EQUITY_FRACTION) // buy_limit)
+        if qty < 1:
             send_alert(
-                f"REJECTED SIGNAL: {symbol} insufficient buying power (with safety margin) — "
-                f"need ${required:.2f} (base ${qty * buy_limit:.2f}), have ${buying_power:.2f}"
+                f"REJECTED SIGNAL: {symbol} insufficient buying power to size a position — "
+                f"buying_power=${buying_power:.2f}, buy_limit={buy_limit}"
             )
             return "Insufficient buying power", 200
 
@@ -459,10 +466,10 @@ def webhook():
             )
             submitted = trading_client.submit_order(order)
             recent_signals[symbol] = now
-            
+
             latency_ms = (time.time() - start_time) * 1000
             send_alert(
-                f"Entry placed: {symbol} qty={qty} stop={buy_stop} limit={buy_limit} "
+                f"Entry placed: {symbol} qty={qty} (equity-sized) stop={buy_stop} limit={buy_limit} "
                 f"| TP={take_profit} SL={stop_loss} | Order ID: {submitted.id} | Client Order ID: {submitted.client_order_id} | Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
             )
             logger.info(f"Order submitted: {submitted.id} (Client ID: {submitted.client_order_id}) for {symbol} with status {submitted.status}")
