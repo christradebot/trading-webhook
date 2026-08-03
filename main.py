@@ -170,6 +170,24 @@ def has_open_exposure(symbol):
     return False
 
 
+def has_any_open_exposure():
+    """Hard cap of 1 concurrent position/pending entry across ALL symbols.
+    Unlike has_open_exposure(), this doesn't care which ticker — if there's
+    already any open position or any pending BUY order for anything, a new
+    signal is rejected regardless of symbol. This replaces equity availability
+    as the sole limiter on concurrency; equity sizing still determines share
+    count once a slot is actually free."""
+    positions = trading_client.get_all_positions()
+    if len(positions) > 0:
+        return True
+
+    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+    if any(o.side == OrderSide.BUY for o in open_orders):
+        return True
+
+    return False
+
+
 def retry_replace_order(order_id, replace_request, retries=3, delay=1.0):
     for attempt in range(1, retries + 1):
         try:
@@ -426,12 +444,12 @@ def webhook():
             return "Duplicate (rate-limited)", 200
 
         try:
-            if has_open_exposure(symbol):
-                send_alert(f"Duplicate signal ignored for {symbol} — existing position/order found.")
-                return "Duplicate", 200
+            if has_any_open_exposure():
+                send_alert(f"Signal for {symbol} ignored — already at max concurrent positions (cap: 1).")
+                return "Max concurrent positions reached", 200
         except Exception as e:
-            send_alert(f"CRITICAL: Could not verify duplicate protection for {symbol}, rejecting for safety: {e}")
-            return "Duplicate check failed", 500
+            send_alert(f"CRITICAL: Could not verify concurrency cap for {symbol}, rejecting for safety: {e}")
+            return "Concurrency check failed", 500
 
         # Position sizing: qty = (EQUITY_FRACTION * buying_power) / buy_limit,
         # using buy_limit as the worst-case fill price (same conservative
