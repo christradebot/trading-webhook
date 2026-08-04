@@ -46,6 +46,12 @@ symbol_error_counts = {}
 symbol_alert_cooldown = {}
 ERROR_ALERT_INTERVAL = 10
 
+# Throttles the "exit order FAILED to submit" alert so a persistent failure
+# (e.g. a stray order blocking close_position) re-alerts periodically instead
+# of every single 2-second loop iteration forever.
+exit_fail_alerted = {}
+EXIT_FAIL_ALERT_INTERVAL_SECONDS = 60
+
 # Risk / gating config — window start 09:45 ET, close entries at 16:00 ET
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
@@ -299,18 +305,33 @@ def position_manager_loop():
                     if current >= (entry * 1.02) and current <= (hwm_val * 0.90):
                         logger.info(f"TRAILING HIT: Exiting {symbol}")
 
+                        # Cancel ALL open orders for this symbol, not just the
+                        # STOP leg. A bracket's take-profit LIMIT leg holds
+                        # shares "for orders" just as much as the stop does --
+                        # close_position() will fail with "insufficient qty
+                        # available" if any sibling order is still resting.
+                        # This was the actual bug behind AMIX getting stuck
+                        # unclosed while up 90%+: the stop was cancelled fine,
+                        # but the TP leg was never touched, so every retry of
+                        # close_position() failed identically, forever.
                         cancel_ok = True
-                        if symbol in open_orders_map:
-                            for order in open_orders_map[symbol]:
+                        try:
+                            symbol_orders = trading_client.get_orders(
+                                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+                            )
+                            for order in symbol_orders:
                                 try:
                                     retry_cancel_order(order.id)
-                                    logger.info(f"Cancelled stop order {order.id} for {symbol}")
+                                    logger.info(f"Cancelled order {order.id} ({order.type}) for {symbol}")
                                 except Exception as e:
                                     cancel_ok = False
                                     send_alert(
-                                        f"CRITICAL: Failed to cancel stop {order.id} for {symbol} before exit — "
-                                        f"possible duplicate orders on this position: {e}"
+                                        f"CRITICAL: Failed to cancel order {order.id} ({order.type}) for "
+                                        f"{symbol} before exit — possible duplicate orders on this position: {e}"
                                     )
+                        except Exception as e:
+                            cancel_ok = False
+                            send_alert(f"CRITICAL: Failed to fetch open orders for {symbol} before exit: {e}")
 
                         try:
                             retry_close_position(symbol)
@@ -321,11 +342,18 @@ def position_manager_loop():
                             send_alert(f"Position {symbol} closed via Trailing Stop.")
                             symbol_error_counts[symbol] = 0
                             symbol_alert_cooldown.pop(symbol, None)
+                            exit_fail_alerted.pop(symbol, None)
                         except Exception as e:
-                            send_alert(
-                                f"CRITICAL: {symbol} stop was cancelled ({'ok' if cancel_ok else 'FAILED'}) "
-                                f"but exit order FAILED to submit — position may be UNPROTECTED: {e}"
-                            )
+                            # Throttled: without this, a repeated failure here
+                            # (as happened with AMIX) re-alerts every 2s
+                            # forever instead of escalating sanely.
+                            last_alert = exit_fail_alerted.get(symbol, 0)
+                            if time.time() - last_alert >= EXIT_FAIL_ALERT_INTERVAL_SECONDS:
+                                send_alert(
+                                    f"CRITICAL: {symbol} order cleanup was {'ok' if cancel_ok else 'INCOMPLETE'} "
+                                    f"but exit order FAILED to submit — position may be UNPROTECTED: {e}"
+                                )
+                                exit_fail_alerted[symbol] = time.time()
 
                 except Exception as e:
                     handle_symbol_error(symbol, e)
@@ -500,7 +528,6 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
 
 
 
