@@ -5,7 +5,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 
@@ -51,6 +51,12 @@ ERROR_ALERT_INTERVAL = 10
 # of every single 2-second loop iteration forever.
 exit_fail_alerted = {}
 EXIT_FAIL_ALERT_INTERVAL_SECONDS = 60
+
+# An unfilled entry order can otherwise sit indefinitely (up to end of day)
+# holding the single concurrency slot hostage, blocking fresh signals on
+# other tickers that might actually move. Cancel unfilled BUY entry orders
+# once they've been open this long, freeing the slot back up.
+ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "600"))  # 10 min default
 
 # Risk / gating config — window start 09:45 ET, close entries at 16:00 ET
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
@@ -273,10 +279,31 @@ def position_manager_loop():
                     logger.info(f"POSITION P/L UPDATE: {p.symbol} | Qty: {p.qty} | Unrealized P/L: ${float(p.unrealized_pl):.2f} ({float(p.unrealized_plpc)*100:.2f}%)")
                 last_pl_log = now
 
+            all_open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
+
             open_orders_map = {}
-            for o in trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN)):
+            for o in all_open_orders:
                 if o.type == OrderType.STOP:
                     open_orders_map.setdefault(o.symbol, []).append(o)
+
+            # Stale entry order cleanup: an unfilled BUY entry that's been
+            # sitting too long blocks the concurrency cap from freeing up for
+            # a fresh signal on a different ticker (this is exactly what
+            # happened when INLF sat unfilled all session while GTE and YXT
+            # signals were rejected). Cancel it once it exceeds the timeout.
+            for o in all_open_orders:
+                if o.side == OrderSide.BUY:
+                    age_seconds = (datetime.now(timezone.utc) - o.created_at).total_seconds()
+                    if age_seconds >= ENTRY_ORDER_TIMEOUT_SECONDS:
+                        try:
+                            retry_cancel_order(o.id)
+                            send_alert(
+                                f"Cancelled stale unfilled entry order for {o.symbol} after "
+                                f"{age_seconds:.0f}s ({ENTRY_ORDER_TIMEOUT_SECONDS}s timeout) — "
+                                f"freeing concurrency slot for new signals."
+                            )
+                        except Exception as e:
+                            send_alert(f"CRITICAL: Failed to cancel stale entry order {o.id} for {o.symbol}: {e}")
 
             for pos in positions:
                 symbol = pos.symbol
