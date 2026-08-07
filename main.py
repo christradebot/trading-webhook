@@ -141,7 +141,7 @@ def send_alert(message):
 
 
 def emergency_flatten():
-    send_alert("CRITICAL: Emergency Flatten Triggered!")
+    send_alert("[CRIT] Emergency Flatten Triggered!")
     try:
         trading_client.close_all_positions(cancel_orders=True)
     except Exception as e:
@@ -156,10 +156,10 @@ def handle_symbol_error(symbol, e):
     logger.error(f"Error managing {symbol}: {e}")
 
     if count == 3:
-        send_alert(f"CRITICAL: Symbol {symbol} failing repeatedly ({count} consecutive errors).")
+        send_alert(f"[CRIT] Symbol {symbol} failing repeatedly ({count} consecutive errors).")
         symbol_alert_cooldown[symbol] = count
     elif count > 3 and (count - symbol_alert_cooldown.get(symbol, 3)) >= ERROR_ALERT_INTERVAL:
-        send_alert(f"CRITICAL: Symbol {symbol} still failing ({count} consecutive errors).")
+        send_alert(f"[CRIT] Symbol {symbol} still failing ({count} consecutive errors).")
         symbol_alert_cooldown[symbol] = count
 
 
@@ -237,8 +237,11 @@ def position_manager_loop():
     global global_hwm
     global_hwm = load_hwm()
     last_equity_log = 0.0
-    last_pl_log = 0.0
     eod_flatten_triggered_date = None
+    # Tracks currently-open positions so we can detect the moment one closes
+    # (native stop/TP fill, trailing exit, or EOD flatten) and log a single
+    # clean summary line instead of noisy per-minute updates.
+    open_positions_tracked = {}  # symbol -> {"qty", "entry_price"}
 
     while True:
         try:
@@ -253,15 +256,15 @@ def position_manager_loop():
             eod_target_time = datetime.strptime("15:55", "%H:%M").time()
 
             if current_time_val >= eod_target_time and eod_flatten_triggered_date != current_date_str:
-                send_alert("EOD FLATTEN: Reached 15:55 ET. Flattening all positions and cancelling open orders.")
+                send_alert("[EOD] Reached 15:55 ET. Flattening all positions and cancelling open orders.")
                 try:
                     trading_client.close_all_positions(cancel_orders=True)
                     with hwm_lock:
                         global_hwm.clear()
                         maybe_save_hwm(global_hwm, force=True)
-                    send_alert("EOD FLATTEN: Successfully closed all positions and cleared HWM.")
+                    send_alert("[EOD] Successfully closed all positions and cleared HWM.")
                 except Exception as e:
-                    send_alert(f"CRITICAL: EOD Flatten failed: {e}")
+                    send_alert(f"[CRIT] EOD Flatten failed: {e}")
                 eod_flatten_triggered_date = current_date_str
 
             if now - last_equity_log >= 3600:
@@ -273,11 +276,47 @@ def position_manager_loop():
                     logger.warning(f"Failed to log account equity: {e}")
 
             positions = trading_client.get_all_positions()
+            current_symbols = {p.symbol for p in positions}
 
-            if now - last_pl_log >= 60 and positions:
-                for p in positions:
-                    logger.info(f"POSITION P/L UPDATE: {p.symbol} | Qty: {p.qty} | Unrealized P/L: ${float(p.unrealized_pl):.2f} ({float(p.unrealized_plpc)*100:.2f}%)")
-                last_pl_log = now
+            # Trade-close detection: anything we were tracking that's no
+            # longer an open position just closed -- via native stop/TP
+            # fill, our own trailing exit, or EOD flatten. Look up the
+            # actual closing fill and log one clean line with real numbers,
+            # rather than relying on the P/L-update stream just going quiet.
+            for symbol in set(open_positions_tracked.keys()) - current_symbols:
+                info = open_positions_tracked.pop(symbol)
+                try:
+                    recent_orders = trading_client.get_orders(
+                        filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], limit=10)
+                    )
+                    exit_order = next(
+                        (o for o in recent_orders if o.side == OrderSide.SELL and o.filled_avg_price),
+                        None,
+                    )
+                    if exit_order:
+                        exit_price = float(exit_order.filled_avg_price)
+                        qty = float(exit_order.filled_qty or info["qty"])
+                        pl = (exit_price - info["entry_price"]) * qty
+                        pl_pct = ((exit_price / info["entry_price"]) - 1) * 100
+                        exit_time = exit_order.filled_at.strftime("%H:%M:%S") if exit_order.filled_at else "?"
+                        tag = "[WIN]" if pl >= 0 else "[LOSS]"
+                        logger.info(
+                            f"{tag} {symbol} entry ${info['entry_price']:.4f} -> "
+                            f"exit ${exit_price:.4f} @ {exit_time} | qty {qty:.0f} | "
+                            f"P/L: ${pl:.2f} ({pl_pct:+.2f}%) | exit: {exit_order.type}"
+                        )
+                    else:
+                        logger.info(f"[?] {symbol} closed | qty {info['qty']:.0f} | (exit fill details unavailable)")
+                except Exception as e:
+                    logger.warning(f"Could not log close summary for {symbol}: {e}")
+
+            # Track newly-opened positions with their true entry fill price.
+            for p in positions:
+                if p.symbol not in open_positions_tracked:
+                    open_positions_tracked[p.symbol] = {
+                        "qty": float(p.qty),
+                        "entry_price": float(p.avg_entry_price),
+                    }
 
             all_open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
 
@@ -298,12 +337,12 @@ def position_manager_loop():
                         try:
                             retry_cancel_order(o.id)
                             send_alert(
-                                f"Cancelled stale unfilled entry order for {o.symbol} after "
+                                f"[TIMEOUT] Cancelled stale unfilled entry for {o.symbol} after "
                                 f"{age_seconds:.0f}s ({ENTRY_ORDER_TIMEOUT_SECONDS}s timeout) — "
-                                f"freeing concurrency slot for new signals."
+                                f"slot freed for new signals."
                             )
                         except Exception as e:
-                            send_alert(f"CRITICAL: Failed to cancel stale entry order {o.id} for {o.symbol}: {e}")
+                            send_alert(f"[CRIT] Failed to cancel stale entry order {o.id} for {o.symbol}: {e}")
 
             for pos in positions:
                 symbol = pos.symbol
@@ -323,7 +362,7 @@ def position_manager_loop():
                                     order.id,
                                     ReplaceOrderRequest(stop_price=entry),
                                 )
-                                logger.info(f"MOVED TO BE: {symbol} (Order ID: {order.id})")
+                                logger.info(f"[BE] {symbol} stop moved to breakeven (Order ID: {order.id})")
 
                     # 2. 10% Trailing Stop -> Market Order Exit
                     with hwm_lock:
@@ -353,12 +392,12 @@ def position_manager_loop():
                                 except Exception as e:
                                     cancel_ok = False
                                     send_alert(
-                                        f"CRITICAL: Failed to cancel order {order.id} ({order.type}) for "
+                                        f"[CRIT] Failed to cancel order {order.id} ({order.type}) for "
                                         f"{symbol} before exit — possible duplicate orders on this position: {e}"
                                     )
                         except Exception as e:
                             cancel_ok = False
-                            send_alert(f"CRITICAL: Failed to fetch open orders for {symbol} before exit: {e}")
+                            send_alert(f"[CRIT] Failed to fetch open orders for {symbol} before exit: {e}")
 
                         try:
                             retry_close_position(symbol)
@@ -366,7 +405,7 @@ def position_manager_loop():
                                 if symbol in global_hwm:
                                     del global_hwm[symbol]
                                     maybe_save_hwm(global_hwm, force=True)
-                            send_alert(f"Position {symbol} closed via Trailing Stop.")
+                            send_alert(f"[TRAIL] {symbol} closed via trailing stop.")
                             symbol_error_counts[symbol] = 0
                             symbol_alert_cooldown.pop(symbol, None)
                             exit_fail_alerted.pop(symbol, None)
@@ -377,7 +416,7 @@ def position_manager_loop():
                             last_alert = exit_fail_alerted.get(symbol, 0)
                             if time.time() - last_alert >= EXIT_FAIL_ALERT_INTERVAL_SECONDS:
                                 send_alert(
-                                    f"CRITICAL: {symbol} order cleanup was {'ok' if cancel_ok else 'INCOMPLETE'} "
+                                    f"[CRIT] {symbol} order cleanup was {'ok' if cancel_ok else 'INCOMPLETE'} "
                                     f"but exit order FAILED to submit — position may be UNPROTECTED: {e}"
                                 )
                                 exit_fail_alerted[symbol] = time.time()
@@ -449,16 +488,16 @@ def webhook():
     start_time = time.time()
 
     if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
-        send_alert("REJECTED SIGNAL: Manager thread offline.")
+        send_alert("[CRIT] Manager thread offline — signal rejected.")
         return "System Offline", 503
 
     data = request.get_json(force=True, silent=True)
     if not data:
-        send_alert("REJECTED SIGNAL: No/invalid JSON body received.")
+        send_alert("[REJECT] No/invalid JSON body received.")
         return "Bad Request: no JSON body", 400
 
     if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
-        send_alert("REJECTED SIGNAL: Invalid webhook secret.")
+        send_alert("[REJECT] Invalid webhook secret.")
         return "Unauthorized", 401
 
     # NOTE: qty is intentionally NOT read from the payload. Position sizing
@@ -471,19 +510,19 @@ def webhook():
         take_profit = float(data["take_profit"])
         stop_loss = float(data["stop_loss"])
     except (KeyError, ValueError, TypeError) as e:
-        send_alert(f"REJECTED SIGNAL: Malformed payload — {e}")
+        send_alert(f"[REJECT] Malformed payload — {e}")
         return "Bad Request: malformed payload", 400
 
     if not (stop_loss < buy_stop <= buy_limit < take_profit):
         send_alert(
-            f"REJECTED SIGNAL: {symbol} levels out of order — "
+            f"[REJECT] {symbol} levels out of order — "
             f"stop_loss={stop_loss}, buy_stop={buy_stop}, "
             f"buy_limit={buy_limit}, take_profit={take_profit}"
         )
         return "Bad Request: price levels out of order", 400
 
     if not within_trading_window():
-        send_alert(f"REJECTED SIGNAL: {symbol} arrived outside trading window ({TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET).")
+        send_alert(f"[REJECT] {symbol} arrived outside trading window ({TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET).")
         return "Outside trading hours", 200
 
     with order_lock:
@@ -495,15 +534,15 @@ def webhook():
         }
 
         if recent_signals.get(symbol) is not None:
-            send_alert(f"Duplicate signal ignored for {symbol} — received again within {SIGNAL_DEDUPE_WINDOW_SECONDS}s.")
+            send_alert(f"[SKIP] Duplicate signal for {symbol} — received again within {SIGNAL_DEDUPE_WINDOW_SECONDS}s.")
             return "Duplicate (rate-limited)", 200
 
         try:
             if has_any_open_exposure():
-                send_alert(f"Signal for {symbol} ignored — already at max concurrent positions (cap: 1).")
+                send_alert(f"[SKIP] Signal for {symbol} ignored — max concurrent positions (cap: 1).")
                 return "Max concurrent positions reached", 200
         except Exception as e:
-            send_alert(f"CRITICAL: Could not verify concurrency cap for {symbol}, rejecting for safety: {e}")
+            send_alert(f"[CRIT] Could not verify concurrency cap for {symbol}, rejecting for safety: {e}")
             return "Concurrency check failed", 500
 
         # Position sizing: qty = (EQUITY_FRACTION * buying_power) / buy_limit,
@@ -514,13 +553,13 @@ def webhook():
             account = trading_client.get_account()
             buying_power = float(account.buying_power)
         except Exception as e:
-            send_alert(f"CRITICAL: Could not check buying power for {symbol}, rejecting for safety: {e}")
+            send_alert(f"[CRIT] Could not check buying power for {symbol}, rejecting for safety: {e}")
             return "Buying power check failed", 500
 
         qty = int((buying_power * EQUITY_FRACTION) // buy_limit)
         if qty < 1:
             send_alert(
-                f"REJECTED SIGNAL: {symbol} insufficient buying power to size a position — "
+                f"[REJECT] {symbol} insufficient buying power to size a position — "
                 f"buying_power=${buying_power:.2f}, buy_limit={buy_limit}"
             )
             return "Insufficient buying power", 200
@@ -542,12 +581,12 @@ def webhook():
 
             latency_ms = (time.time() - start_time) * 1000
             send_alert(
-                f"Entry placed: {symbol} qty={qty} (equity-sized) stop={buy_stop} limit={buy_limit} "
+                f"[ENTRY] {symbol} qty={qty} (equity-sized) stop={buy_stop} limit={buy_limit} "
                 f"| TP={take_profit} SL={stop_loss} | Order ID: {submitted.id} | Client Order ID: {submitted.client_order_id} | Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
             )
             logger.info(f"Order submitted: {submitted.id} (Client ID: {submitted.client_order_id}) for {symbol} with status {submitted.status}")
         except Exception as e:
-            send_alert(f"CRITICAL: Failed to submit entry order for {symbol}: {e}")
+            send_alert(f"[CRIT] Failed to submit entry order for {symbol}: {e}")
             return "Order submission failed", 500
 
     return "Success", 200
@@ -555,7 +594,6 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
 
 
 
