@@ -92,6 +92,15 @@ TRAIL_PERCENT = float(os.getenv("TRAIL_PERCENT", "15.0"))
 # and give the whole move back before anything protects it.
 BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "2.0"))
 
+# Second breakeven tier: a flat floor at breakeven has the same gap problem
+# one level up -- once a trade has run to +8%+, it's proven real strength,
+# but the floor still sits pinned at exactly entry until the trail reaches
+# ~17.6%. That leaves an +8%-to-+17.6% stretch where a normal pullback wipes
+# out the entire gain back to breakeven instead of locking in any of it.
+# This tier locks in a real profit cushion once that strength is shown.
+BREAKEVEN_TIER2_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TIER2_TRIGGER_PCT", "8.0"))
+BREAKEVEN_TIER2_LOCK_PCT = float(os.getenv("BREAKEVEN_TIER2_LOCK_PCT", "4.0"))
+
 # Idempotency & deduplication
 order_lock = threading.Lock()
 hwm_lock = threading.RLock()
@@ -370,23 +379,36 @@ def position_manager_loop():
                             maybe_save_hwm(global_hwm, symbol=symbol, current_price=current)
                         hwm_val = global_hwm.get(symbol, current)
 
-                    # Stop management: two floors combine, whichever is
-                    # higher wins (the stop only ever ratchets up).
-                    # 1) Breakeven: once up BREAKEVEN_TRIGGER_PCT%, the stop
-                    #    must be at least entry price, regardless of the
-                    #    trail calc -- the 15% trail alone doesn't reach
-                    #    entry until the position is up ~17.6%.
-                    # 2) 15% trail: (highest price since entry) x 0.85,
+                    # Stop management: three floors combine, whichever is
+                    # highest wins (the stop only ever ratchets up):
+                    # 1) 15% trail: (highest price since entry) x 0.85 --
                     #    the fallback exit if TP is never reached.
+                    # 2) Breakeven (+2%): stop >= entry, so a full reversal
+                    #    from a modest gain never turns into a real loss.
+                    # 3) Tier-2 lock (+8% -> lock +4%): once the trade has
+                    #    proven real strength, lock in an actual profit
+                    #    cushion instead of leaving the floor pinned at pure
+                    #    breakeven all the way out to where the trail alone
+                    #    would reach entry (~+17.6%) -- that gap is exactly
+                    #    where a normal pullback-then-continuation wipes out
+                    #    the whole gain for nothing.
                     # Alpaca's own engine fires the STOP the instant price
                     # crosses it -- the bot's only job is keeping the price
                     # current.
                     if symbol in open_orders_map:
                         trail_level = hwm_val * (1 - TRAIL_PERCENT / 100)
                         desired_stop = trail_level
-                        breakeven_earned = current >= entry * (1 + BREAKEVEN_TRIGGER_PCT / 100)
-                        if breakeven_earned:
-                            desired_stop = max(desired_stop, entry)
+                        be_tag = None
+
+                        if current >= entry * (1 + BREAKEVEN_TIER2_TRIGGER_PCT / 100):
+                            tier2_floor = entry * (1 + BREAKEVEN_TIER2_LOCK_PCT / 100)
+                            if tier2_floor > desired_stop:
+                                desired_stop = tier2_floor
+                                be_tag = "[BE2]"
+                        elif current >= entry * (1 + BREAKEVEN_TRIGGER_PCT / 100):
+                            if entry > desired_stop:
+                                desired_stop = entry
+                                be_tag = "[BE]"
 
                         for order in open_orders_map[symbol]:
                             current_stop = float(order.stop_price)
@@ -395,7 +417,7 @@ def position_manager_loop():
                                     retry_replace_order(
                                         order.id, ReplaceOrderRequest(stop_price=round(desired_stop, 4))
                                     )
-                                    tag = "[BE]" if breakeven_earned and desired_stop == entry else "[TRAIL]"
+                                    tag = be_tag or "[TRAIL]"
                                     logger.info(f"{tag} {symbol} stop -> ${desired_stop:.4f} (HWM ${hwm_val:.4f})")
                                 except Exception as e:
                                     send_alert(f"[CRIT] Failed to move stop for {symbol}: {e}")
