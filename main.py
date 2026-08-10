@@ -19,6 +19,8 @@ from alpaca.trading.requests import (
     StopLossRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass, QueryOrderStatus
+from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockLatestQuoteRequest
 from requests.exceptions import Timeout, ConnectionError
 
 # ============================================================
@@ -38,6 +40,9 @@ app = Flask(__name__)
 is_live = os.getenv("LIVE_TRADING", "False") == "True"
 logger.info(f"--- BOT STARTED: LIVE_TRADING={is_live} ---")
 trading_client = TradingClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"), paper=not is_live)
+# Separate client for live market data (used to sanity-check a signal
+# against the real current price before committing an order).
+data_client = StockHistoricalDataClient(os.getenv("APCA_API_KEY_ID"), os.getenv("APCA_API_SECRET_KEY"))
 
 HWM_FILE = "hwm_data.json"
 bot_start_time = time.time()
@@ -66,6 +71,13 @@ EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
 # this, regardless of what Pine computed — full-size sizing means this is
 # the only backstop against an outlier candle producing an outsized loss.
 MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
+
+# Guards against a signal firing on a condition that was true at bar-close
+# evaluation time but no longer reflects reality (late/revised tape prints
+# on thin small caps, TradingView's server-side data snapshot diverging
+# slightly from the live feed). Reject if the current live price has
+# already drifted this far from what the signal computed as entry_limit.
+STALE_SIGNAL_MAX_DRIFT_PCT = float(os.getenv("STALE_SIGNAL_MAX_DRIFT_PCT", "2.0"))
 
 # Flat trailing-stop percentage. The stop only ever ratchets UP (native STOP
 # order price is replaced, never loosened) toward highest-price-since-entry
@@ -534,6 +546,31 @@ def webhook():
                 f"buying_power=${buying_power:.2f}, entry_limit={entry_limit}"
             )
             return "Insufficient buying power", 200
+
+        # Stale-signal check: verify the live quote hasn't already drifted
+        # meaningfully away from what the confirmed signal computed. This
+        # is the last line of defense against a condition that was true at
+        # bar-close evaluation but no longer reflects the real market —
+        # deliberately checked right before submission, using the freshest
+        # possible price, not earlier in the request.
+        try:
+            quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            quote = data_client.get_stock_latest_quote(quote_req)[symbol]
+            live_price = float(quote.ask_price) if quote.ask_price else float(quote.bid_price)
+            if not live_price or live_price <= 0:
+                raise ValueError(f"no usable live price (ask={quote.ask_price}, bid={quote.bid_price})")
+        except Exception as e:
+            send_alert(f"[CRIT] Could not verify live price for {symbol}, rejecting for safety: {e}")
+            return "Live price check failed", 500
+
+        drift_pct = abs(live_price - entry_limit) / entry_limit * 100
+        if drift_pct > STALE_SIGNAL_MAX_DRIFT_PCT:
+            send_alert(
+                f"[REJECT] {symbol} signal appears stale — live price ${live_price:.4f} is "
+                f"{drift_pct:.2f}% away from entry_limit ${entry_limit:.4f} "
+                f"(max {STALE_SIGNAL_MAX_DRIFT_PCT}%)."
+            )
+            return "Stale signal rejected", 200
 
         try:
             # BRACKET: entry + take_profit (HTF AVWAP) + stop_loss (candle
