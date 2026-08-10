@@ -14,7 +14,7 @@ from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import (
     ReplaceOrderRequest,
     GetOrdersRequest,
-    StopLimitOrderRequest,
+    LimitOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
 )
@@ -46,12 +46,6 @@ symbol_error_counts = {}
 symbol_alert_cooldown = {}
 ERROR_ALERT_INTERVAL = 10
 
-# Throttles the "exit order FAILED to submit" alert so a persistent failure
-# (e.g. a stray order blocking close_position) re-alerts periodically instead
-# of every single 2-second loop iteration forever.
-exit_fail_alerted = {}
-EXIT_FAIL_ALERT_INTERVAL_SECONDS = 60
-
 # An unfilled entry order can otherwise sit indefinitely (up to end of day)
 # holding the single concurrency slot hostage, blocking fresh signals on
 # other tickers that might actually move. Cancel unfilled BUY entry orders
@@ -59,15 +53,32 @@ EXIT_FAIL_ALERT_INTERVAL_SECONDS = 60
 ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "600"))  # 10 min default
 
 # Risk / gating config — window start 09:45 ET, close entries at 16:00 ET
-TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:45")
-TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "16:00")
+TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:00")
+TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "11:30")
 NY_TZ = ZoneInfo("America/New_York")
 
 # Position sizing — qty is computed server-side from available equity rather
-# than supplied by Pine. EQUITY_FRACTION is the share of buying power to
-# commit per trade; kept below 1.0 as a small buffer against price movement
-# between the buying-power check and the actual fill.
+# than supplied by Pine. Full-size by design; the candle-range / stop-distance
+# checks below are the risk control, not position size.
 EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
+
+# Defense-in-depth: reject any signal whose implied stop distance exceeds
+# this, regardless of what Pine computed — full-size sizing means this is
+# the only backstop against an outlier candle producing an outsized loss.
+MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
+
+# Flat trailing-stop percentage. The stop only ever ratchets UP (native STOP
+# order price is replaced, never loosened) toward highest-price-since-entry
+# minus this percent. Take-profit (HTF AVWAP, computed in Pine) is the
+# primary exit target; this is the fallback if that target is never reached.
+TRAIL_PERCENT = float(os.getenv("TRAIL_PERCENT", "15.0"))
+
+# Breakeven guarantee: once the position is up this much, immediately move
+# the stop to entry, independent of what the trail calc alone would give.
+# The 15% trail doesn't mathematically reach entry until the position is up
+# ~17.6% (entry / 0.85), so without this a trade could run up double-digits
+# and give the whole move back before anything protects it.
+BREAKEVEN_TRIGGER_PCT = float(os.getenv("BREAKEVEN_TRIGGER_PCT", "2.0"))
 
 # Idempotency & deduplication
 order_lock = threading.Lock()
@@ -183,12 +194,7 @@ def has_open_exposure(symbol):
 
 
 def has_any_open_exposure():
-    """Hard cap of 1 concurrent position/pending entry across ALL symbols.
-    Unlike has_open_exposure(), this doesn't care which ticker — if there's
-    already any open position or any pending BUY order for anything, a new
-    signal is rejected regardless of symbol. This replaces equity availability
-    as the sole limiter on concurrency; equity sizing still determines share
-    count once a slot is actually free."""
+    """Hard cap of 1 concurrent position/pending entry across ALL symbols."""
     positions = trading_client.get_all_positions()
     if len(positions) > 0:
         return True
@@ -222,25 +228,14 @@ def retry_cancel_order(order_id, retries=3, delay=1.0):
             time.sleep(delay)
 
 
-def retry_close_position(symbol, retries=3, delay=1.0):
-    for attempt in range(1, retries + 1):
-        try:
-            return trading_client.close_position(symbol)
-        except Exception as e:
-            if attempt == retries or not is_transient_error(e):
-                raise
-            logger.warning(f"Transient error closing position {symbol} (attempt {attempt}/{retries}): {e}. Retrying in {delay}s...")
-            time.sleep(delay)
-
-
 def position_manager_loop():
     global global_hwm
     global_hwm = load_hwm()
     last_equity_log = 0.0
     eod_flatten_triggered_date = None
     # Tracks currently-open positions so we can detect the moment one closes
-    # (native stop/TP fill, trailing exit, or EOD flatten) and log a single
-    # clean summary line instead of noisy per-minute updates.
+    # (TP fill, trailing-stop fill, or EOD flatten) and log a single clean
+    # summary line instead of noisy per-minute updates.
     open_positions_tracked = {}  # symbol -> {"qty", "entry_price"}
 
     while True:
@@ -279,10 +274,14 @@ def position_manager_loop():
             current_symbols = {p.symbol for p in positions}
 
             # Trade-close detection: anything we were tracking that's no
-            # longer an open position just closed -- via native stop/TP
-            # fill, our own trailing exit, or EOD flatten. Look up the
-            # actual closing fill and log one clean line with real numbers,
-            # rather than relying on the P/L-update stream just going quiet.
+            # longer an open position just closed -- via the native TP fill,
+            # the trailing STOP fill, or EOD flatten. Alpaca's own bracket
+            # OCO linkage cancels whichever sibling leg didn't fire, so
+            # there's no stray-order cleanup needed here (unlike the earlier
+            # AMIX bug, which came from a manual close_position() call
+            # stepping on a still-resting sibling leg -- this design never
+            # calls close_position() for a normal exit, only ever replaces
+            # the trailing stop's price, so that failure mode can't recur).
             for symbol in set(open_positions_tracked.keys()) - current_symbols:
                 info = open_positions_tracked.pop(symbol)
                 try:
@@ -310,6 +309,13 @@ def position_manager_loop():
                 except Exception as e:
                     logger.warning(f"Could not log close summary for {symbol}: {e}")
 
+                symbol_error_counts[symbol] = 0
+                symbol_alert_cooldown.pop(symbol, None)
+                with hwm_lock:
+                    if symbol in global_hwm:
+                        del global_hwm[symbol]
+                        maybe_save_hwm(global_hwm, force=True)
+
             # Track newly-opened positions with their true entry fill price.
             for p in positions:
                 if p.symbol not in open_positions_tracked:
@@ -326,10 +332,7 @@ def position_manager_loop():
                     open_orders_map.setdefault(o.symbol, []).append(o)
 
             # Stale entry order cleanup: an unfilled BUY entry that's been
-            # sitting too long blocks the concurrency cap from freeing up for
-            # a fresh signal on a different ticker (this is exactly what
-            # happened when INLF sat unfilled all session while GTE and YXT
-            # signals were rejected). Cancel it once it exceeds the timeout.
+            # sitting too long blocks the concurrency cap from freeing up.
             for o in all_open_orders:
                 if o.side == OrderSide.BUY:
                     age_seconds = (datetime.now(timezone.utc) - o.created_at).total_seconds()
@@ -353,73 +356,37 @@ def position_manager_loop():
                         if symbol not in global_hwm or current > global_hwm[symbol]:
                             global_hwm[symbol] = current
                             maybe_save_hwm(global_hwm, symbol=symbol, current_price=current)
-
-                    # 1. Breakeven move (2% gain trigger)
-                    if current >= (entry * 1.02) and symbol in open_orders_map:
-                        for order in open_orders_map[symbol]:
-                            if float(order.stop_price) < entry:
-                                retry_replace_order(
-                                    order.id,
-                                    ReplaceOrderRequest(stop_price=entry),
-                                )
-                                logger.info(f"[BE] {symbol} stop moved to breakeven (Order ID: {order.id})")
-
-                    # 2. 10% Trailing Stop -> Market Order Exit
-                    with hwm_lock:
                         hwm_val = global_hwm.get(symbol, current)
 
-                    if current >= (entry * 1.02) and current <= (hwm_val * 0.90):
-                        logger.info(f"TRAILING HIT: Exiting {symbol}")
+                    # Stop management: two floors combine, whichever is
+                    # higher wins (the stop only ever ratchets up).
+                    # 1) Breakeven: once up BREAKEVEN_TRIGGER_PCT%, the stop
+                    #    must be at least entry price, regardless of the
+                    #    trail calc -- the 15% trail alone doesn't reach
+                    #    entry until the position is up ~17.6%.
+                    # 2) 15% trail: (highest price since entry) x 0.85,
+                    #    the fallback exit if TP is never reached.
+                    # Alpaca's own engine fires the STOP the instant price
+                    # crosses it -- the bot's only job is keeping the price
+                    # current.
+                    if symbol in open_orders_map:
+                        trail_level = hwm_val * (1 - TRAIL_PERCENT / 100)
+                        desired_stop = trail_level
+                        breakeven_earned = current >= entry * (1 + BREAKEVEN_TRIGGER_PCT / 100)
+                        if breakeven_earned:
+                            desired_stop = max(desired_stop, entry)
 
-                        # Cancel ALL open orders for this symbol, not just the
-                        # STOP leg. A bracket's take-profit LIMIT leg holds
-                        # shares "for orders" just as much as the stop does --
-                        # close_position() will fail with "insufficient qty
-                        # available" if any sibling order is still resting.
-                        # This was the actual bug behind AMIX getting stuck
-                        # unclosed while up 90%+: the stop was cancelled fine,
-                        # but the TP leg was never touched, so every retry of
-                        # close_position() failed identically, forever.
-                        cancel_ok = True
-                        try:
-                            symbol_orders = trading_client.get_orders(
-                                filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
-                            )
-                            for order in symbol_orders:
+                        for order in open_orders_map[symbol]:
+                            current_stop = float(order.stop_price)
+                            if desired_stop > current_stop:
                                 try:
-                                    retry_cancel_order(order.id)
-                                    logger.info(f"Cancelled order {order.id} ({order.type}) for {symbol}")
-                                except Exception as e:
-                                    cancel_ok = False
-                                    send_alert(
-                                        f"[CRIT] Failed to cancel order {order.id} ({order.type}) for "
-                                        f"{symbol} before exit — possible duplicate orders on this position: {e}"
+                                    retry_replace_order(
+                                        order.id, ReplaceOrderRequest(stop_price=round(desired_stop, 4))
                                     )
-                        except Exception as e:
-                            cancel_ok = False
-                            send_alert(f"[CRIT] Failed to fetch open orders for {symbol} before exit: {e}")
-
-                        try:
-                            retry_close_position(symbol)
-                            with hwm_lock:
-                                if symbol in global_hwm:
-                                    del global_hwm[symbol]
-                                    maybe_save_hwm(global_hwm, force=True)
-                            send_alert(f"[TRAIL] {symbol} closed via trailing stop.")
-                            symbol_error_counts[symbol] = 0
-                            symbol_alert_cooldown.pop(symbol, None)
-                            exit_fail_alerted.pop(symbol, None)
-                        except Exception as e:
-                            # Throttled: without this, a repeated failure here
-                            # (as happened with AMIX) re-alerts every 2s
-                            # forever instead of escalating sanely.
-                            last_alert = exit_fail_alerted.get(symbol, 0)
-                            if time.time() - last_alert >= EXIT_FAIL_ALERT_INTERVAL_SECONDS:
-                                send_alert(
-                                    f"[CRIT] {symbol} order cleanup was {'ok' if cancel_ok else 'INCOMPLETE'} "
-                                    f"but exit order FAILED to submit — position may be UNPROTECTED: {e}"
-                                )
-                                exit_fail_alerted[symbol] = time.time()
+                                    tag = "[BE]" if breakeven_earned and desired_stop == entry else "[TRAIL]"
+                                    logger.info(f"{tag} {symbol} stop -> ${desired_stop:.4f} (HWM ${hwm_val:.4f})")
+                                except Exception as e:
+                                    send_alert(f"[CRIT] Failed to move stop for {symbol}: {e}")
 
                 except Exception as e:
                     handle_symbol_error(symbol, e)
@@ -500,26 +467,34 @@ def webhook():
         send_alert("[REJECT] Invalid webhook secret.")
         return "Unauthorized", 401
 
-    # NOTE: qty is intentionally NOT read from the payload. Position sizing
-    # is computed server-side from available equity (see below), so Pine
-    # never needs to send — or guess — a share count.
+    # take_profit is back (HTF AVWAP target, computed in Pine). No buy_stop --
+    # there's no future trigger to wait for, the signal already confirmed at
+    # bar close. qty is still server-computed from equity.
     try:
         symbol = str(data["symbol"]).upper()
-        buy_stop = float(data["buy_stop"])
-        buy_limit = float(data["buy_limit"])
-        take_profit = float(data["take_profit"])
+        entry_limit = float(data["entry_limit"])
         stop_loss = float(data["stop_loss"])
+        take_profit = float(data["take_profit"])
     except (KeyError, ValueError, TypeError) as e:
         send_alert(f"[REJECT] Malformed payload — {e}")
         return "Bad Request: malformed payload", 400
 
-    if not (stop_loss < buy_stop <= buy_limit < take_profit):
+    if not (0 < stop_loss < entry_limit < take_profit):
         send_alert(
             f"[REJECT] {symbol} levels out of order — "
-            f"stop_loss={stop_loss}, buy_stop={buy_stop}, "
-            f"buy_limit={buy_limit}, take_profit={take_profit}"
+            f"stop_loss={stop_loss}, entry_limit={entry_limit}, take_profit={take_profit}"
         )
         return "Bad Request: price levels out of order", 400
+
+    # Defense-in-depth: reject regardless of what Pine computed if the
+    # implied stop distance is outside a sane ceiling.
+    stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
+    if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
+        send_alert(
+            f"[REJECT] {symbol} stop distance {stop_distance_pct:.2f}% exceeds "
+            f"MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}%."
+        )
+        return "Bad Request: stop distance too wide", 400
 
     if not within_trading_window():
         send_alert(f"[REJECT] {symbol} arrived outside trading window ({TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET).")
@@ -545,10 +520,6 @@ def webhook():
             send_alert(f"[CRIT] Could not verify concurrency cap for {symbol}, rejecting for safety: {e}")
             return "Concurrency check failed", 500
 
-        # Position sizing: qty = (EQUITY_FRACTION * buying_power) / buy_limit,
-        # using buy_limit as the worst-case fill price (same conservative
-        # assumption the old fixed-qty buying-power check used). Rounded
-        # down so we never commit more than the available buying power.
         try:
             account = trading_client.get_account()
             buying_power = float(account.buying_power)
@@ -556,22 +527,27 @@ def webhook():
             send_alert(f"[CRIT] Could not check buying power for {symbol}, rejecting for safety: {e}")
             return "Buying power check failed", 500
 
-        qty = int((buying_power * EQUITY_FRACTION) // buy_limit)
+        qty = int((buying_power * EQUITY_FRACTION) // entry_limit)
         if qty < 1:
             send_alert(
                 f"[REJECT] {symbol} insufficient buying power to size a position — "
-                f"buying_power=${buying_power:.2f}, buy_limit={buy_limit}"
+                f"buying_power=${buying_power:.2f}, entry_limit={entry_limit}"
             )
             return "Insufficient buying power", 200
 
         try:
-            order = StopLimitOrderRequest(
+            # BRACKET: entry + take_profit (HTF AVWAP) + stop_loss (candle
+            # low, then continuously ratcheted up as a 15% trail). Alpaca
+            # links these as OCO siblings natively -- whichever fires,
+            # the other is auto-cancelled on Alpaca's side. The bot never
+            # manually closes the position for this exit, so the AMIX
+            # stray-order bug class doesn't apply here.
+            order = LimitOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
-                stop_price=buy_stop,
-                limit_price=buy_limit,
+                limit_price=entry_limit,
                 order_class=OrderClass.BRACKET,
                 take_profit=TakeProfitRequest(limit_price=take_profit),
                 stop_loss=StopLossRequest(stop_price=stop_loss),
@@ -581,8 +557,10 @@ def webhook():
 
             latency_ms = (time.time() - start_time) * 1000
             send_alert(
-                f"[ENTRY] {symbol} qty={qty} (equity-sized) stop={buy_stop} limit={buy_limit} "
-                f"| TP={take_profit} SL={stop_loss} | Order ID: {submitted.id} | Client Order ID: {submitted.client_order_id} | Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
+                f"[ENTRY] {symbol} qty={qty} (equity-sized) limit={entry_limit} "
+                f"TP={take_profit} SL={stop_loss} (trailing {TRAIL_PERCENT}%) "
+                f"| Order ID: {submitted.id} | Client Order ID: {submitted.client_order_id} | "
+                f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
             )
             logger.info(f"Order submitted: {submitted.id} (Client ID: {submitted.client_order_id}) for {symbol} with status {submitted.status}")
         except Exception as e:
