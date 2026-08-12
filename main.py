@@ -113,6 +113,42 @@ _last_hwm_save = 0.0
 _last_saved_hwm_values = {}
 global_hwm = {}
 
+# ============================================================
+# Reject-reason tally — reset daily at EOD flatten, logged as one
+# summary line so you can see the day's rejection breakdown at a
+# glance instead of scrolling the raw log (e.g. "6x WINDOW, 2x
+# TP_NOT_SET, 1x STALE"). Every reject() call below increments this.
+# ============================================================
+reject_tally_lock = threading.Lock()
+reject_reason_counts = {}
+
+
+def reject(tag, symbol, message, http_status=200, log_level="info"):
+    """Central reject helper. Every webhook rejection MUST go through this
+    so the reason is both tagged distinctly in the log and tallied for the
+    daily summary. `tag` should be a short stable code (e.g. "WINDOW",
+    "TP_NOT_SET") — not a full sentence — so the tally groups correctly."""
+    with reject_tally_lock:
+        reject_reason_counts[tag] = reject_reason_counts.get(tag, 0) + 1
+    full_message = f"[REJECT:{tag}] {symbol} — {message}"
+    if log_level == "error":
+        logger.error(full_message)
+    else:
+        logger.info(f"ALERT: {full_message}")
+    return message, http_status
+
+
+def log_reject_summary():
+    """Logs a single tallied line of today's reject reasons, then resets
+    the counter for the next session. Called from the EOD flatten path."""
+    with reject_tally_lock:
+        if not reject_reason_counts:
+            logger.info("[SUMMARY] No rejected signals today.")
+        else:
+            parts = ", ".join(f"{count}x {tag}" for tag, count in sorted(reject_reason_counts.items(), key=lambda kv: -kv[1]))
+            logger.info(f"[SUMMARY] Reject reasons today: {parts}")
+        reject_reason_counts.clear()
+
 
 def is_transient_error(e):
     if isinstance(e, (Timeout, ConnectionError)):
@@ -281,6 +317,10 @@ def position_manager_loop():
                     send_alert("[EOD] Successfully closed all positions and cleared HWM.")
                 except Exception as e:
                     send_alert(f"[CRIT] EOD Flatten failed: {e}")
+                # Daily reject-reason summary, right alongside the flatten —
+                # one glance tells you how many signals fired vs. how many
+                # were rejected and why, before the tally resets for tomorrow.
+                log_reject_summary()
                 eod_flatten_triggered_date = current_date_str
 
             if now - last_equity_log >= 3600:
@@ -484,6 +524,14 @@ def health():
     return payload, 200
 
 
+@app.route("/reject-summary", methods=["GET"])
+def reject_summary():
+    """On-demand snapshot of today's reject tally so far, without waiting
+    for the EOD flatten to see it. Doesn't reset the counter."""
+    with reject_tally_lock:
+        return dict(reject_reason_counts), 200
+
+
 @app.route("/", methods=["POST"])
 def webhook():
     start_time = time.time()
@@ -494,45 +542,72 @@ def webhook():
 
     data = request.get_json(force=True, silent=True)
     if not data:
-        send_alert("[REJECT] No/invalid JSON body received.")
-        return "Bad Request: no JSON body", 400
+        # No symbol available yet at this point (body itself is missing/invalid) —
+        # most of these are TradingView's periodic webhook connectivity test
+        # pings, not real signals. Tallied separately so they don't get
+        # confused with genuine rejected trade signals in the summary.
+        return reject("NO_JSON", "-", "no/invalid JSON body received", http_status=400)
 
     if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
-        send_alert("[REJECT] Invalid webhook secret.")
-        return "Unauthorized", 401
+        return reject("BAD_SECRET", data.get("symbol", "-"), "invalid webhook secret", http_status=401)
 
-    # take_profit is back (HTF AVWAP target, computed in Pine). No buy_stop --
-    # there's no future trigger to wait for, the signal already confirmed at
-    # bar close. qty is still server-computed from equity.
+    symbol = str(data.get("symbol", "UNKNOWN")).upper()
+
     try:
-        symbol = str(data["symbol"]).upper()
         entry_limit = float(data["entry_limit"])
         stop_loss = float(data["stop_loss"])
         take_profit = float(data["take_profit"])
     except (KeyError, ValueError, TypeError) as e:
-        send_alert(f"[REJECT] Malformed payload — {e}")
-        return "Bad Request: malformed payload", 400
+        return reject("MALFORMED", symbol, f"malformed payload — {e}", http_status=400)
 
-    if not (0 < stop_loss < entry_limit < take_profit):
-        send_alert(
-            f"[REJECT] {symbol} levels out of order — "
-            f"stop_loss={stop_loss}, entry_limit={entry_limit}, take_profit={take_profit}"
+    # ============================================================
+    # Trading window check now runs FIRST, right after the payload is
+    # parseable — before any level validation. Previously this ran last,
+    # which meant a signal that was both outside the window AND had bad
+    # levels (e.g. an unset take_profit) would get logged only as
+    # "levels out of order", hiding the fact that it was also a stale/
+    # out-of-window signal. Checking window first makes the log tell you
+    # the real first-order reason every time.
+    # ============================================================
+    if not within_trading_window():
+        now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
+        return reject(
+            "WINDOW", symbol,
+            f"arrived at {now_ny_str} ET, outside window {TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET "
+            f"(entry_limit={entry_limit}, stop_loss={stop_loss}, take_profit={take_profit})",
         )
-        return "Bad Request: price levels out of order", 400
+
+    # ============================================================
+    # Level ordering — split into distinct sub-checks so the log says
+    # exactly which value broke it, instead of one generic message.
+    # take_profit == 0.0 is called out by name since that's the most
+    # common real-world cause: the Pine "Take Profit Target Price"
+    # input wasn't set on that ticker's chart before the session.
+    # ============================================================
+    if not (stop_loss > 0):
+        return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})")
+
+    if not (stop_loss < entry_limit):
+        return reject("SL_GE_ENTRY", symbol, f"stop_loss ({stop_loss}) must be below entry_limit ({entry_limit})")
+
+    if take_profit == 0.0:
+        return reject(
+            "TP_NOT_SET", symbol,
+            f"take_profit is 0.0 — the 'Take Profit Target Price' input likely wasn't set on this "
+            f"ticker's chart before the session (entry_limit={entry_limit}, stop_loss={stop_loss})",
+        )
+
+    if not (entry_limit < take_profit):
+        return reject("TP_LE_ENTRY", symbol, f"entry_limit ({entry_limit}) must be below take_profit ({take_profit})")
 
     # Defense-in-depth: reject regardless of what Pine computed if the
     # implied stop distance is outside a sane ceiling.
     stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
     if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
-        send_alert(
-            f"[REJECT] {symbol} stop distance {stop_distance_pct:.2f}% exceeds "
-            f"MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}%."
+        return reject(
+            "STOP_TOO_WIDE", symbol,
+            f"stop distance {stop_distance_pct:.2f}% exceeds MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}%",
         )
-        return "Bad Request: stop distance too wide", 400
-
-    if not within_trading_window():
-        send_alert(f"[REJECT] {symbol} arrived outside trading window ({TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET).")
-        return "Outside trading hours", 200
 
     with order_lock:
         now = time.time()
@@ -543,31 +618,23 @@ def webhook():
         }
 
         if recent_signals.get(symbol) is not None:
-            send_alert(f"[SKIP] Duplicate signal for {symbol} — received again within {SIGNAL_DEDUPE_WINDOW_SECONDS}s.")
-            return "Duplicate (rate-limited)", 200
+            return reject("DUPLICATE", symbol, f"duplicate signal received again within {SIGNAL_DEDUPE_WINDOW_SECONDS}s")
 
         try:
             if has_any_open_exposure():
-                send_alert(f"[SKIP] Signal for {symbol} ignored — max concurrent positions (cap: 1).")
-                return "Max concurrent positions reached", 200
+                return reject("CONCURRENCY_CAP", symbol, "max concurrent positions reached (cap: 1)")
         except Exception as e:
-            send_alert(f"[CRIT] Could not verify concurrency cap for {symbol}, rejecting for safety: {e}")
-            return "Concurrency check failed", 500
+            return reject("CONCURRENCY_CHECK_FAILED", symbol, f"could not verify concurrency cap, rejecting for safety: {e}", http_status=500, log_level="error")
 
         try:
             account = trading_client.get_account()
             buying_power = float(account.buying_power)
         except Exception as e:
-            send_alert(f"[CRIT] Could not check buying power for {symbol}, rejecting for safety: {e}")
-            return "Buying power check failed", 500
+            return reject("BUYING_POWER_CHECK_FAILED", symbol, f"could not check buying power, rejecting for safety: {e}", http_status=500, log_level="error")
 
         qty = int((buying_power * EQUITY_FRACTION) // entry_limit)
         if qty < 1:
-            send_alert(
-                f"[REJECT] {symbol} insufficient buying power to size a position — "
-                f"buying_power=${buying_power:.2f}, entry_limit={entry_limit}"
-            )
-            return "Insufficient buying power", 200
+            return reject("INSUFFICIENT_BP", symbol, f"buying_power=${buying_power:.2f} insufficient to size a position at entry_limit={entry_limit}")
 
         # Stale-signal check: verify the live quote hasn't already drifted
         # meaningfully away from what the confirmed signal computed. This
@@ -582,17 +649,15 @@ def webhook():
             if not live_price or live_price <= 0:
                 raise ValueError(f"no usable live price (ask={quote.ask_price}, bid={quote.bid_price})")
         except Exception as e:
-            send_alert(f"[CRIT] Could not verify live price for {symbol}, rejecting for safety: {e}")
-            return "Live price check failed", 500
+            return reject("LIVE_PRICE_CHECK_FAILED", symbol, f"could not verify live price, rejecting for safety: {e}", http_status=500, log_level="error")
 
         drift_pct = abs(live_price - entry_limit) / entry_limit * 100
         if drift_pct > STALE_SIGNAL_MAX_DRIFT_PCT:
-            send_alert(
-                f"[REJECT] {symbol} signal appears stale — live price ${live_price:.4f} is "
-                f"{drift_pct:.2f}% away from entry_limit ${entry_limit:.4f} "
-                f"(max {STALE_SIGNAL_MAX_DRIFT_PCT}%)."
+            return reject(
+                "STALE_SIGNAL", symbol,
+                f"live price ${live_price:.4f} is {drift_pct:.2f}% away from entry_limit ${entry_limit:.4f} "
+                f"(max {STALE_SIGNAL_MAX_DRIFT_PCT}%)",
             )
-            return "Stale signal rejected", 200
 
         try:
             # BRACKET: entry + take_profit (HTF AVWAP) + stop_loss (candle
