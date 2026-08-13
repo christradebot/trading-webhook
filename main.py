@@ -57,9 +57,9 @@ ERROR_ALERT_INTERVAL = 10
 # once they've been open this long, freeing the slot back up.
 ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "600"))  # 10 min default
 
-# Risk / gating config — window start 09:45 ET, close entries at 16:00 ET
-TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:00")
-TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "11:30")
+# Risk / gating config — entry window 09:05-11:35 ET
+TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:05")
+TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "11:35")
 NY_TZ = ZoneInfo("America/New_York")
 
 # Position sizing — qty is computed server-side from available equity rather
@@ -419,22 +419,6 @@ def position_manager_loop():
                             maybe_save_hwm(global_hwm, symbol=symbol, current_price=current)
                         hwm_val = global_hwm.get(symbol, current)
 
-                    # Stop management: three floors combine, whichever is
-                    # highest wins (the stop only ever ratchets up):
-                    # 1) 15% trail: (highest price since entry) x 0.85 --
-                    #    the fallback exit if TP is never reached.
-                    # 2) Breakeven (+2%): stop >= entry, so a full reversal
-                    #    from a modest gain never turns into a real loss.
-                    # 3) Tier-2 lock (+8% -> lock +4%): once the trade has
-                    #    proven real strength, lock in an actual profit
-                    #    cushion instead of leaving the floor pinned at pure
-                    #    breakeven all the way out to where the trail alone
-                    #    would reach entry (~+17.6%) -- that gap is exactly
-                    #    where a normal pullback-then-continuation wipes out
-                    #    the whole gain for nothing.
-                    # Alpaca's own engine fires the STOP the instant price
-                    # crosses it -- the bot's only job is keeping the price
-                    # current.
                     if symbol in open_orders_map:
                         trail_level = hwm_val * (1 - TRAIL_PERCENT / 100)
                         desired_stop = trail_level
@@ -562,12 +546,7 @@ def webhook():
 
     # ============================================================
     # Trading window check now runs FIRST, right after the payload is
-    # parseable — before any level validation. Previously this ran last,
-    # which meant a signal that was both outside the window AND had bad
-    # levels (e.g. an unset take_profit) would get logged only as
-    # "levels out of order", hiding the fact that it was also a stale/
-    # out-of-window signal. Checking window first makes the log tell you
-    # the real first-order reason every time.
+    # parseable — before any level validation.
     # ============================================================
     if not within_trading_window():
         now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
@@ -580,9 +559,6 @@ def webhook():
     # ============================================================
     # Level ordering — split into distinct sub-checks so the log says
     # exactly which value broke it, instead of one generic message.
-    # take_profit == 0.0 is called out by name since that's the most
-    # common real-world cause: the Pine "Take Profit Target Price"
-    # input wasn't set on that ticker's chart before the session.
     # ============================================================
     if not (stop_loss > 0):
         return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})")
@@ -600,8 +576,6 @@ def webhook():
     if not (entry_limit < take_profit):
         return reject("TP_LE_ENTRY", symbol, f"entry_limit ({entry_limit}) must be below take_profit ({take_profit})")
 
-    # Defense-in-depth: reject regardless of what Pine computed if the
-    # implied stop distance is outside a sane ceiling.
     stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
     if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
         return reject(
@@ -636,12 +610,6 @@ def webhook():
         if qty < 1:
             return reject("INSUFFICIENT_BP", symbol, f"buying_power=${buying_power:.2f} insufficient to size a position at entry_limit={entry_limit}")
 
-        # Stale-signal check: verify the live quote hasn't already drifted
-        # meaningfully away from what the confirmed signal computed. This
-        # is the last line of defense against a condition that was true at
-        # bar-close evaluation but no longer reflects the real market —
-        # deliberately checked right before submission, using the freshest
-        # possible price, not earlier in the request.
         try:
             quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
             quote = data_client.get_stock_latest_quote(quote_req)[symbol]
@@ -660,12 +628,6 @@ def webhook():
             )
 
         try:
-            # BRACKET: entry + take_profit (HTF AVWAP) + stop_loss (candle
-            # low, then continuously ratcheted up as a 15% trail). Alpaca
-            # links these as OCO siblings natively -- whichever fires,
-            # the other is auto-cancelled on Alpaca's side. The bot never
-            # manually closes the position for this exit, so the AMIX
-            # stray-order bug class doesn't apply here.
             order = LimitOrderRequest(
                 symbol=symbol,
                 qty=qty,
