@@ -15,8 +15,9 @@ from alpaca.trading.requests import (
     ReplaceOrderRequest,
     GetOrdersRequest,
     LimitOrderRequest,
+    MarketOrderRequest,
+    StopOrderRequest,
     TakeProfitRequest,
-    StopLossRequest,
 )
 from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
@@ -51,11 +52,11 @@ symbol_error_counts = {}
 symbol_alert_cooldown = {}
 ERROR_ALERT_INTERVAL = 10
 
-# An unfilled entry order can otherwise sit indefinitely (up to end of day)
-# holding the single concurrency slot hostage, blocking fresh signals on
-# other tickers that might actually move. Cancel unfilled BUY entry orders
-# once they've been open this long, freeing the slot back up.
-ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "600"))  # 10 min default
+# An unfilled entry order sits as a resting limit at the AVWAP level. Per
+# the "quick continuation off the level" design, if it hasn't filled within
+# 5 minutes the setup is considered dead -- cancel and free the slot for
+# the next signal rather than leaving it hoping for a late fill.
+ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "300"))  # 5 min default
 
 # Risk / gating config — entry window 09:05-11:35 ET
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:05")
@@ -67,23 +68,36 @@ NY_TZ = ZoneInfo("America/New_York")
 # checks below are the risk control, not position size.
 EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
 
-# Defense-in-depth: reject any signal whose implied stop distance exceeds
-# this, regardless of what Pine computed — full-size sizing means this is
-# the only backstop against an outlier candle producing an outsized loss.
+# Defense-in-depth: reject any signal whose implied stop distance (using
+# the signal candle's low Pine sends, even though it's no longer submitted
+# as a resting order -- see below) exceeds this. Purely a pre-entry quality
+# filter now, not protecting a real resting order.
 MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
 
-# Guards against a signal firing on a condition that was true at bar-close
-# evaluation time but no longer reflects reality (late/revised tape prints
-# on thin small caps, TradingView's server-side data snapshot diverging
-# slightly from the live feed). Reject if the current live price has
-# already drifted this far from what the signal computed as entry_limit.
-STALE_SIGNAL_MAX_DRIFT_PCT = float(os.getenv("STALE_SIGNAL_MAX_DRIFT_PCT", "2.0"))
+# Guards against the setup being invalidated before the order can be
+# placed. Entry is a resting limit at a specific AVWAP level (buying the
+# pullback back to the level, not chasing current price), so price being
+# ABOVE entry_limit at submission time is normal and expected. What
+# actually invalidates the setup is price having already breached the
+# signal candle's low (stop_loss, still sent for reference even though
+# it's no longer a resting order) before the order could even be placed.
+STALE_SIGNAL_STOP_BUFFER_PCT = float(os.getenv("STALE_SIGNAL_STOP_BUFFER_PCT", "0.0"))
 
 # Flat trailing-stop percentage. The stop only ever ratchets UP (native STOP
 # order price is replaced, never loosened) toward highest-price-since-entry
 # minus this percent. Take-profit (HTF AVWAP, computed in Pine) is the
 # primary exit target; this is the fallback if that target is never reached.
 TRAIL_PERCENT = float(os.getenv("TRAIL_PERCENT", "15.0"))
+
+# Gain threshold that switches the exit mechanism entirely. Below this, a
+# position has NO resting exchange-side stop at all -- the EMA-close signal
+# from Pine is the only stop, executed as a market sell (see EMA_EXIT
+# handling in the webhook). At/above this, a native trailing STOP order is
+# created for the first time and takes over completely; the EMA-close
+# signal is ignored from that point on. This mirrors "trade with the trend
+# while it's proving itself, protect the gain with a hard price floor once
+# it's real."
+TRAIL_ACTIVATION_GAIN_PCT = float(os.getenv("TRAIL_ACTIVATION_GAIN_PCT", "15.0"))
 
 # Breakeven guarantee: once the position is up this much, immediately move
 # the stop to entry, independent of what the trail calc alone would give.
@@ -419,7 +433,20 @@ def position_manager_loop():
                             maybe_save_hwm(global_hwm, symbol=symbol, current_price=current)
                         hwm_val = global_hwm.get(symbol, current)
 
-                    if symbol in open_orders_map:
+                    # Stop management, in two phases:
+                    # PHASE 1 (gain < TRAIL_ACTIVATION_GAIN_PCT): no native
+                    # stop order exists at all. The EMA-close signal from
+                    # Pine, handled in the webhook's EMA_EXIT branch, is the
+                    # only stop mechanism here -- trading with the trend,
+                    # giving room for normal pullbacks instead of a fixed
+                    # price floor.
+                    # PHASE 2 (gain >= TRAIL_ACTIVATION_GAIN_PCT): a native
+                    # STOP order is created for the first time (if it
+                    # doesn't exist yet) at whichever is highest of the
+                    # trail level or breakeven tiers, then ratcheted up each
+                    # cycle exactly as before. The EMA-close signal is
+                    # ignored by the webhook from this point on.
+                    if current >= entry * (1 + TRAIL_ACTIVATION_GAIN_PCT / 100):
                         trail_level = hwm_val * (1 - TRAIL_PERCENT / 100)
                         desired_stop = trail_level
                         be_tag = None
@@ -434,17 +461,41 @@ def position_manager_loop():
                                 desired_stop = entry
                                 be_tag = "[BE]"
 
-                        for order in open_orders_map[symbol]:
-                            current_stop = float(order.stop_price)
-                            if desired_stop > current_stop:
-                                try:
-                                    retry_replace_order(
-                                        order.id, ReplaceOrderRequest(stop_price=round(desired_stop, 4))
-                                    )
-                                    tag = be_tag or "[TRAIL]"
-                                    logger.info(f"{tag} {symbol} stop -> ${desired_stop:.4f} (HWM ${hwm_val:.4f})")
-                                except Exception as e:
-                                    send_alert(f"[CRIT] Failed to move stop for {symbol}: {e}")
+                        if symbol in open_orders_map:
+                            for order in open_orders_map[symbol]:
+                                current_stop = float(order.stop_price)
+                                if desired_stop > current_stop:
+                                    try:
+                                        retry_replace_order(
+                                            order.id, ReplaceOrderRequest(stop_price=round(desired_stop, 4))
+                                        )
+                                        tag = be_tag or "[TRAIL]"
+                                        logger.info(f"{tag} {symbol} stop -> ${desired_stop:.4f} (HWM ${hwm_val:.4f})")
+                                    except Exception as e:
+                                        send_alert(f"[CRIT] Failed to move stop for {symbol}: {e}")
+                        else:
+                            # First time this position has crossed the gain
+                            # threshold -- no native stop exists yet, create
+                            # one now. From the next loop iteration on it'll
+                            # show up in open_orders_map and just ratchet
+                            # via the branch above like any other position.
+                            try:
+                                stop_order = StopOrderRequest(
+                                    symbol=symbol,
+                                    qty=pos.qty,
+                                    side=OrderSide.SELL,
+                                    time_in_force=TimeInForce.DAY,
+                                    stop_price=round(desired_stop, 4),
+                                )
+                                submitted_stop = trading_client.submit_order(stop_order)
+                                tag = be_tag or "[TRAIL]"
+                                send_alert(
+                                    f"{tag} {symbol} crossed +{TRAIL_ACTIVATION_GAIN_PCT}% gain -- created native "
+                                    f"stop at ${desired_stop:.4f} (HWM ${hwm_val:.4f}) | Order ID: {submitted_stop.id}. "
+                                    f"EMA-close exit signal will now be ignored for this symbol."
+                                )
+                            except Exception as e:
+                                send_alert(f"[CRIT] Failed to create initial trailing stop for {symbol}: {e}")
 
                 except Exception as e:
                     handle_symbol_error(symbol, e)
@@ -536,6 +587,64 @@ def webhook():
         return reject("BAD_SECRET", data.get("symbol", "-"), "invalid webhook secret", http_status=401)
 
     symbol = str(data.get("symbol", "UNKNOWN")).upper()
+    signal_type = data.get("type", "entry")
+
+    # ============================================================
+    # EMA-close exit signal -- handled entirely separately from the
+    # entry flow below, and deliberately BEFORE the trading-window
+    # check, since exiting an open position must be allowed at any
+    # time, not just during the entry window (matches EOD flatten
+    # already working this way).
+    # ============================================================
+    if signal_type == "exit_ema_close":
+        with order_lock:
+            try:
+                positions = trading_client.get_all_positions()
+                pos = next((p for p in positions if p.symbol == symbol), None)
+            except Exception as e:
+                return reject("EMA_EXIT_CHECK_FAILED", symbol, f"could not check open positions: {e}", http_status=500, log_level="error")
+
+            if pos is None:
+                logger.info(f"[EMA_EXIT] {symbol} — signal received but no open position, ignoring.")
+                return "No open position", 200
+
+            entry_price = float(pos.avg_entry_price)
+            current_price = float(pos.current_price)
+            gain_pct = ((current_price / entry_price) - 1) * 100
+
+            if gain_pct >= TRAIL_ACTIVATION_GAIN_PCT:
+                logger.info(
+                    f"[EMA_EXIT] {symbol} — signal received but gain is {gain_pct:.2f}% "
+                    f"(>= {TRAIL_ACTIVATION_GAIN_PCT}%), trailing stop already governs this position, ignoring."
+                )
+                return "Gain past threshold, trailing stop governs", 200
+
+            try:
+                open_orders = trading_client.get_orders(
+                    filter=GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol])
+                )
+                for o in open_orders:
+                    retry_cancel_order(o.id)
+            except Exception as e:
+                send_alert(f"[CRIT] EMA_EXIT: failed cancelling resting orders for {symbol} before flatten: {e}")
+
+            try:
+                sell_order = MarketOrderRequest(
+                    symbol=symbol,
+                    qty=pos.qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                )
+                submitted = trading_client.submit_order(sell_order)
+                send_alert(
+                    f"[EMA_EXIT] {symbol} closed at market — gain was {gain_pct:.2f}%, "
+                    f"close below 9 EMA | Order ID: {submitted.id}"
+                )
+            except Exception as e:
+                send_alert(f"[CRIT] EMA_EXIT: failed to submit market sell for {symbol}: {e}")
+                return "Exit order submission failed", 500
+
+        return "Exit executed", 200
 
     try:
         entry_limit = float(data["entry_limit"])
@@ -546,7 +655,12 @@ def webhook():
 
     # ============================================================
     # Trading window check now runs FIRST, right after the payload is
-    # parseable — before any level validation.
+    # parseable — before any level validation. Previously this ran last,
+    # which meant a signal that was both outside the window AND had bad
+    # levels (e.g. an unset take_profit) would get logged only as
+    # "levels out of order", hiding the fact that it was also a stale/
+    # out-of-window signal. Checking window first makes the log tell you
+    # the real first-order reason every time.
     # ============================================================
     if not within_trading_window():
         now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
@@ -559,6 +673,9 @@ def webhook():
     # ============================================================
     # Level ordering — split into distinct sub-checks so the log says
     # exactly which value broke it, instead of one generic message.
+    # take_profit == 0.0 is called out by name since that's the most
+    # common real-world cause: the Pine "Take Profit Target Price"
+    # input wasn't set on that ticker's chart before the session.
     # ============================================================
     if not (stop_loss > 0):
         return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})")
@@ -576,6 +693,8 @@ def webhook():
     if not (entry_limit < take_profit):
         return reject("TP_LE_ENTRY", symbol, f"entry_limit ({entry_limit}) must be below take_profit ({take_profit})")
 
+    # Defense-in-depth: reject regardless of what Pine computed if the
+    # implied stop distance is outside a sane ceiling.
     stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
     if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
         return reject(
@@ -610,6 +729,11 @@ def webhook():
         if qty < 1:
             return reject("INSUFFICIENT_BP", symbol, f"buying_power=${buying_power:.2f} insufficient to size a position at entry_limit={entry_limit}")
 
+        # Level-integrity check: reject only if live price has already
+        # fallen to/through the stop before the order could be placed --
+        # meaning the setup broke down in the gap between signal and
+        # submission. Price being above entry_limit (the normal case for
+        # a resting pullback-to-level order) is NOT a rejection reason.
         try:
             quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
             quote = data_client.get_stock_latest_quote(quote_req)[symbol]
@@ -619,24 +743,30 @@ def webhook():
         except Exception as e:
             return reject("LIVE_PRICE_CHECK_FAILED", symbol, f"could not verify live price, rejecting for safety: {e}", http_status=500, log_level="error")
 
-        drift_pct = abs(live_price - entry_limit) / entry_limit * 100
-        if drift_pct > STALE_SIGNAL_MAX_DRIFT_PCT:
+        stop_breach_level = stop_loss * (1 + STALE_SIGNAL_STOP_BUFFER_PCT / 100)
+        if live_price <= stop_breach_level:
             return reject(
-                "STALE_SIGNAL", symbol,
-                f"live price ${live_price:.4f} is {drift_pct:.2f}% away from entry_limit ${entry_limit:.4f} "
-                f"(max {STALE_SIGNAL_MAX_DRIFT_PCT}%)",
+                "LEVEL_BROKEN", symbol,
+                f"live price ${live_price:.4f} has already reached/breached stop ${stop_loss:.4f} "
+                f"(entry_limit ${entry_limit:.4f}) — setup invalidated before order could be placed",
             )
 
         try:
+            # OTO: entry + take_profit only. No native stop_loss leg --
+            # per the EMA-close design, there is NO resting exchange-side
+            # stop while gain is under TRAIL_ACTIVATION_GAIN_PCT. The
+            # EMA_EXIT branch above is the only protection until then;
+            # once gain crosses the threshold, the position manager loop
+            # creates a native STOP order for the first time and the
+            # trailing mechanism takes over completely.
             order = LimitOrderRequest(
                 symbol=symbol,
                 qty=qty,
                 side=OrderSide.BUY,
                 time_in_force=TimeInForce.DAY,
                 limit_price=entry_limit,
-                order_class=OrderClass.BRACKET,
+                order_class=OrderClass.OTO,
                 take_profit=TakeProfitRequest(limit_price=take_profit),
-                stop_loss=StopLossRequest(stop_price=stop_loss),
             )
             submitted = trading_client.submit_order(order)
             recent_signals[symbol] = now
@@ -644,7 +774,9 @@ def webhook():
             latency_ms = (time.time() - start_time) * 1000
             send_alert(
                 f"[ENTRY] {symbol} qty={qty} (equity-sized) limit={entry_limit} "
-                f"TP={take_profit} SL={stop_loss} (trailing {TRAIL_PERCENT}%) "
+                f"TP={take_profit} SL(reference only, no resting order)={stop_loss} "
+                f"| stop mechanism: EMA-close exit until +{TRAIL_ACTIVATION_GAIN_PCT}% gain, "
+                f"then {TRAIL_PERCENT}% trail "
                 f"| Order ID: {submitted.id} | Client Order ID: {submitted.client_order_id} | "
                 f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
             )
