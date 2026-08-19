@@ -18,7 +18,7 @@ from alpaca.trading.requests import (
     TakeProfitRequest,
     StopLossRequest,
 )
-from alpaca.trading.enums import OrderSide, TimeInForce, OrderStatus, OrderType, OrderClass, QueryOrderStatus
+from alpaca.trading.enums import OrderSide, TimeInForce, OrderType, OrderClass, QueryOrderStatus
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockLatestQuoteRequest
 from requests.exceptions import Timeout, ConnectionError
@@ -242,18 +242,6 @@ def within_trading_window():
     start = datetime.strptime(TRADING_WINDOW_START, "%H:%M").time()
     end = datetime.strptime(TRADING_WINDOW_END, "%H:%M").time()
     return start <= now_ny <= end
-
-
-def has_open_exposure(symbol):
-    positions = trading_client.get_all_positions()
-    if any(p.symbol == symbol for p in positions):
-        return True
-
-    open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
-    if any(o.symbol == symbol and o.side == OrderSide.BUY for o in open_orders):
-        return True
-
-    return False
 
 
 def has_any_open_exposure():
