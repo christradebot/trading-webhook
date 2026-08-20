@@ -537,6 +537,250 @@ def position_manager_loop():
                                         order.id, ReplaceOrderRequest(stop_price=rounded_stop)
                                     )
                                     tag = be_tag or "[TRAIL]"
+                                    logger.info(f"{tag} {symbol} stop -> ${rounded_stop:.4f} (HWM ${hwm_val:.4f})")
+                                except Exception as e:
+                                    send_alert(f"[CRIT] Failed to move stop for {symbol}: {e}")
+
+                except Exception as e:
+                    handle_symbol_error(symbol, e)
+
+        except Exception as e:
+            if any(code in str(e) for code in ["401", "403"]):
+                emergency_flatten()
+                break
+            logger.warning(f"Transient error in position manager: {e}. Retrying...")
+
+        time.sleep(2)
+
+
+def position_manager():
+    while True:
+        try:
+            position_manager_loop()
+        except Exception as e:
+            logger.exception(f"Position manager crashed: {e}")
+            manager_status["is_alive"] = False
+            time.sleep(5)
+
+
+threading.Thread(target=position_manager, daemon=True).start()
+
+
+def handle_shutdown(signum, frame):
+    logger.info("Shutdown signal received. Saving in-memory HWM...")
+    with hwm_lock:
+        save_hwm(global_hwm)
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, handle_shutdown)
+signal.signal(signal.SIGTERM, handle_shutdown)
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    """Health check endpoint monitoring thread liveness, metrics, and uptime."""
+    alive = manager_status["is_alive"]
+    heartbeat_age = time.time() - manager_status["last_heartbeat"]
+    is_healthy = alive and heartbeat_age < 30
+
+    try:
+        positions = trading_client.get_all_positions()
+        positions_count = len(positions)
+    except Exception:
+        positions_count = 0
+
+    uptime_hours = (time.time() - bot_start_time) / 3600.0
+
+    payload = {
+        "alive": alive,
+        "heartbeat_age": round(heartbeat_age, 2),
+        "positions": positions_count,
+        "uptime_hours": round(uptime_hours, 2)
+    }
+
+    if not is_healthy:
+        return payload, 500
+    return payload, 200
+
+
+@app.route("/reject-summary", methods=["GET"])
+def reject_summary():
+    """On-demand snapshot of today's reject tally so far, without waiting
+    for the EOD flatten to see it. Doesn't reset the counter."""
+    with reject_tally_lock:
+        return dict(reject_reason_counts), 200
+
+
+@app.route("/", methods=["POST"])
+def webhook():
+    start_time = time.time()
+
+    if not manager_status["is_alive"] or (time.time() - manager_status["last_heartbeat"] > 60):
+        send_alert("[CRIT] Manager thread offline — signal rejected.")
+        return "System Offline", 503
+
+    data = request.get_json(force=True, silent=True)
+    if not data:
+        # No symbol available yet at this point (body itself is missing/invalid) —
+        # most of these are TradingView's periodic webhook connectivity test
+        # pings, not real signals. Tallied separately so they don't get
+        # confused with genuine rejected trade signals in the summary.
+        return reject("NO_JSON", "-", "no/invalid JSON body received", http_status=400)
+
+    if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
+        return reject("BAD_SECRET", data.get("symbol", "-"), "invalid webhook secret", http_status=401)
+
+    symbol = str(data.get("symbol", "UNKNOWN")).upper()
+
+    try:
+        entry_limit = float(data["entry_limit"])
+        stop_loss = float(data["stop_loss"])
+        take_profit = float(data["take_profit"])
+    except (KeyError, ValueError, TypeError) as e:
+        return reject("MALFORMED", symbol, f"malformed payload — {e}", http_status=400)
+
+    # ============================================================
+    # Trading window check now runs FIRST, right after the payload is
+    # parseable — before any level validation. Previously this ran last,
+    # which meant a signal that was both outside the window AND had bad
+    # levels (e.g. an unset take_profit) would get logged only as
+    # "levels out of order", hiding the fact that it was also a stale/
+    # out-of-window signal. Checking window first makes the log tell you
+    # the real first-order reason every time.
+    # ============================================================
+    if not within_trading_window():
+        now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
+        return reject(
+            "WINDOW", symbol,
+            f"arrived at {now_ny_str} ET, outside window {TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET "
+            f"(entry_limit={entry_limit}, stop_loss={stop_loss}, take_profit={take_profit})",
+        )
+
+    # ============================================================
+    # Level ordering — split into distinct sub-checks so the log says
+    # exactly which value broke it, instead of one generic message.
+    # take_profit == 0.0 is called out by name since that's the most
+    # common real-world cause: the Pine "Take Profit Target Price"
+    # input wasn't set on that ticker's chart before the session.
+    # ============================================================
+    if not (stop_loss > 0):
+        return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})")
+
+    if not (stop_loss < entry_limit):
+        return reject("SL_GE_ENTRY", symbol, f"stop_loss ({stop_loss}) must be below entry_limit ({entry_limit})")
+
+    if take_profit == 0.0:
+        return reject(
+            "TP_NOT_SET", symbol,
+            f"take_profit is 0.0 — the 'Take Profit Target Price' input likely wasn't set on this "
+            f"ticker's chart before the session (entry_limit={entry_limit}, stop_loss={stop_loss})",
+        )
+
+    if not (entry_limit < take_profit):
+        return reject("TP_LE_ENTRY", symbol, f"entry_limit ({entry_limit}) must be below take_profit ({take_profit})")
+
+    # Defense-in-depth: reject regardless of what Pine computed if the
+    # implied stop distance is outside a sane ceiling.
+    stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
+    if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
+        return reject(
+            "STOP_TOO_WIDE", symbol,
+            f"stop distance {stop_distance_pct:.2f}% exceeds MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}%",
+        )
+
+    with order_lock:
+        now = time.time()
+
+        global recent_signals
+        recent_signals = {
+            s: t for s, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS
+        }
+
+        if recent_signals.get(symbol) is not None:
+            return reject("DUPLICATE", symbol, f"duplicate signal received again within {SIGNAL_DEDUPE_WINDOW_SECONDS}s")
+
+        try:
+            if has_any_open_exposure():
+                return reject("CONCURRENCY_CAP", symbol, "max concurrent positions reached (cap: 1)")
+        except Exception as e:
+            return reject("CONCURRENCY_CHECK_FAILED", symbol, f"could not verify concurrency cap, rejecting for safety: {e}", http_status=500, log_level="error")
+
+        try:
+            account = trading_client.get_account()
+            buying_power = float(account.buying_power)
+        except Exception as e:
+            return reject("BUYING_POWER_CHECK_FAILED", symbol, f"could not check buying power, rejecting for safety: {e}", http_status=500, log_level="error")
+
+        qty = int((buying_power * EQUITY_FRACTION) // entry_limit)
+        if qty < 1:
+            return reject("INSUFFICIENT_BP", symbol, f"buying_power=${buying_power:.2f} insufficient to size a position at entry_limit={entry_limit}")
+
+        # Live-quote check, now INFORMATIONAL ONLY -- logged for visibility,
+        # never blocks submission. Entry/stop/take-profit all come from
+        # TradingView's real-time feed already; Alpaca's own quote here is
+        # on the free IEX-only (or 15-min-delayed SIP) plan and has proven
+        # unreliable on thin small caps (confirmed live with TNON and RDAC
+        # -- 45-60% drift that didn't reflect the real market). Submitting
+        # a limit order to Alpaca doesn't require accurate quote data on
+        # our side at all -- the order routes and fills against the real
+        # market regardless of which data plan the account has. A total
+        # fetch FAILURE (network/API broken) still blocks, since that's a
+        # genuine infrastructure problem, not a stale-price problem.
+        try:
+            quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
+            quote = data_client.get_stock_latest_quote(quote_req)[symbol]
+            live_price = float(quote.ask_price) if quote.ask_price else float(quote.bid_price)
+            if not live_price or live_price <= 0:
+                raise ValueError(f"no usable live price (ask={quote.ask_price}, bid={quote.bid_price})")
+
+            price_drift_pct = abs(live_price - entry_limit) / entry_limit * 100
+            if price_drift_pct > MAX_PLAUSIBLE_PRICE_DRIFT_PCT:
+                logger.info(
+                    f"[PRICE_DATA_INFO] {symbol} — Alpaca quote ${live_price:.4f} is {price_drift_pct:.1f}% "
+                    f"away from entry_limit ${entry_limit:.4f} (likely Alpaca's own stale/thin data, "
+                    f"not a real move) — informational only, proceeding with order."
+                )
+        except Exception as e:
+            return reject("LIVE_PRICE_CHECK_FAILED", symbol, f"could not fetch any live quote from Alpaca (infrastructure issue, not a price-drift issue), rejecting for safety: {e}", http_status=500, log_level="error")
+
+        try:
+            # BRACKET: entry + take_profit + stop_loss (signal candle's
+            # low from Pine). Alpaca links take_profit and stop_loss as
+            # OCO siblings natively -- whichever fires, the other is
+            # auto-cancelled on Alpaca's side. The stop leg is active from
+            # the moment of fill; the position manager loop below only
+            # ever replaces its price (trailing/breakeven ratchet), never
+            # creates it fresh at a gain threshold.
+            order = LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                limit_price=entry_limit,
+                order_class=OrderClass.BRACKET,
+                take_profit=TakeProfitRequest(limit_price=take_profit),
+                stop_loss=StopLossRequest(stop_price=stop_loss),
+            )
+            submitted = trading_client.submit_order(order)
+            recent_signals[symbol] = now
+
+            latency_ms = (time.time() - start_time) * 1000
+            send_alert(
+                f"[ENTRY] {symbol} qty={qty} (equity-sized) limit={entry_limit} "
+                f"TP={take_profit} SL={stop_loss} (trailing {TRAIL_PERCENT}%) "
+                f"| Order ID: {submitted.id} | Client Order ID: {submitted.client_order_id} | "
+                f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
+            )
+            logger.info(f"Order submitted: {submitted.id} (Client ID: {submitted.client_order_id}) for {symbol} with status {submitted.status}")
+        except Exception as e:
+            send_alert(f"[CRIT] Failed to submit entry order for {symbol}: {e}")
+            return "Order submission failed", 500
+
+    return "Success", 200
+
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
 
 
 
