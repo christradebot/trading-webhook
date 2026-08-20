@@ -5,7 +5,7 @@ import signal
 import sys
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 
@@ -76,11 +76,22 @@ MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
 
 # Guards against a signal firing on a condition that was true when the
 # signal bar closed but no longer reflects reality by the time the order
-# is about to submit (late/revised tape prints on thin small caps). Reject
-# if live price has already reached or breached stop_loss -- the setup
-# broke down in the gap between signal and submission, before the order
-# could even be placed.
-STALE_SIGNAL_STOP_BUFFER_PCT = float(os.getenv("STALE_SIGNAL_STOP_BUFFER_PCT", "0.0"))
+# is about to submit (late/revised tape prints on thin small caps).
+# Historically this rejected trades whose live price had already crossed
+# stop_loss, but that check is now informational-only (see the webhook's
+# live-quote block below) -- kept as a comment/marker for context, no
+# active config needed for it anymore.
+
+# Used purely for informational logging now (see webhook). Alpaca's own
+# quote on the free IEX-only plan proved unreliable on thin small caps
+# (confirmed live with TNON: entry $11.51, quote came back $4.55; and
+# RDAC: entry $14.33, quote came back $7.84 -- both far outside anything
+# a real tick-to-tick move could produce). Entry/stop/take-profit all come
+# from TradingView's real-time feed already, and submitting a limit order
+# to Alpaca doesn't require accurate quote data on our side -- the order
+# routes and fills against the real market regardless of data plan. So a
+# large drift here is logged as likely-bad-Alpaca-data, never blocks.
+MAX_PLAUSIBLE_PRICE_DRIFT_PCT = float(os.getenv("MAX_PLAUSIBLE_PRICE_DRIFT_PCT", "40.0"))
 
 # Flat trailing-stop percentage. The stop only ever ratchets UP (native STOP
 # order price is replaced, never loosened) toward highest-price-since-entry
@@ -347,8 +358,20 @@ def position_manager_loop():
             for symbol in set(open_positions_tracked.keys()) - current_symbols:
                 info = open_positions_tracked.pop(symbol)
                 try:
+                    # 'after' is the hard fix: only orders submitted after
+                    # THIS position was first observed open can possibly be
+                    # its exit. A small safety buffer (5 min back) covers
+                    # clock/detection lag without reopening the door to an
+                    # older session's orders, which are realistically hours
+                    # or days apart, not minutes.
+                    lookback_start = info["opened_at"] - timedelta(minutes=5)
                     recent_orders = trading_client.get_orders(
-                        filter=GetOrdersRequest(status=QueryOrderStatus.CLOSED, symbols=[symbol], limit=10)
+                        filter=GetOrdersRequest(
+                            status=QueryOrderStatus.CLOSED,
+                            symbols=[symbol],
+                            limit=10,
+                            after=lookback_start,
+                        )
                     )
                     exit_order = next(
                         (o for o in recent_orders if o.side == OrderSide.SELL and o.filled_avg_price),
@@ -378,12 +401,22 @@ def position_manager_loop():
                         del global_hwm[symbol]
                         maybe_save_hwm(global_hwm, force=True)
 
-            # Track newly-opened positions with their true entry fill price.
+            # Track newly-opened positions with their true entry fill price
+            # AND the moment we first observed them open. That timestamp is
+            # what lets close-detection below only ever consider orders
+            # from THIS specific trade -- without it, a stale closed order
+            # from an earlier session on the same symbol can get mistaken
+            # for this trade's real exit (confirmed live: EHGO logged a
+            # bogus "$3.19 exit, qty 302, +39.3% WIN" that matched no real
+            # order in Alpaca's own history -- the real exit was $2.24,
+            # qty 356, a small loss -- because the lookup had no time
+            # bound and grabbed an unrelated older filled order).
             for p in positions:
                 if p.symbol not in open_positions_tracked:
                     open_positions_tracked[p.symbol] = {
                         "qty": float(p.qty),
                         "entry_price": float(p.avg_entry_price),
+                        "opened_at": datetime.now(timezone.utc),
                     }
 
             all_open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
@@ -469,12 +502,24 @@ def position_manager_loop():
                         for order in open_orders_map[symbol]:
                             current_stop = float(order.stop_price)
                             if desired_stop > current_stop:
+                                # Alpaca requires whole-cent stop prices for
+                                # anything trading >= $1 -- sub-penny is
+                                # only valid under $1. This unconditional
+                                # 4-decimal round silently broke the
+                                # trailing stop on RDAC (~$18): every
+                                # replace call was rejected with "sub-penny
+                                # increment does not fulfill minimum
+                                # pricing criteria", so the stop stayed
+                                # frozen at its original price instead of
+                                # ratcheting up while the position ran.
+                                tick = 0.01 if desired_stop >= 1.0 else 0.0001
+                                rounded_stop = round(round(desired_stop / tick) * tick, 4)
                                 try:
                                     retry_replace_order(
-                                        order.id, ReplaceOrderRequest(stop_price=round(desired_stop, 4))
+                                        order.id, ReplaceOrderRequest(stop_price=rounded_stop)
                                     )
                                     tag = be_tag or "[TRAIL]"
-                                    logger.info(f"{tag} {symbol} stop -> ${desired_stop:.4f} (HWM ${hwm_val:.4f})")
+                                    logger.info(f"{tag} {symbol} stop -> ${rounded_stop:.4f} (HWM ${hwm_val:.4f})")
                                 except Exception as e:
                                     send_alert(f"[CRIT] Failed to move stop for {symbol}: {e}")
 
@@ -652,27 +697,33 @@ def webhook():
         if qty < 1:
             return reject("INSUFFICIENT_BP", symbol, f"buying_power=${buying_power:.2f} insufficient to size a position at entry_limit={entry_limit}")
 
-        # Level-integrity check: reject only if live price has already
-        # fallen to/through the stop before the order could be placed --
-        # meaning the setup broke down in the gap between signal and
-        # submission. Price being above entry_limit (the normal case for
-        # a resting pullback-to-level order) is NOT a rejection reason.
+        # Live-quote check, now INFORMATIONAL ONLY -- logged for visibility,
+        # never blocks submission. Entry/stop/take-profit all come from
+        # TradingView's real-time feed already; Alpaca's own quote here is
+        # on the free IEX-only (or 15-min-delayed SIP) plan and has proven
+        # unreliable on thin small caps (confirmed live with TNON and RDAC
+        # -- 45-60% drift that didn't reflect the real market). Submitting
+        # a limit order to Alpaca doesn't require accurate quote data on
+        # our side at all -- the order routes and fills against the real
+        # market regardless of which data plan the account has. A total
+        # fetch FAILURE (network/API broken) still blocks, since that's a
+        # genuine infrastructure problem, not a stale-price problem.
         try:
             quote_req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
             quote = data_client.get_stock_latest_quote(quote_req)[symbol]
             live_price = float(quote.ask_price) if quote.ask_price else float(quote.bid_price)
             if not live_price or live_price <= 0:
                 raise ValueError(f"no usable live price (ask={quote.ask_price}, bid={quote.bid_price})")
-        except Exception as e:
-            return reject("LIVE_PRICE_CHECK_FAILED", symbol, f"could not verify live price, rejecting for safety: {e}", http_status=500, log_level="error")
 
-        stop_breach_level = stop_loss * (1 + STALE_SIGNAL_STOP_BUFFER_PCT / 100)
-        if live_price <= stop_breach_level:
-            return reject(
-                "LEVEL_BROKEN", symbol,
-                f"live price ${live_price:.4f} has already reached/breached stop ${stop_loss:.4f} "
-                f"(entry_limit ${entry_limit:.4f}) — setup invalidated before order could be placed",
-            )
+            price_drift_pct = abs(live_price - entry_limit) / entry_limit * 100
+            if price_drift_pct > MAX_PLAUSIBLE_PRICE_DRIFT_PCT:
+                logger.info(
+                    f"[PRICE_DATA_INFO] {symbol} — Alpaca quote ${live_price:.4f} is {price_drift_pct:.1f}% "
+                    f"away from entry_limit ${entry_limit:.4f} (likely Alpaca's own stale/thin data, "
+                    f"not a real move) — informational only, proceeding with order."
+                )
+        except Exception as e:
+            return reject("LIVE_PRICE_CHECK_FAILED", symbol, f"could not fetch any live quote from Alpaca (infrastructure issue, not a price-drift issue), rejecting for safety: {e}", http_status=500, log_level="error")
 
         try:
             # BRACKET: entry + take_profit + stop_loss (signal candle's
