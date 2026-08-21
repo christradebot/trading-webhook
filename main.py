@@ -383,18 +383,33 @@ def position_manager_loop():
                     # older session's orders, which are realistically hours
                     # or days apart, not minutes.
                     lookback_start = info["opened_at"] - timedelta(minutes=5)
-                    recent_orders = trading_client.get_orders(
-                        filter=GetOrdersRequest(
-                            status=QueryOrderStatus.CLOSED,
-                            symbols=[symbol],
-                            limit=10,
-                            after=lookback_start,
+
+                    # Retry the lookup a couple of times with a short delay.
+                    # Alpaca's closed-orders endpoint can lag slightly
+                    # behind a fill that just happened -- checking once and
+                    # giving up immediately can miss an exit that exists but
+                    # hasn't propagated yet (confirmed live: BTCT's 594-share
+                    # stop fill was real and had the right qty, but the
+                    # first-and-only lookup came back empty, logging "exit
+                    # fill details unavailable" instead of the real price).
+                    exit_order = None
+                    for attempt in range(3):
+                        recent_orders = trading_client.get_orders(
+                            filter=GetOrdersRequest(
+                                status=QueryOrderStatus.CLOSED,
+                                symbols=[symbol],
+                                limit=10,
+                                after=lookback_start,
+                            )
                         )
-                    )
-                    exit_order = next(
-                        (o for o in recent_orders if o.side == OrderSide.SELL and o.filled_avg_price),
-                        None,
-                    )
+                        exit_order = next(
+                            (o for o in recent_orders if o.side == OrderSide.SELL and o.filled_avg_price),
+                            None,
+                        )
+                        if exit_order or attempt == 2:
+                            break
+                        time.sleep(1.5)
+
                     if exit_order:
                         exit_price = float(exit_order.filled_avg_price)
                         qty = float(exit_order.filled_qty or info["qty"])
@@ -408,7 +423,7 @@ def position_manager_loop():
                             f"P/L: ${pl:.2f} ({pl_pct:+.2f}%) | exit: {exit_order.type}"
                         )
                     else:
-                        logger.info(f"[?] {symbol} closed | qty {info['qty']:.0f} | (exit fill details unavailable)")
+                        logger.info(f"[?] {symbol} closed | qty {info['qty']:.0f} | (exit fill details unavailable after 3 attempts)")
                 except Exception as e:
                     logger.warning(f"Could not log close summary for {symbol}: {e}")
 
@@ -420,15 +435,23 @@ def position_manager_loop():
                         maybe_save_hwm(global_hwm, force=True)
 
             # Track newly-opened positions with their true entry fill price
-            # AND the moment we first observed them open. That timestamp is
+            # AND the moment we first observed them open. The timestamp is
             # what lets close-detection below only ever consider orders
             # from THIS specific trade -- without it, a stale closed order
             # from an earlier session on the same symbol can get mistaken
             # for this trade's real exit (confirmed live: EHGO logged a
             # bogus "$3.19 exit, qty 302, +39.3% WIN" that matched no real
-            # order in Alpaca's own history -- the real exit was $2.24,
-            # qty 356, a small loss -- because the lookup had no time
-            # bound and grabbed an unrelated older filled order).
+            # order in Alpaca's own history).
+            #
+            # qty and entry_price are refreshed EVERY cycle for symbols
+            # already being tracked, not just set once on first sight. On a
+            # thin/illiquid symbol, a large order can fill via several
+            # partial fills over a few seconds -- polling once and never
+            # updating can lock in an early partial quantity as "the"
+            # position size. Confirmed live: MMA's 1210-share position got
+            # tracked as qty 376 (an early partial-fill snapshot), so when
+            # it closed, the fallback branch reported "[?] MMA closed | qty
+            # 376" instead of the real 1210-share, +$414.63 TP win.
             for p in positions:
                 if p.symbol not in open_positions_tracked:
                     open_positions_tracked[p.symbol] = {
@@ -436,6 +459,9 @@ def position_manager_loop():
                         "entry_price": float(p.avg_entry_price),
                         "opened_at": datetime.now(timezone.utc),
                     }
+                else:
+                    open_positions_tracked[p.symbol]["qty"] = float(p.qty)
+                    open_positions_tracked[p.symbol]["entry_price"] = float(p.avg_entry_price)
 
             all_open_orders = trading_client.get_orders(filter=GetOrdersRequest(status=QueryOrderStatus.OPEN))
 
