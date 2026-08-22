@@ -169,11 +169,16 @@ hwm_lock = threading.RLock()
 recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 15
 
-# Which Pine signal produced each pending/open entry ("YELLOW" | "BLUE").
+# Which Pine strategy/signal produced each pending/open entry. The current
+# Pine ("Range Filter + EMA Gate") has a single entry path, so this defaults
+# to RF_EMA and is mostly a build-identity marker in the P&L log. It becomes a
+# real measurement again the moment a second entry path is added -- at which
+# point Pine should send a distinct "signal" value per path.
+DEFAULT_STRATEGY_TAG = os.getenv("DEFAULT_STRATEGY_TAG", "RF_EMA")
+
 # Written by the webhook thread on submission, read by the manager thread when
 # a position is first observed, so every [WIN]/[LOSS] line can be attributed to
-# the setup that generated it. Without this the two signals are statistically
-# indistinguishable and no tuning decision can be made about either.
+# the setup that generated it.
 pending_signal_types = {}
 
 # HWM persistent storage state
@@ -696,6 +701,37 @@ signal.signal(signal.SIGINT, handle_shutdown)
 signal.signal(signal.SIGTERM, handle_shutdown)
 
 
+def log_startup_config():
+    """Dumps every live risk/gating parameter at boot. Without this you cannot
+    tell from a log which settings produced a session's behaviour -- env vars
+    on Railway can drift from the defaults in this file, and a strategy tuned
+    against one set of numbers is meaningless if a different set was running.
+
+    Also flags the known misalignment between Pine and the backend: the current
+    Pine script caps stop distance at 8% of entry, but MAX_STOP_DISTANCE_PCT
+    and TRAIL_PERCENT still default to 15. That is deliberate for now -- these
+    are strategy decisions and were left alone so this deploy is a pure bug-fix
+    deploy. Override via env var when you tune them.
+    """
+    logger.info(
+        f"[CONFIG] window={TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET | "
+        f"equity_fraction={EQUITY_FRACTION} | max_stop_dist={MAX_STOP_DISTANCE_PCT}% | "
+        f"trail={TRAIL_PERCENT}% | be_tier1={BREAKEVEN_TRIGGER_PCT}% | "
+        f"be_tier2={BREAKEVEN_TIER2_TRIGGER_PCT}%->lock {BREAKEVEN_TIER2_LOCK_PCT}% | "
+        f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | max_tick_jump={MAX_TICK_JUMP_PCT}% | "
+        f"strategy_tag={DEFAULT_STRATEGY_TAG}"
+    )
+    if TRAIL_PERCENT >= 12.0:
+        logger.info(
+            f"[CONFIG] NOTE: trail is {TRAIL_PERCENT}% while Pine caps initial stops at ~8%. "
+            f"The trail will not bind until roughly +{(1 / (1 - TRAIL_PERCENT / 100) - 1) * 100:.1f}%, "
+            f"so the breakeven tiers do all the work below that. Revisit during tuning."
+        )
+
+
+log_startup_config()
+
+
 @app.route("/health", methods=["GET"])
 def health():
     """Health check endpoint monitoring thread liveness, metrics, and uptime."""
@@ -749,9 +785,10 @@ def webhook():
 
     symbol = str(data.get("symbol", "UNKNOWN")).upper()
 
-    # Which Pine signal fired. Optional so an older Pine version still works,
-    # but without it the two setups can't be told apart in the P&L log.
-    signal_type = str(data.get("signal", "UNKNOWN")).upper()
+    # Which Pine signal fired. Optional -- the current single-path script
+    # doesn't need to send it, but if a future version has multiple entry
+    # paths it should, so each one can be attributed separately in the P&L log.
+    signal_type = str(data.get("signal", DEFAULT_STRATEGY_TAG)).upper()
 
     try:
         entry_limit = float(data["entry_limit"])
