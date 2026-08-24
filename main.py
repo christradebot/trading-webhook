@@ -217,22 +217,67 @@ def round_tick(price):
     return round(round(price / tick) * tick, 4)
 
 
-# nested=False is pinned on every order query. If it ever resolves to True,
-# Alpaca rolls bracket child orders up under their parent and they vanish
-# from the top-level list -- which is the leading suspect for the stop legs
-# being invisible to the manager on 20 Aug.
-def get_open_orders(symbol=None):
-    f = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=False)
+def get_open_orders(symbol=None, nested=True):
+    """Open orders, nested by default.
+
+    CONFIRMED LIVE 24 Aug: with nested=False the query returned ONLY the
+    take-profit LIMIT leg -- the stop leg was absent, yet demonstrably alive
+    (both trades that day exited with `exit: stop`). Alpaca returns the
+    bracket's OCO siblings as LEGS of one another rather than as separate
+    top-level orders, so a flat query silently loses one of them.
+
+    That is the whole reason the trailing stop has never once ratcheted in
+    production. It was never a logic bug -- the manager simply could not
+    see the order it was trying to move."""
     if symbol:
-        f = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], nested=False)
+        f = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], nested=nested)
+    else:
+        f = GetOrdersRequest(status=QueryOrderStatus.OPEN, nested=nested)
     return trading_client.get_orders(filter=f)
+
+
+def flatten_orders(orders):
+    """Walks an order list and yields every order AND every nested leg.
+
+    Alpaca nests recursively (a bracket parent holds legs, and after the
+    entry fills those legs hold each other), so this recurses rather than
+    checking one level."""
+    seen = set()
+    out = []
+
+    def walk(o):
+        oid = getattr(o, "id", None)
+        if oid is not None and oid in seen:
+            return
+        if oid is not None:
+            seen.add(oid)
+        out.append(o)
+        for leg in (getattr(o, "legs", None) or []):
+            walk(leg)
+
+    for o in orders:
+        walk(o)
+    return out
+
+
+def get_stop_orders(symbol):
+    """Every live STOP order for a symbol, including ones nested as legs.
+
+    An order only counts if it has a stop_price -- a leg placeholder without
+    one is not something we can ratchet."""
+    stops = []
+    for o in flatten_orders(get_open_orders(symbol)):
+        if o.type == OrderType.STOP and getattr(o, "stop_price", None) is not None:
+            if str(getattr(o, "status", "")).lower().split(".")[-1] not in ("filled", "canceled", "cancelled", "expired", "rejected"):
+                stops.append(o)
+    return stops
 
 
 def has_any_open_exposure():
     """Hard cap of 1 concurrent position/pending entry across ALL symbols."""
     if len(trading_client.get_all_positions()) > 0:
         return True
-    return any(o.side == OrderSide.BUY for o in get_open_orders())
+    return any(o.side == OrderSide.BUY for o in flatten_orders(get_open_orders()))
 
 
 def get_position(symbol):
@@ -273,7 +318,7 @@ def cancel_resting_legs(symbol):
     close."""
     cancelled = 0
     try:
-        for o in get_open_orders(symbol):
+        for o in flatten_orders(get_open_orders(symbol)):
             try:
                 retry_cancel_order(o.id)
                 cancelled += 1
@@ -424,7 +469,7 @@ def position_manager_loop():
                     open_positions_tracked[p.symbol]["qty"] = float(p.qty)
                     open_positions_tracked[p.symbol]["entry_price"] = float(p.avg_entry_price)
 
-            all_open_orders = get_open_orders()
+            all_open_orders = flatten_orders(get_open_orders())
 
             # DIAGNOSTIC: while a position is open, dump what the manager can
             # actually see. On 20 Aug the stop legs were invisible to this
@@ -432,7 +477,7 @@ def position_manager_loop():
             if positions and (now - last_orders_debug) >= ORDERS_DEBUG_INTERVAL_SECONDS:
                 stop_orders = [o for o in all_open_orders if o.type == OrderType.STOP]
                 logger.info(
-                    f"[ORDERS] visible={[(o.symbol, str(o.type), str(o.status), str(o.stop_price)) for o in all_open_orders]} "
+                    f"[ORDERS] visible={[(o.symbol, str(o.type).split('.')[-1], str(o.status).split('.')[-1], str(o.stop_price)) for o in all_open_orders]} "
                     f"| stop_legs={[(o.symbol, str(o.stop_price)) for o in stop_orders]} "
                     f"| positions={[p.symbol for p in positions]}"
                 )
@@ -661,7 +706,7 @@ def handle_stop_update(data, symbol):
                       log_level="debug")
 
     try:
-        stop_orders = [o for o in get_open_orders(symbol) if o.type == OrderType.STOP]
+        stop_orders = get_stop_orders(symbol)
     except Exception as e:
         return reject("ORDER_LOOKUP_FAILED", symbol, f"could not list stop orders: {e}",
                       http_status=500, log_level="error")
@@ -715,7 +760,7 @@ def handle_exit(data, symbol):
         # No position, but a pending entry may still be resting. Pine has
         # decided the setup is dead, so that entry should not fill either.
         try:
-            pending = [o for o in get_open_orders(symbol) if o.side == OrderSide.BUY]
+            pending = [o for o in flatten_orders(get_open_orders(symbol)) if o.side == OrderSide.BUY]
         except Exception:
             pending = []
         if pending:
