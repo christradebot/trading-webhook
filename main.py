@@ -145,6 +145,38 @@ reject_reason_counts = {}
 force_close_lock = threading.Lock()
 force_close_symbols = set()
 
+# symbol -> order id of the bracket's STOP leg, captured from the submit
+# response at entry time.
+#
+# WHY THIS EXISTS: the open-orders LIST endpoint does not reliably return
+# both OCO siblings once the parent entry has filled. Confirmed live across
+# four trades -- while the entry was unfilled both legs showed as HELD and
+# nested, then the moment the entry left the open list only the take-profit
+# LIMIT came back and the STOP disappeared. The stop was never gone: DAIC's
+# and PMI's later FILLED, and PRZO's was auto-cancelled by Alpaca when we
+# closed the position. It was purely invisible to the query, which is why
+# every stop_update came back NO_STOP_ORDER and the trail never once ran.
+#
+# Looking the leg up by its own id sidesteps the list endpoint entirely.
+stop_leg_lock = threading.Lock()
+stop_leg_ids = {}
+
+
+def remember_stop_leg(symbol, order):
+    """Pulls the STOP leg's id out of a submit/replace response."""
+    for leg in (getattr(order, "legs", None) or []):
+        if leg.type == OrderType.STOP:
+            with stop_leg_lock:
+                stop_leg_ids[symbol] = leg.id
+            logger.info(f"[LEG] {symbol} stop leg id captured: {leg.id}")
+            return leg.id
+    return None
+
+
+def forget_stop_leg(symbol):
+    with stop_leg_lock:
+        stop_leg_ids.pop(symbol, None)
+
 
 def reject(tag, symbol, message, http_status=200, log_level="info"):
     """Central reject helper. Every rejection MUST go through this so the
@@ -268,16 +300,42 @@ def flatten_orders(orders):
     return out
 
 
-def get_stop_orders(symbol):
-    """Every live STOP order for a symbol, including ones nested as legs.
+DEAD_STATUSES = ("filled", "canceled", "cancelled", "expired", "rejected", "done_for_day", "replaced")
 
-    An order only counts if it has a stop_price -- a leg placeholder without
-    one is not something we can ratchet."""
+
+def _is_live(order):
+    return str(getattr(order, "status", "")).lower().split(".")[-1] not in DEAD_STATUSES
+
+
+def get_stop_orders(symbol):
+    """The live STOP order(s) for a symbol.
+
+    Tries the remembered leg id FIRST, because the list endpoint drops the
+    stop sibling once the entry fills. Falls back to scanning the list only
+    if there is no remembered id or the direct lookup comes back dead."""
+    with stop_leg_lock:
+        leg_id = stop_leg_ids.get(symbol)
+
+    if leg_id:
+        try:
+            o = trading_client.get_order_by_id(leg_id)
+            if o is not None and _is_live(o) and getattr(o, "stop_price", None) is not None:
+                return [o]
+            logger.info(
+                f"[LEG] {symbol} remembered stop leg {leg_id} is no longer live "
+                f"(status={getattr(o, 'status', '?')}); falling back to list scan"
+            )
+            forget_stop_leg(symbol)
+        except Exception as e:
+            logger.warning(f"[LEG] {symbol} direct lookup of {leg_id} failed: {e}; falling back to list scan")
+
     stops = []
     for o in flatten_orders(get_open_orders(symbol)):
-        if o.type == OrderType.STOP and getattr(o, "stop_price", None) is not None:
-            if str(getattr(o, "status", "")).lower().split(".")[-1] not in ("filled", "canceled", "cancelled", "expired", "rejected"):
-                stops.append(o)
+        if o.type == OrderType.STOP and getattr(o, "stop_price", None) is not None and _is_live(o):
+            stops.append(o)
+    if stops:
+        with stop_leg_lock:
+            stop_leg_ids[symbol] = stops[0].id
     return stops
 
 
@@ -417,6 +475,7 @@ def position_manager_loop():
 
     open_positions_tracked = {}
     cancel_requested_order_ids = set()
+    naked_streak = {}
 
     while True:
         try:
@@ -543,6 +602,7 @@ def position_manager_loop():
                 symbol_error_counts[symbol] = 0
                 symbol_alert_cooldown.pop(symbol, None)
                 pending_signal_types.pop(symbol, None)
+                forget_stop_leg(symbol)
 
             # qty and entry_price are refreshed EVERY cycle, not just on first
             # sight. A large order on a thin symbol fills via several partials
@@ -565,12 +625,34 @@ def position_manager_loop():
             # DIAGNOSTIC: while a position is open, dump what the manager can
             # actually see. On 20 Aug the stop legs were invisible to this
             # loop across six trades and nothing said so.
+            # Naked-position watchdog. A position with no live stop is the
+            # one state that must never pass silently. Two consecutive misses
+            # rather than one, so a momentary lookup blip is not alarming.
+            for p in positions:
+                try:
+                    live_stops = get_stop_orders(p.symbol)
+                except Exception:
+                    live_stops = []
+                if live_stops:
+                    naked_streak.pop(p.symbol, None)
+                else:
+                    naked_streak[p.symbol] = naked_streak.get(p.symbol, 0) + 1
+                    if naked_streak[p.symbol] == 2:
+                        send_alert(
+                            f"[CRIT] {p.symbol} has an OPEN POSITION and NO LIVE STOP ORDER "
+                            f"(qty {p.qty}) — position is unprotected."
+                        )
+            for sym in list(naked_streak.keys()):
+                if sym not in current_symbols:
+                    naked_streak.pop(sym, None)
+
             if positions and (now - last_orders_debug) >= ORDERS_DEBUG_INTERVAL_SECONDS:
                 stop_orders = [o for o in all_open_orders if o.type == OrderType.STOP]
                 logger.info(
                     f"[ORDERS] visible={[(o.symbol, str(o.type).split('.')[-1], str(o.status).split('.')[-1], str(o.stop_price)) for o in all_open_orders]} "
                     f"| stop_legs={[(o.symbol, str(o.stop_price)) for o in stop_orders]} "
-                    f"| positions={[p.symbol for p in positions]}"
+                    f"| positions={[p.symbol for p in positions]} "
+                    f"| remembered_legs={dict(stop_leg_ids)}"
                 )
                 last_orders_debug = now
 
@@ -754,6 +836,16 @@ def handle_entry(data, symbol, signal_type, start_time):
             recent_signals[symbol] = now
             pending_signal_types[symbol] = signal_type
 
+            # Capture the stop leg's id now, while the submit response still
+            # contains it. Waiting until a stop_update arrives is too late --
+            # by then the list endpoint has stopped returning it.
+            captured = remember_stop_leg(symbol, submitted)
+            if captured is None:
+                logger.warning(
+                    f"[LEG] {symbol} submit response contained no STOP leg — "
+                    f"stop_update will have to fall back to scanning the order list"
+                )
+
             latency_ms = (time.time() - start_time) * 1000
             note = "" if abs(buying_power - equity) < 1.0 else f" [WARN: BP/equity {buying_power / equity:.2f}x]"
             send_alert(
@@ -816,6 +908,13 @@ def handle_stop_update(data, symbol):
             continue
         try:
             replaced = retry_replace_order(o.id, ReplaceOrderRequest(stop_price=stop_price))
+            # A replace supersedes the order and issues a NEW id. Without
+            # this the map would still point at the replaced order and every
+            # later ratchet would fall back to the broken list scan.
+            new_id = getattr(replaced, "id", None)
+            if new_id is not None:
+                with stop_leg_lock:
+                    stop_leg_ids[symbol] = new_id
             # Log all three values. Alpaca can round or adjust what it
             # accepts, and "requested 18.42, accepted 18.42" vs
             # "requested 18.42, accepted 18.11" is the difference between a
