@@ -137,6 +137,14 @@ pending_signal_types = {}
 reject_tally_lock = threading.Lock()
 reject_reason_counts = {}
 
+# Symbols whose bracket legs were cancelled but whose close then FAILED.
+# That is the one genuinely dangerous state this process can create: an open
+# position with no protective stop. The manager thread retries these every
+# cycle until the position is actually gone, the same pattern the EOD flatten
+# uses. Nothing here should ever depend on a single API call succeeding.
+force_close_lock = threading.Lock()
+force_close_symbols = set()
+
 
 def reject(tag, symbol, message, http_status=200, log_level="info"):
     """Central reject helper. Every rejection MUST go through this so the
@@ -329,6 +337,71 @@ def cancel_resting_legs(symbol):
     return cancelled
 
 
+def verify_legs_cancelled(symbol, timeout_s=3.0, poll_s=0.4):
+    """Polls until no open SELL order or leg remains for the symbol.
+
+    Alpaca processes cancellation ASYNCHRONOUSLY, so cancel_resting_legs()
+    returning does not mean the legs are gone -- it means the requests were
+    accepted. Closing in that window can leave a stray leg alive against a
+    position that no longer exists (the AMIX failure).
+
+    Bounded on purpose: waiting indefinitely would be worse than a stray
+    order, because the position stays open the whole time. Returns
+    (clear, remaining) and the caller proceeds either way."""
+    deadline = time.time() + timeout_s
+    remaining = []
+    while True:
+        try:
+            remaining = [o for o in flatten_orders(get_open_orders(symbol)) if o.side == OrderSide.SELL]
+        except Exception as e:
+            logger.warning(f"Could not verify leg cancellation for {symbol}: {e}")
+            return False, []
+        if not remaining:
+            return True, []
+        if time.time() >= deadline:
+            return False, remaining
+        time.sleep(poll_s)
+
+
+def position_gone(symbol):
+    try:
+        return get_position(symbol) is None
+    except Exception:
+        return False
+
+
+def close_position_with_retry(symbol, reason, attempts=3, delay=1.0):
+    """Closes a position, retrying on failure.
+
+    A close that fails AFTER the legs were cancelled leaves an unprotected
+    position, so a single attempt is not good enough. If every attempt fails
+    the symbol is registered for the manager thread to keep retrying rather
+    than being abandoned with a log line."""
+    for attempt in range(1, attempts + 1):
+        try:
+            trading_client.close_position(symbol)
+            return True
+        except Exception as e:
+            # The stop leg may have filled during the verify window. That is
+            # a normal outcome, not a failure -- the position is flat either
+            # way, which is what was wanted.
+            if position_gone(symbol):
+                logger.info(f"[EXIT] {symbol} — already flat before close completed ({reason})")
+                return True
+            if attempt == attempts:
+                with force_close_lock:
+                    force_close_symbols.add(symbol)
+                send_alert(
+                    f"[CRIT] Failed to close {symbol} after {attempts} attempts ({reason}): {e} — "
+                    f"POSITION MAY BE UNPROTECTED (legs already cancelled). "
+                    f"Registered for retry every cycle until flat."
+                )
+                return False
+            logger.warning(f"Close attempt {attempt}/{attempts} failed for {symbol}: {e}. Retrying...")
+            time.sleep(delay)
+    return False
+
+
 # ============================================================
 # Position manager — housekeeping only.
 #
@@ -384,6 +457,24 @@ def position_manager_loop():
                     last_equity_log = now
                 except Exception as e:
                     logger.warning(f"Failed to log account equity: {e}")
+
+            # Retry any close that failed earlier. Highest priority in the
+            # cycle: these are positions whose protective stop was already
+            # cancelled, so every second they stay open is unhedged.
+            with force_close_lock:
+                stuck = list(force_close_symbols)
+            for sym in stuck:
+                if position_gone(sym):
+                    with force_close_lock:
+                        force_close_symbols.discard(sym)
+                    send_alert(f"[EXIT] {sym} — position confirmed flat, cleared from force-close retry.")
+                    continue
+                try:
+                    cancel_resting_legs(sym)
+                    trading_client.close_position(sym)
+                    send_alert(f"[EXIT] {sym} — force-close retry submitted.")
+                except Exception as e:
+                    logger.warning(f"Force-close retry failed for {sym}: {e}")
 
             positions = trading_client.get_all_positions()
             current_symbols = {p.symbol for p in positions}
@@ -724,8 +815,17 @@ def handle_stop_update(data, symbol):
         if stop_price <= current_stop:
             continue
         try:
-            retry_replace_order(o.id, ReplaceOrderRequest(stop_price=stop_price))
-            logger.info(f"[TRAIL] {symbol} stop ${current_stop:.4f} -> ${stop_price:.4f}")
+            replaced = retry_replace_order(o.id, ReplaceOrderRequest(stop_price=stop_price))
+            # Log all three values. Alpaca can round or adjust what it
+            # accepts, and "requested 18.42, accepted 18.42" vs
+            # "requested 18.42, accepted 18.11" is the difference between a
+            # working trail and one that silently is not moving.
+            accepted = getattr(replaced, "stop_price", None)
+            accepted_str = f"${float(accepted):.4f}" if accepted is not None else "unconfirmed"
+            logger.info(
+                f"[TRAIL] {symbol} requested=${stop_price:.4f} "
+                f"current=${current_stop:.4f} accepted={accepted_str}"
+            )
             moved += 1
         except Exception as e:
             send_alert(f"[CRIT] Failed to move stop for {symbol} to ${stop_price}: {e}")
@@ -776,14 +876,24 @@ def handle_exit(data, symbol):
     qty = position.qty
     cancelled = cancel_resting_legs(symbol)
 
-    try:
-        trading_client.close_position(symbol)
-        send_alert(f"[EXIT] {symbol} — closing {qty} shares at market ({reason}); cancelled {cancelled} resting leg(s)")
-    except Exception as e:
-        send_alert(f"[CRIT] Failed to close {symbol} ({reason}): {e}")
-        return "Close failed", 500
+    # Cancellation is asynchronous. Confirm the legs are actually gone before
+    # submitting the market close, rather than assuming the accepted cancel
+    # requests took effect immediately.
+    clear, remaining = verify_legs_cancelled(symbol)
+    if not clear and remaining:
+        logger.warning(
+            f"[EXIT] {symbol} — {len(remaining)} sell leg(s) still visible after cancel "
+            f"({[str(o.id) for o in remaining]}); closing anyway rather than leaving the position open"
+        )
 
-    return "Success", 200
+    if close_position_with_retry(symbol, reason):
+        send_alert(
+            f"[EXIT] {symbol} — closing {qty} shares at market ({reason}); "
+            f"cancelled {cancelled} resting leg(s), legs_clear={clear}"
+        )
+        return "Success", 200
+
+    return "Close failed", 500
 
 
 # ============================================================
