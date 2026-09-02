@@ -13,18 +13,37 @@ $14.33 vs $7.84). Any logic here that read a price would be reading that
 feed. So the trail, the exit level and the high-water mark all now live
 in Pine, computed on TradingView's data, and arrive as instructions.
 
-Three inbound message types, all from the merged 1-minute script:
+Three inbound message types:
 
   entry        -> submit a BRACKET order (entry + TP + native stop)
   stop_update  -> replace the native stop leg's price (ratchet up only)
   exit         -> cancel resting legs, then close the position at market
 
-WHAT THIS FILE NO LONGER DOES
------------------------------
+MULTI-STRATEGY (added Sep 2026)
+-------------------------------
+More than one Pine script now feeds this endpoint. Each entry payload
+carries a "signal" tag naming the strategy. That tag is used for:
+
+  * per-strategy stop-distance caps (STRATEGY_MAX_STOP_PCT), because a
+    stop taken from a 5-minute candle's low is structurally wider than one
+    taken from a 1-minute candle's, and a single global cap cannot be
+    right for both;
+  * per-strategy reject tallies and win/loss stats, so two strategies
+    sharing one account can still be told apart in the log;
+  * strategy-scoped duplicate suppression.
+
+Strategies still share ONE account and ONE concurrency cap. Two strategies
+firing on the same morning compete for the same slot — see
+MAX_CONCURRENT_POSITIONS below before assuming their results are
+comparable.
+
+WHAT THIS FILE DOES NOT DO
+--------------------------
 No trailing stop calculation. No breakeven tiers. No high-water mark
-tracking or hwm_data.json. No live-quote sanity check. All of it moved
-to Pine. The position manager thread now only handles housekeeping:
-heartbeat, EOD flatten, stale entry cleanup, and exit/P&L logging.
+tracking. No live-quote sanity check. All of it lives in Pine. The
+position manager thread handles housekeeping only: heartbeat, EOD
+flatten, stale entry cleanup, naked-position watchdog, and exit/P&L
+logging.
 """
 
 import json
@@ -34,6 +53,7 @@ import signal
 import sys
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
@@ -112,16 +132,61 @@ ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "300"
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:35")
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "11:35")
 
-# Position sizing. Full-size by design. On the current paper account
-# buying_power equals equity when flat (no margin multiplier); both are
-# logged at entry so a change would be visible immediately rather than
-# silently doubling every position.
+# Concurrency. ONE by default and it should stay there unless there is a
+# deliberate reason to change it.
+#
+# Raising this does NOT simply let two strategies run side by side on equal
+# terms. Sizing below divides the allocation by the cap, so a cap of 2
+# halves every position -- including the days when only one strategy fires
+# at all. That is a real cost paid on every trade to buy comparability on
+# the few days both fire. Decide which you want before touching it.
+MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
+
+# Position sizing. Full-size by design when the cap is 1. On the current
+# paper account buying_power equals equity when flat (no margin
+# multiplier); both are logged at entry so a change would be visible
+# immediately rather than silently doubling every position.
 EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
 
 # Defense-in-depth on stop width. Pine's own max-stop input was removed,
-# so this is now the ONLY guard against an outlier bar producing an
-# oversized loss at full size. Do not remove it too.
+# so this is the ONLY guard against an outlier bar producing an oversized
+# loss at full size. Do not remove it.
+#
+# MAX_STOP_DISTANCE_PCT is the fallback. STRATEGY_MAX_STOP_PCT overrides it
+# per strategy tag, as JSON:
+#
+#   STRATEGY_MAX_STOP_PCT={"RF_EXEC":15.0,"VWAP_X_LOWTEST":9.0,"VWAP_X_VOLSHIFT":9.0}
+#
+# The 5-minute crossover strategy takes its stop from a 5-minute candle's
+# low, which sits materially further from the close than a 1-minute
+# candle's does. Same account, same equity fraction, wider stop, bigger
+# dollar loss. One global number cannot be correct for both.
 MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
+
+
+def _parse_strategy_stop_caps():
+    raw = os.getenv("STRATEGY_MAX_STOP_PCT", "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        out = {str(k).upper(): float(v) for k, v in parsed.items()}
+        return out
+    except Exception as e:
+        logger.error(
+            f"[CONFIG] STRATEGY_MAX_STOP_PCT could not be parsed ({e}). "
+            f"Falling back to MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}% for every strategy."
+        )
+        return {}
+
+
+STRATEGY_MAX_STOP_PCT = _parse_strategy_stop_caps()
+
+
+def max_stop_pct_for(strategy):
+    """Per-strategy cap, falling back to the global one."""
+    return STRATEGY_MAX_STOP_PCT.get(strategy.upper(), MAX_STOP_DISTANCE_PCT)
+
 
 # Diagnostic cadence while a position is open.
 ORDERS_DEBUG_INTERVAL_SECONDS = int(os.getenv("ORDERS_DEBUG_INTERVAL_SECONDS", "30"))
@@ -129,6 +194,11 @@ ORDERS_DEBUG_INTERVAL_SECONDS = int(os.getenv("ORDERS_DEBUG_INTERVAL_SECONDS", "
 DEFAULT_STRATEGY_TAG = os.getenv("DEFAULT_STRATEGY_TAG", "RF_EXEC")
 
 order_lock = threading.Lock()
+
+# Keyed by (symbol, strategy). Two different strategies firing on the same
+# symbol within the window are two different decisions, not a duplicate --
+# the concurrency cap is what stops both being taken, and it gives a
+# meaningful reject reason. Suppressing one as a "duplicate" would hide it.
 recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 15
 
@@ -136,6 +206,11 @@ pending_signal_types = {}
 
 reject_tally_lock = threading.Lock()
 reject_reason_counts = {}
+
+# Per-strategy daily results, so two strategies sharing one account can
+# still be told apart at EOD.
+strategy_stats_lock = threading.Lock()
+strategy_stats = defaultdict(lambda: {"entries": 0, "wins": 0, "losses": 0, "pl": 0.0})
 
 # Symbols whose bracket legs were cancelled but whose close then FAILED.
 # That is the one genuinely dangerous state this process can create: an open
@@ -178,13 +253,18 @@ def forget_stop_leg(symbol):
         stop_leg_ids.pop(symbol, None)
 
 
-def reject(tag, symbol, message, http_status=200, log_level="info"):
+def reject(tag, symbol, message, http_status=200, log_level="info", strategy=None):
     """Central reject helper. Every rejection MUST go through this so the
     reason is tagged distinctly in the log and tallied for the daily
-    summary. `tag` is a short stable code, not a sentence."""
+    summary. `tag` is a short stable code, not a sentence.
+
+    `strategy` is optional and only known once a payload has been parsed
+    far enough to read it -- malformed-payload rejects will not have it."""
+    key = f"{tag}|{strategy.upper()}" if strategy else tag
     with reject_tally_lock:
-        reject_reason_counts[tag] = reject_reason_counts.get(tag, 0) + 1
-    full_message = f"[REJECT:{tag}] {symbol} — {message}"
+        reject_reason_counts[key] = reject_reason_counts.get(key, 0) + 1
+    prefix = f"[REJECT:{tag}]" if not strategy else f"[REJECT:{tag}][{strategy.upper()}]"
+    full_message = f"{prefix} {symbol} — {message}"
     if log_level == "error":
         logger.error(full_message)
     elif log_level == "debug":
@@ -200,11 +280,28 @@ def log_reject_summary():
             logger.info("[SUMMARY] No rejected signals today.")
         else:
             parts = ", ".join(
-                f"{count}x {tag}"
-                for tag, count in sorted(reject_reason_counts.items(), key=lambda kv: -kv[1])
+                f"{count}x {key}"
+                for key, count in sorted(reject_reason_counts.items(), key=lambda kv: -kv[1])
             )
             logger.info(f"[SUMMARY] Reject reasons today: {parts}")
         reject_reason_counts.clear()
+
+
+def log_strategy_summary():
+    """Per-strategy results for the session. With two strategies sharing one
+    account this is the only place the split is visible."""
+    with strategy_stats_lock:
+        if not strategy_stats:
+            logger.info("[SUMMARY] No entries taken today.")
+        else:
+            for tag, s in sorted(strategy_stats.items()):
+                closed = s["wins"] + s["losses"]
+                wr = (s["wins"] / closed * 100) if closed else 0.0
+                logger.info(
+                    f"[SUMMARY] {tag}: entries={s['entries']} closed={closed} "
+                    f"W/L={s['wins']}/{s['losses']} ({wr:.0f}%) P/L=${s['pl']:.2f}"
+                )
+        strategy_stats.clear()
 
 
 def is_transient_error(e):
@@ -339,11 +436,18 @@ def get_stop_orders(symbol):
     return stops
 
 
-def has_any_open_exposure():
-    """Hard cap of 1 concurrent position/pending entry across ALL symbols."""
-    if len(trading_client.get_all_positions()) > 0:
-        return True
-    return any(o.side == OrderSide.BUY for o in flatten_orders(get_open_orders()))
+def open_exposure_count():
+    """How many slots are currently consumed, across ALL symbols and ALL
+    strategies: open positions plus resting unfilled entries.
+
+    Counts distinct symbols rather than raw orders. A bracket's entry leg
+    and its position never coexist for the same symbol in practice, but
+    counting symbols makes the cap mean what it says regardless."""
+    symbols = {p.symbol for p in trading_client.get_all_positions()}
+    for o in flatten_orders(get_open_orders()):
+        if o.side == OrderSide.BUY:
+            symbols.add(o.symbol)
+    return len(symbols)
 
 
 def get_position(symbol):
@@ -465,7 +569,8 @@ def close_position_with_retry(symbol, reason, attempts=3, delay=1.0):
 #
 # It does NOT compute a trail, a breakeven, or a high-water mark any
 # more. Those live in Pine. What remains: heartbeat, EOD flatten, stale
-# entry cleanup, exit/P&L logging, and the [ORDERS] diagnostic.
+# entry cleanup, naked-position watchdog, exit/P&L logging, and the
+# [ORDERS] diagnostic.
 # ============================================================
 def position_manager_loop():
     last_equity_log = 0.0
@@ -496,7 +601,11 @@ def position_manager_loop():
                 try:
                     trading_client.close_all_positions(cancel_orders=True)
                     send_alert("[EOD] Successfully closed all positions.")
+                    # Give close detection a cycle to log the final exits
+                    # before the per-strategy tally is printed and cleared.
+                    time.sleep(3)
                     log_reject_summary()
+                    log_strategy_summary()
                     # Only mark done on SUCCESS. Setting this unconditionally
                     # would let one transient failure silently stop the bot
                     # from ever retrying for the rest of the day.
@@ -542,6 +651,7 @@ def position_manager_loop():
             # closed -- via TP, native stop, our own exit, or EOD flatten.
             for symbol in set(open_positions_tracked.keys()) - current_symbols:
                 info = open_positions_tracked.pop(symbol)
+                sig = info.get("signal", DEFAULT_STRATEGY_TAG)
                 try:
                     # 'after' is the hard fix: only orders submitted after THIS
                     # position was first observed can possibly be its exit.
@@ -571,8 +681,6 @@ def position_manager_loop():
                             break
                         time.sleep(1.5)
 
-                    sig = info.get("signal", "UNKNOWN")
-
                     if exit_order:
                         exit_price = float(exit_order.filled_avg_price)
                         qty = float(exit_order.filled_qty or info["qty"])
@@ -591,6 +699,13 @@ def position_manager_loop():
                             f"exit ${exit_price:.4f} @ {exit_time} ET | qty {qty:.0f} | "
                             f"P/L: ${pl:.2f} ({pl_pct:+.2f}%) | exit: {exit_order.type}"
                         )
+                        with strategy_stats_lock:
+                            s = strategy_stats[sig]
+                            s["pl"] += pl
+                            if pl >= 0:
+                                s["wins"] += 1
+                            else:
+                                s["losses"] += 1
                     else:
                         logger.info(
                             f"[?] {symbol} [{sig}] closed | qty {info['qty']:.0f} | "
@@ -622,9 +737,6 @@ def position_manager_loop():
 
             all_open_orders = flatten_orders(get_open_orders())
 
-            # DIAGNOSTIC: while a position is open, dump what the manager can
-            # actually see. On 20 Aug the stop legs were invisible to this
-            # loop across six trades and nothing said so.
             # Naked-position watchdog. A position with no live stop is the
             # one state that must never pass silently. Two consecutive misses
             # rather than one, so a momentary lookup blip is not alarming.
@@ -646,6 +758,9 @@ def position_manager_loop():
                 if sym not in current_symbols:
                     naked_streak.pop(sym, None)
 
+            # DIAGNOSTIC: while a position is open, dump what the manager can
+            # actually see. On 20 Aug the stop legs were invisible to this
+            # loop across six trades and nothing said so.
             if positions and (now - last_orders_debug) >= ORDERS_DEBUG_INTERVAL_SECONDS:
                 stop_orders = [o for o in all_open_orders if o.type == OrderType.STOP]
                 logger.info(
@@ -669,6 +784,11 @@ def position_manager_loop():
                         try:
                             retry_cancel_order(o.id)
                             cancel_requested_order_ids.add(o.id)
+                            # The strategy tag was staged at submit time and is
+                            # only cleared on close detection. An entry that
+                            # never fills never closes, so without this the tag
+                            # leaks and mislabels the NEXT trade on that symbol.
+                            pending_signal_types.pop(o.symbol, None)
                             send_alert(
                                 f"[TIMEOUT] Requested cancel for stale unfilled entry for {o.symbol} "
                                 f"after {age:.0f}s — slot frees once Alpaca confirms."
@@ -713,9 +833,18 @@ def log_startup_config():
     not the ones running is worthless."""
     logger.info(
         f"[CONFIG] entry_window={TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET | "
-        f"equity_fraction={EQUITY_FRACTION} | max_stop_dist={MAX_STOP_DISTANCE_PCT}% | "
-        f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | strategy_tag={DEFAULT_STRATEGY_TAG}"
+        f"equity_fraction={EQUITY_FRACTION} | max_concurrent={MAX_CONCURRENT_POSITIONS} | "
+        f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | default_strategy_tag={DEFAULT_STRATEGY_TAG}"
     )
+    if STRATEGY_MAX_STOP_PCT:
+        caps = ", ".join(f"{k}={v}%" for k, v in sorted(STRATEGY_MAX_STOP_PCT.items()))
+        logger.info(f"[CONFIG] stop caps: {caps} | fallback={MAX_STOP_DISTANCE_PCT}%")
+    else:
+        logger.info(
+            f"[CONFIG] stop cap: {MAX_STOP_DISTANCE_PCT}% for ALL strategies "
+            f"(STRATEGY_MAX_STOP_PCT not set — a 5-minute-candle stop and a "
+            f"1-minute-candle stop are being held to the same limit)"
+        )
     logger.info(
         "[CONFIG] Trail, exit level and high-water mark are owned by Pine. "
         "This process computes no price levels of its own."
@@ -752,6 +881,14 @@ def reject_summary():
         return dict(reject_reason_counts), 200
 
 
+@app.route("/strategy-summary", methods=["GET"])
+def strategy_summary():
+    """Live per-strategy tally without waiting for EOD. Read-only — it does
+    NOT clear the counters, unlike the EOD summary."""
+    with strategy_stats_lock:
+        return {k: dict(v) for k, v in strategy_stats.items()}, 200
+
+
 # ============================================================
 # ENTRY
 # ============================================================
@@ -761,7 +898,8 @@ def handle_entry(data, symbol, signal_type, start_time):
         stop_loss = float(data["stop_loss"])
         take_profit = float(data["take_profit"])
     except (KeyError, ValueError, TypeError) as e:
-        return reject("MALFORMED", symbol, f"malformed entry payload — {e}", http_status=400)
+        return reject("MALFORMED", symbol, f"malformed entry payload — {e}",
+                      http_status=400, strategy=signal_type)
 
     # Window first, so a signal that is BOTH out of window and badly formed
     # logs the real first-order reason instead of hiding it.
@@ -771,38 +909,51 @@ def handle_entry(data, symbol, signal_type, start_time):
             "WINDOW", symbol,
             f"arrived at {now_ny_str} ET, outside {TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET "
             f"(entry={entry_limit}, sl={stop_loss}, tp={take_profit})",
+            strategy=signal_type,
         )
 
     if not stop_loss > 0:
-        return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})")
+        return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})",
+                      strategy=signal_type)
     if not stop_loss < entry_limit:
-        return reject("SL_GE_ENTRY", symbol, f"stop_loss ({stop_loss}) must be below entry ({entry_limit})")
+        return reject("SL_GE_ENTRY", symbol, f"stop_loss ({stop_loss}) must be below entry ({entry_limit})",
+                      strategy=signal_type)
     if take_profit == 0.0:
-        return reject("TP_NOT_SET", symbol, "take_profit is 0.0 — target not set on this ticker's chart")
+        return reject("TP_NOT_SET", symbol, "take_profit is 0.0 — target not set on this ticker's chart",
+                      strategy=signal_type)
     if not entry_limit < take_profit:
-        return reject("TP_LE_ENTRY", symbol, f"entry ({entry_limit}) must be below take_profit ({take_profit})")
+        return reject("TP_LE_ENTRY", symbol, f"entry ({entry_limit}) must be below take_profit ({take_profit})",
+                      strategy=signal_type)
 
     stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
-    if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
+    cap = max_stop_pct_for(signal_type)
+    if stop_distance_pct > cap:
         return reject(
             "STOP_TOO_WIDE", symbol,
-            f"stop distance {stop_distance_pct:.2f}% exceeds MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}%",
+            f"stop distance {stop_distance_pct:.2f}% exceeds cap {cap}% for this strategy",
+            strategy=signal_type,
         )
 
     with order_lock:
         now = time.time()
         global recent_signals
-        recent_signals = {s: t for s, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
-        if recent_signals.get(symbol) is not None:
-            return reject("DUPLICATE", symbol, f"duplicate entry within {SIGNAL_DEDUPE_WINDOW_SECONDS}s")
+        recent_signals = {k: t for k, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
+        dedupe_key = (symbol, signal_type)
+        if recent_signals.get(dedupe_key) is not None:
+            return reject("DUPLICATE", symbol,
+                          f"duplicate entry within {SIGNAL_DEDUPE_WINDOW_SECONDS}s",
+                          strategy=signal_type)
 
         try:
-            if has_any_open_exposure():
-                return reject("CONCURRENCY_CAP", symbol, "max concurrent positions reached (cap: 1)")
+            in_use = open_exposure_count()
+            if in_use >= MAX_CONCURRENT_POSITIONS:
+                return reject("CONCURRENCY_CAP", symbol,
+                              f"{in_use}/{MAX_CONCURRENT_POSITIONS} slots in use",
+                              strategy=signal_type)
         except Exception as e:
             return reject("CONCURRENCY_CHECK_FAILED", symbol,
                           f"could not verify concurrency cap, rejecting for safety: {e}",
-                          http_status=500, log_level="error")
+                          http_status=500, log_level="error", strategy=signal_type)
 
         try:
             account = trading_client.get_account()
@@ -811,12 +962,26 @@ def handle_entry(data, symbol, signal_type, start_time):
         except Exception as e:
             return reject("BUYING_POWER_CHECK_FAILED", symbol,
                           f"could not check buying power, rejecting for safety: {e}",
-                          http_status=500, log_level="error")
+                          http_status=500, log_level="error", strategy=signal_type)
 
-        qty = int((buying_power * EQUITY_FRACTION) // entry_limit)
+        # Sizing. With a cap of 1 this is identical to the previous
+        # behaviour: the whole equity fraction of available buying power.
+        #
+        # With a cap above 1 the allocation is divided by the cap, so the
+        # first position cannot consume the capital the second would need.
+        # It is deliberately NOT "whatever is left" -- that would give the
+        # strategy that happens to fire first a systematically larger
+        # position, which would corrupt any comparison between them.
+        allocation = buying_power * EQUITY_FRACTION
+        if MAX_CONCURRENT_POSITIONS > 1:
+            allocation = min(allocation, (equity * EQUITY_FRACTION) / MAX_CONCURRENT_POSITIONS)
+
+        qty = int(allocation // entry_limit)
         if qty < 1:
             return reject("INSUFFICIENT_BP", symbol,
-                          f"buying_power=${buying_power:.2f} insufficient at entry={entry_limit}")
+                          f"allocation ${allocation:.2f} insufficient at entry={entry_limit} "
+                          f"(bp=${buying_power:.2f}, cap={MAX_CONCURRENT_POSITIONS})",
+                          strategy=signal_type)
 
         try:
             # BRACKET: entry + take_profit + native stop, submitted together.
@@ -833,8 +998,11 @@ def handle_entry(data, symbol, signal_type, start_time):
                 stop_loss=StopLossRequest(stop_price=round_tick(stop_loss)),
             )
             submitted = trading_client.submit_order(order)
-            recent_signals[symbol] = now
+            recent_signals[dedupe_key] = now
             pending_signal_types[symbol] = signal_type
+
+            with strategy_stats_lock:
+                strategy_stats[signal_type]["entries"] += 1
 
             # Capture the stop leg's id now, while the submit response still
             # contains it. Waiting until a stop_update arrives is too late --
@@ -850,8 +1018,8 @@ def handle_entry(data, symbol, signal_type, start_time):
             note = "" if abs(buying_power - equity) < 1.0 else f" [WARN: BP/equity {buying_power / equity:.2f}x]"
             send_alert(
                 f"[ENTRY] {symbol} [{signal_type}] qty={qty} limit={entry_limit} TP={take_profit} "
-                f"SL={stop_loss} (stop dist {stop_distance_pct:.2f}%) | equity=${equity:.2f} "
-                f"bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
+                f"SL={stop_loss} (stop dist {stop_distance_pct:.2f}% of cap {cap}%) | "
+                f"equity=${equity:.2f} bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
                 f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
             )
         except Exception as e:
@@ -871,33 +1039,36 @@ def handle_stop_update(data, symbol):
     NO POSITION means Pine believes it is in a trade that never filled --
     Pine cannot see the Alpaca account, so this WILL happen and must be a
     quiet no-op rather than an error."""
+    strategy = pending_signal_types.get(symbol)
+
     try:
         stop_price = round_tick(float(data["stop_price"]))
     except (KeyError, ValueError, TypeError) as e:
-        return reject("MALFORMED", symbol, f"malformed stop_update payload — {e}", http_status=400)
+        return reject("MALFORMED", symbol, f"malformed stop_update payload — {e}",
+                      http_status=400, strategy=strategy)
 
     try:
         position = get_position(symbol)
     except Exception as e:
         return reject("POSITION_CHECK_FAILED", symbol, f"could not verify position: {e}",
-                      http_status=500, log_level="error")
+                      http_status=500, log_level="error", strategy=strategy)
 
     if position is None:
         return reject("NO_POSITION", symbol,
                       f"stop_update to ${stop_price} ignored — no open position "
                       f"(Pine believes it is in a trade that did not fill)",
-                      log_level="debug")
+                      log_level="debug", strategy=strategy)
 
     try:
         stop_orders = get_stop_orders(symbol)
     except Exception as e:
         return reject("ORDER_LOOKUP_FAILED", symbol, f"could not list stop orders: {e}",
-                      http_status=500, log_level="error")
+                      http_status=500, log_level="error", strategy=strategy)
 
     if not stop_orders:
         return reject("NO_STOP_ORDER", symbol,
                       f"position open but NO stop order visible — cannot ratchet to ${stop_price}",
-                      log_level="error")
+                      log_level="error", strategy=strategy)
 
     moved = 0
     for o in stop_orders:
@@ -922,7 +1093,7 @@ def handle_stop_update(data, symbol):
             accepted = getattr(replaced, "stop_price", None)
             accepted_str = f"${float(accepted):.4f}" if accepted is not None else "unconfirmed"
             logger.info(
-                f"[TRAIL] {symbol} requested=${stop_price:.4f} "
+                f"[TRAIL] {symbol} [{strategy or '-'}] requested=${stop_price:.4f} "
                 f"current=${current_stop:.4f} accepted={accepted_str}"
             )
             moved += 1
@@ -933,7 +1104,7 @@ def handle_stop_update(data, symbol):
     if moved == 0:
         return reject("STOP_NOT_HIGHER", symbol,
                       f"requested ${stop_price} is not above the current stop — no change",
-                      log_level="debug")
+                      log_level="debug", strategy=strategy)
 
     return "Success", 200
 
@@ -942,18 +1113,19 @@ def handle_stop_update(data, symbol):
 # EXIT
 # ============================================================
 def handle_exit(data, symbol):
-    """Closes the position at market. Pine fires this on a 1-minute close
+    """Closes the position at market. Pine fires this on a confirmed close
     below the exit level, or at session end.
 
     Legs are cancelled BEFORE the close. Closing while a bracket sibling
     still rests is what produced the AMIX stray order."""
     reason = str(data.get("reason", "unspecified"))
+    strategy = pending_signal_types.get(symbol)
 
     try:
         position = get_position(symbol)
     except Exception as e:
         return reject("POSITION_CHECK_FAILED", symbol, f"could not verify position: {e}",
-                      http_status=500, log_level="error")
+                      http_status=500, log_level="error", strategy=strategy)
 
     if position is None:
         # No position, but a pending entry may still be resting. Pine has
@@ -968,9 +1140,11 @@ def handle_exit(data, symbol):
                     retry_cancel_order(o.id)
                 except Exception as e:
                     logger.warning(f"Could not cancel pending entry {o.id} for {symbol}: {e}")
+            pending_signal_types.pop(symbol, None)
             send_alert(f"[EXIT] {symbol} — no position; cancelled {len(pending)} pending entry order(s) ({reason})")
             return "Success", 200
-        return reject("NO_POSITION", symbol, f"exit ({reason}) ignored — nothing open", log_level="debug")
+        return reject("NO_POSITION", symbol, f"exit ({reason}) ignored — nothing open",
+                      log_level="debug", strategy=strategy)
 
     qty = position.qty
     cancelled = cancel_resting_legs(symbol)
@@ -987,7 +1161,7 @@ def handle_exit(data, symbol):
 
     if close_position_with_retry(symbol, reason):
         send_alert(
-            f"[EXIT] {symbol} — closing {qty} shares at market ({reason}); "
+            f"[EXIT] {symbol} [{strategy or '-'}] — closing {qty} shares at market ({reason}); "
             f"cancelled {cancelled} resting leg(s), legs_clear={clear}"
         )
         return "Success", 200
@@ -1026,7 +1200,8 @@ def webhook():
     if msg_type == "exit":
         return handle_exit(data, symbol)
 
-    return reject("UNKNOWN_TYPE", symbol, f"unrecognised message type '{msg_type}'", http_status=400)
+    return reject("UNKNOWN_TYPE", symbol, f"unrecognised message type '{msg_type}'",
+                  http_status=400, strategy=signal_type)
 
 
 if __name__ == "__main__":
