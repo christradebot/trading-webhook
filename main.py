@@ -10,33 +10,35 @@ of its own.
 That division exists because Alpaca's free IEX data proved unreliable on
 thin small caps (confirmed live: TNON entry $11.51 vs quote $4.55; RDAC
 $14.33 vs $7.84). Any logic here that read a price would be reading that
-feed. So the trail, the exit level and the high-water mark all live in
-Pine, computed on TradingView's data, and arrive as instructions.
+feed. All levels come from TradingView and arrive as instructions.
 
-Three inbound message types, all from the 5-minute crossover script:
+TWO ENTRY MODES
+---------------
+1. BRACKET (regular hours). entry + take_profit + native stop submitted
+   together as one Alpaca bracket. The stop rests at the exchange, and
+   stop_update / exit messages manage it. This is the automated path.
 
-  entry        -> submit a BRACKET order (entry + TP + native stop)
+2. MANUAL (premarket). A plain LIMIT order with extended_hours=True and
+   NO protective legs, because Alpaca rejects stop and stop-limit orders
+   outside regular hours — they are refused outright or sit inactive
+   until 09:30 ET. The operator sets the stop and target by hand after
+   the fill.
+
+   A manual entry is requested by sending "managed":"manual" in the
+   payload, or by sending take_profit and stop_loss as 0.
+
+   THE POSITION IS UNPROTECTED UNTIL THE OPERATOR ACTS. That is a
+   deliberate choice, not an oversight, so the naked-position watchdog
+   warns once at entry rather than screaming every cycle — but the
+   exposure is real and belongs to whoever is awake.
+
+Inbound message types:
+
+  entry        -> bracket order, or plain extended-hours limit if manual
   stop_update  -> replace the native stop leg's price (ratchet up only)
   exit         -> cancel resting legs, then close the position at market
-
-SIGNAL TAGGING
---------------
-The entry payload carries a "signal" field naming which trigger fired:
-LOW_TEST (white candle) or VOL_SHIFT (yellow candle). That tag follows the
-trade through to the close log and into a per-signal daily tally, so the
-two trigger types can be judged separately rather than as one blended
-number. Both share one gate, one account and one concurrency slot.
-
-WHAT THIS FILE DOES NOT DO
---------------------------
-No trailing stop calculation. No breakeven tiers. No high-water mark
-tracking. No live-quote sanity check. All of it lives in Pine. The
-position manager thread handles housekeeping only: heartbeat, EOD
-flatten, stale entry cleanup, naked-position watchdog, and exit/P&L
-logging.
 """
 
-import json
 import logging
 import os
 import signal
@@ -72,9 +74,7 @@ MEL_TZ = ZoneInfo("Australia/Melbourne")
 
 class DualTZFormatter(logging.Formatter):
     """Stamps each record in New York time (what the bot gates on) and
-    Melbourne time (what the operator sees when reviewing). Previously the
-    formatter was attached to the file handler only, so the Railway console
-    log carried no timestamp on any line at all."""
+    Melbourne time (what the operator sees when reviewing)."""
 
     def formatTime(self, record, datefmt=None):
         et = datetime.fromtimestamp(record.created, NY_TZ)
@@ -97,9 +97,6 @@ app = Flask(__name__)
 
 is_live = os.getenv("LIVE_TRADING", "False") == "True"
 
-# Build identity. Without this there is no way to tell from a log whether
-# the code running on Railway is the code in the repo -- exactly the
-# ambiguity that made the 20 Aug session impossible to diagnose.
 BUILD_TAG = os.getenv("RAILWAY_GIT_COMMIT_SHA", "local")[:8]
 
 logger.info(f"--- BOT STARTED: LIVE_TRADING={is_live} BUILD={BUILD_TAG} ---")
@@ -114,67 +111,59 @@ symbol_error_counts = {}
 symbol_alert_cooldown = {}
 ERROR_ALERT_INTERVAL = 10
 
-# An unfilled entry blocks the concurrency cap from freeing up.
 ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "300"))
 
-# Entry window (ET). Applies to ENTRIES ONLY -- stop_update and exit are
-# never time-gated, or a position opened at 11:30 would become unmanaged.
+# Two windows, both ET.
+#
+# BRACKET window: regular hours, where a protective stop can rest at the
+# exchange. This is the automated, walk-away path.
 TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:35")
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "11:35")
 
-# Concurrency. ONE by default and it should stay there unless there is a
-# deliberate reason to change it. Sizing below divides the allocation by
-# the cap, so a cap of 2 halves every position -- including on the days
-# only one signal fires at all.
+# MANUAL window: premarket. Entries here carry NO protective legs, so the
+# window is deliberately narrow and the operator must be at the screen.
+PREMARKET_WINDOW_START = os.getenv("PREMARKET_WINDOW_START", "04:00")
+PREMARKET_WINDOW_END = os.getenv("PREMARKET_WINDOW_END", "09:29")
+
+# Alpaca stops accepting extended-hours orders at 09:30. Cutting off two
+# minutes early avoids a race where the order is accepted premarket but
+# routes into the opening auction.
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
 
-# Position sizing. Full-size by design when the cap is 1. On the current
-# paper account buying_power equals equity when flat (no margin
-# multiplier); both are logged at entry so a change would be visible
-# immediately rather than silently doubling every position.
 EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
 
-# Defense-in-depth on stop width. Pine's own max-stop input was removed,
-# so this is the ONLY guard against an outlier bar producing an oversized
-# loss at full size. Do not remove it.
-#
-# NOTE ON THE CURRENT STRATEGY: the stop is taken from a 5-MINUTE trigger
-# candle's low, buffered below it. A 5-minute candle's low sits materially
-# further from its close than a 1-minute candle's does, so stop distances
-# here run wider than they used to at the same equity fraction. Watch the
-# "stop dist" figure in the [ENTRY] lines for a few sessions and consider
-# lowering this before going live.
+# Manual entries carry no stop, so this cap cannot protect them. It only
+# applies to bracket entries, where a stop price is actually supplied.
 MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
 
-# Diagnostic cadence while a position is open.
+# Manual premarket entries are unprotected by design. This caps how much
+# of the account can sit in one, independently of EQUITY_FRACTION, because
+# "full size with no stop" is a different risk from "full size with a stop".
+MANUAL_EQUITY_FRACTION = float(os.getenv("MANUAL_EQUITY_FRACTION", "0.50"))
+
 ORDERS_DEBUG_INTERVAL_SECONDS = int(os.getenv("ORDERS_DEBUG_INTERVAL_SECONDS", "30"))
 
-# Fallback tag when a payload omits "signal".
-DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "VWAP_X")
+DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "RF_FLIP")
 
 order_lock = threading.Lock()
 
-# Keyed by (symbol, signal). Two different trigger types firing on the same
-# symbol within the window are two different decisions -- the concurrency
-# cap is what stops both being taken, and it gives a meaningful reject
-# reason. Suppressing one as a "duplicate" would hide it.
 recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 15
 
 pending_signal_types = {}
 
+# Symbols entered via the manual path. Their positions have no stop leg BY
+# DESIGN, so the naked-position watchdog must not treat them as an
+# emergency every cycle.
+manual_managed_lock = threading.Lock()
+manual_managed_symbols = set()
+
 reject_tally_lock = threading.Lock()
 reject_reason_counts = {}
 
-# Per-signal daily results, so LOW_TEST and VOL_SHIFT can be judged apart.
 signal_stats_lock = threading.Lock()
 signal_stats = defaultdict(lambda: {"entries": 0, "wins": 0, "losses": 0, "pl": 0.0})
 
-# Symbols whose bracket legs were cancelled but whose close then FAILED.
-# That is the one genuinely dangerous state this process can create: an open
-# position with no protective stop. The manager thread retries these every
-# cycle until the position is actually gone, the same pattern the EOD flatten
-# uses. Nothing here should ever depend on a single API call succeeding.
 force_close_lock = threading.Lock()
 force_close_symbols = set()
 
@@ -185,14 +174,25 @@ force_close_symbols = set()
 # both OCO siblings once the parent entry has filled. Confirmed live across
 # four trades -- while the entry was unfilled both legs showed as HELD and
 # nested, then the moment the entry left the open list only the take-profit
-# LIMIT came back and the STOP disappeared. The stop was never gone: DAIC's
-# and PMI's later FILLED, and PRZO's was auto-cancelled by Alpaca when we
-# closed the position. It was purely invisible to the query, which is why
-# every stop_update came back NO_STOP_ORDER and the trail never once ran.
-#
-# Looking the leg up by its own id sidesteps the list endpoint entirely.
+# LIMIT came back and the STOP disappeared. Looking the leg up by its own
+# id sidesteps the list endpoint entirely.
 stop_leg_lock = threading.Lock()
 stop_leg_ids = {}
+
+
+def mark_manual(symbol):
+    with manual_managed_lock:
+        manual_managed_symbols.add(symbol)
+
+
+def unmark_manual(symbol):
+    with manual_managed_lock:
+        manual_managed_symbols.discard(symbol)
+
+
+def is_manual(symbol):
+    with manual_managed_lock:
+        return symbol in manual_managed_symbols
 
 
 def remember_stop_leg(symbol, order):
@@ -214,10 +214,7 @@ def forget_stop_leg(symbol):
 def reject(tag, symbol, message, http_status=200, log_level="info", sig=None):
     """Central reject helper. Every rejection MUST go through this so the
     reason is tagged distinctly in the log and tallied for the daily
-    summary. `tag` is a short stable code, not a sentence.
-
-    `sig` is optional and only known once a payload has been parsed far
-    enough to read it -- malformed-payload rejects will not have it."""
+    summary."""
     key = f"{tag}|{sig.upper()}" if sig else tag
     with reject_tally_lock:
         reject_reason_counts[key] = reject_reason_counts.get(key, 0) + 1
@@ -246,9 +243,6 @@ def log_reject_summary():
 
 
 def log_signal_summary():
-    """Per-trigger results for the session. LOW_TEST and VOL_SHIFT are very
-    different candle events sharing one gate; blending them into a single
-    win rate would hide which one is actually carrying the strategy."""
     with signal_stats_lock:
         if not signal_stats:
             logger.info("[SUMMARY] No entries taken today.")
@@ -285,23 +279,19 @@ def emergency_flatten():
         manager_status["is_alive"] = False
 
 
-def handle_symbol_error(symbol, e):
-    symbol_error_counts[symbol] = symbol_error_counts.get(symbol, 0) + 1
-    count = symbol_error_counts[symbol]
-    logger.error(f"Error managing {symbol}: {e}")
-    if count == 3:
-        send_alert(f"[CRIT] Symbol {symbol} failing repeatedly ({count} consecutive errors).")
-        symbol_alert_cooldown[symbol] = count
-    elif count > 3 and (count - symbol_alert_cooldown.get(symbol, 3)) >= ERROR_ALERT_INTERVAL:
-        send_alert(f"[CRIT] Symbol {symbol} still failing ({count} consecutive errors).")
-        symbol_alert_cooldown[symbol] = count
+def _in_window(start_str, end_str):
+    now_ny = datetime.now(NY_TZ).time()
+    start = datetime.strptime(start_str, "%H:%M").time()
+    end = datetime.strptime(end_str, "%H:%M").time()
+    return start <= now_ny <= end
 
 
 def within_trading_window():
-    now_ny = datetime.now(NY_TZ).time()
-    start = datetime.strptime(TRADING_WINDOW_START, "%H:%M").time()
-    end = datetime.strptime(TRADING_WINDOW_END, "%H:%M").time()
-    return start <= now_ny <= end
+    return _in_window(TRADING_WINDOW_START, TRADING_WINDOW_END)
+
+
+def within_premarket_window():
+    return _in_window(PREMARKET_WINDOW_START, PREMARKET_WINDOW_END)
 
 
 def round_tick(price):
@@ -317,14 +307,9 @@ def get_open_orders(symbol=None, nested=True):
     """Open orders, nested by default.
 
     CONFIRMED LIVE 24 Aug: with nested=False the query returned ONLY the
-    take-profit LIMIT leg -- the stop leg was absent, yet demonstrably alive
-    (both trades that day exited on their stop). Alpaca returns the
-    bracket's OCO siblings as LEGS of one another rather than as separate
-    top-level orders, so a flat query silently loses one of them.
-
-    That is the whole reason the trailing stop has never once ratcheted in
-    production. It was never a logic bug -- the manager simply could not
-    see the order it was trying to move."""
+    take-profit LIMIT leg -- the stop leg was absent, yet demonstrably alive.
+    Alpaca returns the bracket's OCO siblings as LEGS of one another rather
+    than as separate top-level orders, so a flat query silently loses one."""
     if symbol:
         f = GetOrdersRequest(status=QueryOrderStatus.OPEN, symbols=[symbol], nested=nested)
     else:
@@ -333,11 +318,7 @@ def get_open_orders(symbol=None, nested=True):
 
 
 def flatten_orders(orders):
-    """Walks an order list and yields every order AND every nested leg.
-
-    Alpaca nests recursively (a bracket parent holds legs, and after the
-    entry fills those legs hold each other), so this recurses rather than
-    checking one level."""
+    """Walks an order list and yields every order AND every nested leg."""
     seen = set()
     out = []
 
@@ -364,11 +345,9 @@ def _is_live(order):
 
 
 def get_stop_orders(symbol):
-    """The live STOP order(s) for a symbol.
-
-    Tries the remembered leg id FIRST, because the list endpoint drops the
-    stop sibling once the entry fills. Falls back to scanning the list only
-    if there is no remembered id or the direct lookup comes back dead."""
+    """The live STOP order(s) for a symbol. Tries the remembered leg id
+    FIRST, because the list endpoint drops the stop sibling once the entry
+    fills."""
     with stop_leg_lock:
         leg_id = stop_leg_ids.get(symbol)
 
@@ -396,11 +375,8 @@ def get_stop_orders(symbol):
 
 
 def open_exposure_count():
-    """How many slots are currently consumed, across ALL symbols: open
-    positions plus resting unfilled entries.
-
-    Counts distinct symbols rather than raw orders, so the cap means what
-    it says regardless of how Alpaca nests the legs."""
+    """How many slots are consumed: open positions plus resting unfilled
+    entries, counted as distinct symbols."""
     symbols = {p.symbol for p in trading_client.get_all_positions()}
     for o in flatten_orders(get_open_orders()):
         if o.side == OrderSide.BUY:
@@ -442,8 +418,7 @@ def cancel_resting_legs(symbol):
 
     This ordering is the AMIX fix. Calling close_position() while a bracket
     sibling still rests at the exchange leaves a stray order that can fire
-    later against a position that no longer exists. Cancel first, then
-    close."""
+    later against a position that no longer exists."""
     cancelled = 0
     try:
         for o in flatten_orders(get_open_orders(symbol)):
@@ -459,15 +434,8 @@ def cancel_resting_legs(symbol):
 
 def verify_legs_cancelled(symbol, timeout_s=3.0, poll_s=0.4):
     """Polls until no open SELL order or leg remains for the symbol.
-
-    Alpaca processes cancellation ASYNCHRONOUSLY, so cancel_resting_legs()
-    returning does not mean the legs are gone -- it means the requests were
-    accepted. Closing in that window can leave a stray leg alive against a
-    position that no longer exists (the AMIX failure).
-
     Bounded on purpose: waiting indefinitely would be worse than a stray
-    order, because the position stays open the whole time. Returns
-    (clear, remaining) and the caller proceeds either way."""
+    order, because the position stays open the whole time."""
     deadline = time.time() + timeout_s
     remaining = []
     while True:
@@ -491,20 +459,13 @@ def position_gone(symbol):
 
 
 def close_position_with_retry(symbol, reason, attempts=3, delay=1.0):
-    """Closes a position, retrying on failure.
-
-    A close that fails AFTER the legs were cancelled leaves an unprotected
-    position, so a single attempt is not good enough. If every attempt fails
-    the symbol is registered for the manager thread to keep retrying rather
-    than being abandoned with a log line."""
+    """Closes a position, retrying on failure. A close that fails AFTER the
+    legs were cancelled leaves an unprotected position."""
     for attempt in range(1, attempts + 1):
         try:
             trading_client.close_position(symbol)
             return True
         except Exception as e:
-            # The stop leg may have filled during the verify window. That is
-            # a normal outcome, not a failure -- the position is flat either
-            # way, which is what was wanted.
             if position_gone(symbol):
                 logger.info(f"[EXIT] {symbol} — already flat before close completed ({reason})")
                 return True
@@ -524,10 +485,6 @@ def close_position_with_retry(symbol, reason, attempts=3, delay=1.0):
 
 # ============================================================
 # Position manager — housekeeping only.
-#
-# It does NOT compute a trail, a breakeven, or a high-water mark. Those
-# live in Pine. What remains: heartbeat, EOD flatten, stale entry cleanup,
-# naked-position watchdog, exit/P&L logging, and the [ORDERS] diagnostic.
 # ============================================================
 def position_manager_loop():
     last_equity_log = 0.0
@@ -538,6 +495,7 @@ def position_manager_loop():
     open_positions_tracked = {}
     cancel_requested_order_ids = set()
     naked_streak = {}
+    manual_reminder_sent = set()
 
     while True:
         try:
@@ -546,10 +504,13 @@ def position_manager_loop():
             now = time.time()
             now_ny_dt = datetime.now(NY_TZ)
 
-            # EOD flatten at 15:55 ET. Keyed off the NEW YORK date: the
+            # EOD flatten at 15:55 ET, keyed off the NEW YORK date: the
             # operator is in Melbourne where one US session spans two local
-            # dates (open ~23:30, flatten ~05:55 next day), so a local-date
-            # key would roll over mid-session.
+            # dates, so a local-date key would roll over mid-session.
+            #
+            # This also catches a manual premarket position the operator
+            # forgot about, which is the main automated backstop those
+            # entries have.
             current_date_str = now_ny_dt.strftime("%Y-%m-%d")
             eod_target_time = datetime.strptime("15:55", "%H:%M").time()
 
@@ -558,14 +519,9 @@ def position_manager_loop():
                 try:
                     trading_client.close_all_positions(cancel_orders=True)
                     send_alert("[EOD] Successfully closed all positions.")
-                    # Give close detection a cycle to log the final exits
-                    # before the per-signal tally is printed and cleared.
                     time.sleep(3)
                     log_reject_summary()
                     log_signal_summary()
-                    # Only mark done on SUCCESS. Setting this unconditionally
-                    # would let one transient failure silently stop the bot
-                    # from ever retrying for the rest of the day.
                     eod_flatten_triggered_date = current_date_str
                 except Exception as e:
                     if time.time() - last_eod_failure_alert >= 60:
@@ -583,9 +539,6 @@ def position_manager_loop():
                 except Exception as e:
                     logger.warning(f"Failed to log account equity: {e}")
 
-            # Retry any close that failed earlier. Highest priority in the
-            # cycle: these are positions whose protective stop was already
-            # cancelled, so every second they stay open is unhedged.
             with force_close_lock:
                 stuck = list(force_close_symbols)
             for sym in stuck:
@@ -604,22 +557,13 @@ def position_manager_loop():
             positions = trading_client.get_all_positions()
             current_symbols = {p.symbol for p in positions}
 
-            # Close detection. Anything tracked that is no longer open just
-            # closed -- via TP, native stop, our own exit, or EOD flatten.
+            # Close detection.
             for symbol in set(open_positions_tracked.keys()) - current_symbols:
                 info = open_positions_tracked.pop(symbol)
                 sig = info.get("signal", DEFAULT_SIGNAL_TAG)
                 try:
-                    # 'after' is the hard fix: only orders submitted after THIS
-                    # position was first observed can possibly be its exit.
-                    # Without it, a stale closed order from an earlier session
-                    # got mistaken for this trade's exit (EHGO logged a bogus
-                    # +39.3% win that matched no real order).
                     lookback_start = info["opened_at"] - timedelta(minutes=5)
 
-                    # Retry: Alpaca's closed-orders endpoint can lag a fill that
-                    # just happened. A single lookup missed BTCT's real 594-share
-                    # stop fill and logged "unavailable" instead of the price.
                     exit_order = None
                     for attempt in range(3):
                         recent = trading_client.get_orders(
@@ -643,8 +587,6 @@ def position_manager_loop():
                         qty = float(exit_order.filled_qty or info["qty"])
                         pl = (exit_price - info["entry_price"]) * qty
                         pl_pct = ((exit_price / info["entry_price"]) - 1) * 100
-                        # filled_at is UTC. Printing it raw made every exit look
-                        # ~4 hours outside the entry window.
                         exit_time = (
                             exit_order.filled_at.astimezone(NY_TZ).strftime("%H:%M:%S")
                             if exit_order.filled_at
@@ -674,12 +616,10 @@ def position_manager_loop():
                 symbol_error_counts[symbol] = 0
                 symbol_alert_cooldown.pop(symbol, None)
                 pending_signal_types.pop(symbol, None)
+                manual_reminder_sent.discard(symbol)
+                unmark_manual(symbol)
                 forget_stop_leg(symbol)
 
-            # qty and entry_price are refreshed EVERY cycle, not just on first
-            # sight. A large order on a thin symbol fills via several partials
-            # over seconds; polling once locked in an early partial as "the"
-            # size (MMA's real 1210 shares were tracked as 376).
             for p in positions:
                 if p.symbol not in open_positions_tracked:
                     open_positions_tracked[p.symbol] = {
@@ -694,10 +634,22 @@ def position_manager_loop():
 
             all_open_orders = flatten_orders(get_open_orders())
 
-            # Naked-position watchdog. A position with no live stop is the
-            # one state that must never pass silently. Two consecutive misses
-            # rather than one, so a momentary lookup blip is not alarming.
+            # Naked-position watchdog.
+            #
+            # A BRACKET position with no live stop is an emergency and keeps
+            # alerting. A MANUAL position has no stop by design, so it gets
+            # ONE reminder instead — the operator already knows, and an alert
+            # that fires every cycle is an alert nobody reads.
             for p in positions:
+                if is_manual(p.symbol):
+                    if p.symbol not in manual_reminder_sent:
+                        manual_reminder_sent.add(p.symbol)
+                        send_alert(
+                            f"[MANUAL] {p.symbol} filled premarket with NO protective stop (qty {p.qty}). "
+                            f"Set the stop and target by hand. EOD flatten at 15:55 ET is the only "
+                            f"automated backstop."
+                        )
+                    continue
                 try:
                     live_stops = get_stop_orders(p.symbol)
                 except Exception:
@@ -715,25 +667,20 @@ def position_manager_loop():
                 if sym not in current_symbols:
                     naked_streak.pop(sym, None)
 
-            # DIAGNOSTIC: while a position is open, dump what the manager can
-            # actually see. On 20 Aug the stop legs were invisible to this
-            # loop across six trades and nothing said so.
             if positions and (now - last_orders_debug) >= ORDERS_DEBUG_INTERVAL_SECONDS:
                 stop_orders = [o for o in all_open_orders if o.type == OrderType.STOP]
                 logger.info(
                     f"[ORDERS] visible={[(o.symbol, str(o.type).split('.')[-1], str(o.status).split('.')[-1], str(o.stop_price)) for o in all_open_orders]} "
                     f"| stop_legs={[(o.symbol, str(o.stop_price)) for o in stop_orders]} "
                     f"| positions={[p.symbol for p in positions]} "
+                    f"| manual={sorted(manual_managed_symbols)} "
                     f"| remembered_legs={dict(stop_leg_ids)}"
                 )
                 last_orders_debug = now
 
             cancel_requested_order_ids &= {o.id for o in all_open_orders}
 
-            # Stale entry cleanup. Cancel is REQUESTED once per order --
-            # Alpaca processes cancellation asynchronously, so an order can
-            # still show open for a cycle or two afterwards; re-issuing every
-            # cycle just spams false [CRIT] alerts.
+            # Stale entry cleanup.
             for o in all_open_orders:
                 if o.side == OrderSide.BUY:
                     age = (datetime.now(timezone.utc) - o.created_at).total_seconds()
@@ -741,11 +688,11 @@ def position_manager_loop():
                         try:
                             retry_cancel_order(o.id)
                             cancel_requested_order_ids.add(o.id)
-                            # The signal tag was staged at submit time and is
-                            # only cleared on close detection. An entry that
-                            # never fills never closes, so without this the tag
-                            # leaks and mislabels the NEXT trade on that symbol.
+                            # An entry that never fills never closes, so
+                            # without this the tag and the manual flag leak
+                            # and mislabel the next trade on that symbol.
                             pending_signal_types.pop(o.symbol, None)
+                            unmark_manual(o.symbol)
                             send_alert(
                                 f"[TIMEOUT] Requested cancel for stale unfilled entry for {o.symbol} "
                                 f"after {age:.0f}s — slot frees once Alpaca confirms."
@@ -785,18 +732,17 @@ signal.signal(signal.SIGTERM, handle_shutdown)
 
 
 def log_startup_config():
-    """Every live risk parameter at boot. Railway env vars drift from the
-    defaults in this file, and a strategy tuned against numbers that were
-    not the ones running is worthless."""
     logger.info(
-        f"[CONFIG] entry_window={TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET | "
-        f"equity_fraction={EQUITY_FRACTION} | max_concurrent={MAX_CONCURRENT_POSITIONS} | "
-        f"max_stop_dist={MAX_STOP_DISTANCE_PCT}% | entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | "
-        f"default_signal_tag={DEFAULT_SIGNAL_TAG}"
+        f"[CONFIG] bracket_window={TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET | "
+        f"premarket_manual_window={PREMARKET_WINDOW_START}-{PREMARKET_WINDOW_END} ET | "
+        f"equity_fraction={EQUITY_FRACTION} manual_fraction={MANUAL_EQUITY_FRACTION} | "
+        f"max_concurrent={MAX_CONCURRENT_POSITIONS} | max_stop_dist={MAX_STOP_DISTANCE_PCT}% | "
+        f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | default_signal_tag={DEFAULT_SIGNAL_TAG}"
     )
     logger.info(
-        "[CONFIG] Trail, exit level and high-water mark are owned by Pine. "
-        "This process computes no price levels of its own."
+        "[CONFIG] Manual premarket entries carry NO protective stop — Alpaca rejects stop "
+        "orders outside regular hours. The operator sets stop and target by hand; EOD "
+        "flatten at 15:55 ET is the only automated backstop."
     )
 
 
@@ -817,6 +763,7 @@ def health():
         "build": BUILD_TAG,
         "heartbeat_age": round(heartbeat_age, 2),
         "positions": positions_count,
+        "manual_positions": sorted(manual_managed_symbols),
         "uptime_hours": round((time.time() - bot_start_time) / 3600.0, 2),
         "now_et": datetime.now(NY_TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "now_melbourne": datetime.now(MEL_TZ).strftime("%Y-%m-%d %H:%M:%S"),
@@ -832,8 +779,6 @@ def reject_summary():
 
 @app.route("/signal-summary", methods=["GET"])
 def signal_summary():
-    """Live per-trigger tally without waiting for EOD. Read-only — it does
-    NOT clear the counters, unlike the EOD summary."""
     with signal_stats_lock:
         return {k: dict(v) for k, v in signal_stats.items()}, 200
 
@@ -844,42 +789,62 @@ def signal_summary():
 def handle_entry(data, symbol, signal_type, start_time):
     try:
         entry_limit = float(data["entry_limit"])
-        stop_loss = float(data["stop_loss"])
-        take_profit = float(data["take_profit"])
     except (KeyError, ValueError, TypeError) as e:
         return reject("MALFORMED", symbol, f"malformed entry payload — {e}",
                       http_status=400, sig=signal_type)
 
-    # Window first, so a signal that is BOTH out of window and badly formed
-    # logs the real first-order reason instead of hiding it.
-    if not within_trading_window():
-        now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
-        return reject(
-            "WINDOW", symbol,
-            f"arrived at {now_ny_str} ET, outside {TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET "
-            f"(entry={entry_limit}, sl={stop_loss}, tp={take_profit})",
-            sig=signal_type,
-        )
+    # take_profit / stop_loss are optional on a manual entry.
+    try:
+        stop_loss = float(data.get("stop_loss", 0) or 0)
+        take_profit = float(data.get("take_profit", 0) or 0)
+    except (ValueError, TypeError) as e:
+        return reject("MALFORMED", symbol, f"malformed tp/sl values — {e}",
+                      http_status=400, sig=signal_type)
 
-    if not stop_loss > 0:
-        return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})", sig=signal_type)
-    if not stop_loss < entry_limit:
-        return reject("SL_GE_ENTRY", symbol, f"stop_loss ({stop_loss}) must be below entry ({entry_limit})",
-                      sig=signal_type)
-    if take_profit == 0.0:
-        return reject("TP_NOT_SET", symbol, "take_profit is 0.0 — target not set on this ticker's chart",
-                      sig=signal_type)
-    if not entry_limit < take_profit:
-        return reject("TP_LE_ENTRY", symbol, f"entry ({entry_limit}) must be below take_profit ({take_profit})",
-                      sig=signal_type)
+    # Manual mode: explicitly requested, or implied by both legs being zero.
+    managed = str(data.get("managed", "")).lower()
+    manual_mode = managed == "manual" or (stop_loss == 0 and take_profit == 0)
 
-    stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
-    if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
-        return reject(
-            "STOP_TOO_WIDE", symbol,
-            f"stop distance {stop_distance_pct:.2f}% exceeds MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}%",
-            sig=signal_type,
-        )
+    if manual_mode:
+        if not within_premarket_window():
+            now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
+            return reject(
+                "PREMARKET_WINDOW", symbol,
+                f"manual entry arrived at {now_ny_str} ET, outside "
+                f"{PREMARKET_WINDOW_START}-{PREMARKET_WINDOW_END} ET (entry={entry_limit})",
+                sig=signal_type,
+            )
+        if entry_limit <= 0:
+            return reject("ENTRY_INVALID", symbol, f"entry_limit must be positive (got {entry_limit})",
+                          sig=signal_type)
+    else:
+        if not within_trading_window():
+            now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
+            return reject(
+                "WINDOW", symbol,
+                f"arrived at {now_ny_str} ET, outside {TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET "
+                f"(entry={entry_limit}, sl={stop_loss}, tp={take_profit})",
+                sig=signal_type,
+            )
+        if not stop_loss > 0:
+            return reject("SL_INVALID", symbol, f"stop_loss must be positive (got {stop_loss})", sig=signal_type)
+        if not stop_loss < entry_limit:
+            return reject("SL_GE_ENTRY", symbol, f"stop_loss ({stop_loss}) must be below entry ({entry_limit})",
+                          sig=signal_type)
+        if take_profit == 0.0:
+            return reject("TP_NOT_SET", symbol, "take_profit is 0.0 — target not set on this ticker's chart",
+                          sig=signal_type)
+        if not entry_limit < take_profit:
+            return reject("TP_LE_ENTRY", symbol, f"entry ({entry_limit}) must be below take_profit ({take_profit})",
+                          sig=signal_type)
+
+        stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
+        if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
+            return reject(
+                "STOP_TOO_WIDE", symbol,
+                f"stop distance {stop_distance_pct:.2f}% exceeds MAX_STOP_DISTANCE_PCT={MAX_STOP_DISTANCE_PCT}%",
+                sig=signal_type,
+            )
 
     with order_lock:
         now = time.time()
@@ -909,35 +874,44 @@ def handle_entry(data, symbol, signal_type, start_time):
                           f"could not check buying power, rejecting for safety: {e}",
                           http_status=500, log_level="error", sig=signal_type)
 
-        # With a cap of 1 this is the whole equity fraction of available
-        # buying power. With a cap above 1 the allocation is divided by the
-        # cap, so the first position cannot consume the capital the second
-        # would need.
-        allocation = buying_power * EQUITY_FRACTION
+        # A manual entry has no stop, so it is sized off its own fraction.
+        fraction = MANUAL_EQUITY_FRACTION if manual_mode else EQUITY_FRACTION
+        allocation = buying_power * fraction
         if MAX_CONCURRENT_POSITIONS > 1:
-            allocation = min(allocation, (equity * EQUITY_FRACTION) / MAX_CONCURRENT_POSITIONS)
+            allocation = min(allocation, (equity * fraction) / MAX_CONCURRENT_POSITIONS)
 
         qty = int(allocation // entry_limit)
         if qty < 1:
             return reject("INSUFFICIENT_BP", symbol,
                           f"allocation ${allocation:.2f} insufficient at entry={entry_limit} "
-                          f"(bp=${buying_power:.2f}, cap={MAX_CONCURRENT_POSITIONS})",
+                          f"(bp=${buying_power:.2f}, fraction={fraction})",
                           sig=signal_type)
 
         try:
-            # BRACKET: entry + take_profit + native stop, submitted together.
-            # Alpaca links TP and SL as OCO siblings natively -- whichever
-            # fires, the other is auto-cancelled on their side.
-            order = LimitOrderRequest(
-                symbol=symbol,
-                qty=qty,
-                side=OrderSide.BUY,
-                time_in_force=TimeInForce.DAY,
-                limit_price=round_tick(entry_limit),
-                order_class=OrderClass.BRACKET,
-                take_profit=TakeProfitRequest(limit_price=round_tick(take_profit)),
-                stop_loss=StopLossRequest(stop_price=round_tick(stop_loss)),
-            )
+            if manual_mode:
+                # PLAIN LIMIT, extended hours. Alpaca requires TIF=DAY for
+                # extended-hours orders and refuses bracket/OCO entirely
+                # outside regular hours, which is why there are no legs.
+                order = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round_tick(entry_limit),
+                    extended_hours=True,
+                )
+            else:
+                order = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round_tick(entry_limit),
+                    order_class=OrderClass.BRACKET,
+                    take_profit=TakeProfitRequest(limit_price=round_tick(take_profit)),
+                    stop_loss=StopLossRequest(stop_price=round_tick(stop_loss)),
+                )
+
             submitted = trading_client.submit_order(order)
             recent_signals[dedupe_key] = now
             pending_signal_types[symbol] = signal_type
@@ -945,24 +919,34 @@ def handle_entry(data, symbol, signal_type, start_time):
             with signal_stats_lock:
                 signal_stats[signal_type]["entries"] += 1
 
-            # Capture the stop leg's id now, while the submit response still
-            # contains it. Waiting until a stop_update arrives is too late --
-            # by then the list endpoint has stopped returning it.
-            captured = remember_stop_leg(symbol, submitted)
-            if captured is None:
-                logger.warning(
-                    f"[LEG] {symbol} submit response contained no STOP leg — "
-                    f"stop_update will have to fall back to scanning the order list"
-                )
+            if manual_mode:
+                mark_manual(symbol)
+            else:
+                unmark_manual(symbol)
+                captured = remember_stop_leg(symbol, submitted)
+                if captured is None:
+                    logger.warning(
+                        f"[LEG] {symbol} submit response contained no STOP leg — "
+                        f"stop_update will have to fall back to scanning the order list"
+                    )
 
             latency_ms = (time.time() - start_time) * 1000
             note = "" if abs(buying_power - equity) < 1.0 else f" [WARN: BP/equity {buying_power / equity:.2f}x]"
-            send_alert(
-                f"[ENTRY] {symbol} [{signal_type}] qty={qty} limit={entry_limit} TP={take_profit} "
-                f"SL={stop_loss} (stop dist {stop_distance_pct:.2f}%) | equity=${equity:.2f} "
-                f"bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
-                f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
-            )
+            if manual_mode:
+                send_alert(
+                    f"[ENTRY-MANUAL] {symbol} [{signal_type}] qty={qty} limit={entry_limit} "
+                    f"extended_hours=True NO TP/SL — SET THEM BY HAND ONCE FILLED | "
+                    f"equity=${equity:.2f} bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
+                    f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
+                )
+            else:
+                stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
+                send_alert(
+                    f"[ENTRY] {symbol} [{signal_type}] qty={qty} limit={entry_limit} TP={take_profit} "
+                    f"SL={stop_loss} (stop dist {stop_distance_pct:.2f}%) | equity=${equity:.2f} "
+                    f"bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
+                    f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
+                )
         except Exception as e:
             send_alert(f"[CRIT] Failed to submit entry order for {symbol}: {e}")
             return "Order submission failed", 500
@@ -975,11 +959,7 @@ def handle_entry(data, symbol, signal_type, start_time):
 # ============================================================
 def handle_stop_update(data, symbol):
     """Replaces the native stop leg's price. Pine has already decided the
-    level from TradingView data; this only moves the order.
-
-    NO POSITION means Pine believes it is in a trade that never filled --
-    Pine cannot see the Alpaca account, so this WILL happen and must be a
-    quiet no-op rather than an error."""
+    level from TradingView data; this only moves the order."""
     sig = pending_signal_types.get(symbol)
 
     try:
@@ -987,6 +967,12 @@ def handle_stop_update(data, symbol):
     except (KeyError, ValueError, TypeError) as e:
         return reject("MALFORMED", symbol, f"malformed stop_update payload — {e}",
                       http_status=400, sig=sig)
+
+    if is_manual(symbol):
+        return reject("MANUAL_POSITION", symbol,
+                      f"stop_update to ${stop_price} ignored — {symbol} was entered manually "
+                      f"and has no bot-managed stop leg",
+                      log_level="debug", sig=sig)
 
     try:
         position = get_position(symbol)
@@ -1020,17 +1006,10 @@ def handle_stop_update(data, symbol):
             continue
         try:
             replaced = retry_replace_order(o.id, ReplaceOrderRequest(stop_price=stop_price))
-            # A replace supersedes the order and issues a NEW id. Without
-            # this the map would still point at the replaced order and every
-            # later ratchet would fall back to the broken list scan.
             new_id = getattr(replaced, "id", None)
             if new_id is not None:
                 with stop_leg_lock:
                     stop_leg_ids[symbol] = new_id
-            # Log all three values. Alpaca can round or adjust what it
-            # accepts, and "requested 18.42, accepted 18.42" vs
-            # "requested 18.42, accepted 18.11" is the difference between a
-            # working trail and one that silently is not moving.
             accepted = getattr(replaced, "stop_price", None)
             accepted_str = f"${float(accepted):.4f}" if accepted is not None else "unconfirmed"
             logger.info(
@@ -1043,9 +1022,12 @@ def handle_stop_update(data, symbol):
             return "Stop replace failed", 500
 
     if moved == 0:
+        # Logged at INFO, not debug: silence here is indistinguishable from
+        # Pine never sending anything, which is exactly the ambiguity that
+        # made the trail impossible to verify.
         return reject("STOP_NOT_HIGHER", symbol,
                       f"requested ${stop_price} is not above the current stop — no change",
-                      log_level="debug", sig=sig)
+                      sig=sig)
 
     return "Success", 200
 
@@ -1054,11 +1036,9 @@ def handle_stop_update(data, symbol):
 # EXIT
 # ============================================================
 def handle_exit(data, symbol):
-    """Closes the position at market. Pine fires this on a confirmed close
-    below the exit level, or at session end.
-
-    Legs are cancelled BEFORE the close. Closing while a bracket sibling
-    still rests is what produced the AMIX stray order."""
+    """Closes the position at market. Legs are cancelled BEFORE the close —
+    closing while a bracket sibling still rests is what produced the AMIX
+    stray order."""
     reason = str(data.get("reason", "unspecified"))
     sig = pending_signal_types.get(symbol)
 
@@ -1069,8 +1049,6 @@ def handle_exit(data, symbol):
                       http_status=500, log_level="error", sig=sig)
 
     if position is None:
-        # No position, but a pending entry may still be resting. Pine has
-        # decided the setup is dead, so that entry should not fill either.
         try:
             pending = [o for o in flatten_orders(get_open_orders(symbol)) if o.side == OrderSide.BUY]
         except Exception:
@@ -1082,6 +1060,7 @@ def handle_exit(data, symbol):
                 except Exception as e:
                     logger.warning(f"Could not cancel pending entry {o.id} for {symbol}: {e}")
             pending_signal_types.pop(symbol, None)
+            unmark_manual(symbol)
             send_alert(f"[EXIT] {symbol} — no position; cancelled {len(pending)} pending entry order(s) ({reason})")
             return "Success", 200
         return reject("NO_POSITION", symbol, f"exit ({reason}) ignored — nothing open",
@@ -1090,9 +1069,6 @@ def handle_exit(data, symbol):
     qty = position.qty
     cancelled = cancel_resting_legs(symbol)
 
-    # Cancellation is asynchronous. Confirm the legs are actually gone before
-    # submitting the market close, rather than assuming the accepted cancel
-    # requests took effect immediately.
     clear, remaining = verify_legs_cancelled(symbol)
     if not clear and remaining:
         logger.warning(
@@ -1101,6 +1077,7 @@ def handle_exit(data, symbol):
         )
 
     if close_position_with_retry(symbol, reason):
+        unmark_manual(symbol)
         send_alert(
             f"[EXIT] {symbol} [{sig or '-'}] — closing {qty} shares at market ({reason}); "
             f"cancelled {cancelled} resting leg(s), legs_clear={clear}"
@@ -1123,8 +1100,6 @@ def webhook():
 
     data = request.get_json(force=True, silent=True)
     if not data:
-        # Usually TradingView's periodic connectivity test pings, not real
-        # signals. Tallied separately so they don't pollute the summary.
         return reject("NO_JSON", "-", "no/invalid JSON body received", http_status=400)
 
     if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
