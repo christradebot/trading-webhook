@@ -143,7 +143,69 @@ MANUAL_EQUITY_FRACTION = float(os.getenv("MANUAL_EQUITY_FRACTION", "0.50"))
 
 ORDERS_DEBUG_INTERVAL_SECONDS = int(os.getenv("ORDERS_DEBUG_INTERVAL_SECONDS", "30"))
 
-DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "RF_FLIP")
+# Earlier than the old 15:55 so a failed close has room to retry while the
+# market is still open. A market order submitted at 16:00 does not fill.
+EOD_FLATTEN_TIME = os.getenv("EOD_FLATTEN_TIME", "15:45")
+
+DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "UNTAGGED")
+
+# Which strategies may trade, and by which route.
+#
+# This exists because Pine scripts are switched on and off in TradingView, not
+# here. An alert left live on a retired script will keep firing, and without
+# this the bot would happily trade it. Confirmed live 22 Sep: a KST RTH entry
+# was rejected on the concurrency cap, the Pine script did not know, and it
+# later sent an exit that closed an unrelated premarket position.
+#
+# Prefix match, so LOW_TEST_1 and LOW_TEST_5 are both covered by LOW_TEST.
+# Set either list to "*" to accept anything on that route.
+MANUAL_SIGNALS = [t.strip().upper() for t in os.getenv(
+    "MANUAL_SIGNALS", "KST_X,LOW_TEST,HTF_REVERSAL").split(",") if t.strip()]
+BRACKET_SIGNALS = [t.strip().upper() for t in os.getenv(
+    "BRACKET_SIGNALS", "KST_X").split(",") if t.strip()]
+
+
+ENFORCE_SIGNAL_OWNERSHIP = os.getenv("ENFORCE_SIGNAL_OWNERSHIP", "True") == "True"
+
+
+def owns_position(symbol, data):
+    """Is the sender of this message the script that opened the position?
+
+    A Pine script cannot see whether its entry was accepted. If the bot
+    rejected it — concurrency cap, window, buying power — the script still
+    believes it is in a trade, manages the phantom, and eventually sends an
+    exit. That exit would otherwise close whatever real position exists on the
+    symbol, which is exactly what happened on 22 Sep: a rejected KST RTH entry
+    later closed an unrelated premarket LOW_TEST position in GRML.
+
+    Returns (ok, reason). Messages with no signal tag are allowed through, so
+    older scripts keep working.
+    """
+    if not ENFORCE_SIGNAL_OWNERSHIP:
+        return True, None
+
+    claimed = str(data.get("signal", "")).upper()
+    if not claimed:
+        return True, None
+
+    owner = pending_signal_types.get(symbol)
+    if owner is None:
+        return True, None
+
+    if claimed != owner:
+        return False, (
+            f"'{claimed}' does not own this position — it was opened by "
+            f"'{owner}'. Ignoring so a phantom position cannot close a real one"
+        )
+    return True, None
+
+
+def signal_allowed(signal_type, manual_mode):
+    """True if this tag is permitted on this route."""
+    allowed = MANUAL_SIGNALS if manual_mode else BRACKET_SIGNALS
+    if "*" in allowed:
+        return True
+    return any(signal_type.startswith(prefix) for prefix in allowed)
 
 order_lock = threading.Lock()
 
@@ -374,6 +436,16 @@ def get_stop_orders(symbol):
     return stops
 
 
+def position_count_safe():
+    """Open position count, or -1 if it cannot be determined. Used by the EOD
+    flatten, which must not mark the day complete on a failed lookup."""
+    try:
+        return len(trading_client.get_all_positions())
+    except Exception as e:
+        logger.warning(f"Could not count positions: {e}")
+        return -1
+
+
 def open_exposure_count():
     """How many slots are consumed: open positions plus resting unfilled
     entries, counted as distinct symbols."""
@@ -504,28 +576,91 @@ def position_manager_loop():
             now = time.time()
             now_ny_dt = datetime.now(NY_TZ)
 
-            # EOD flatten at 15:55 ET, keyed off the NEW YORK date: the
-            # operator is in Melbourne where one US session spans two local
-            # dates, so a local-date key would roll over mid-session.
+            # EOD flatten, keyed off the NEW YORK date: the operator is in
+            # Melbourne where one US session spans two local dates, so a
+            # local-date key would roll over mid-session.
             #
             # This also catches a manual premarket position the operator
             # forgot about, which is the main automated backstop those
             # entries have.
+            #
+            # WHY NOT close_all_positions(cancel_orders=True): it did not
+            # reliably cancel first. Confirmed live 22 Sep — TOPS held 420
+            # shares behind a live bracket (take-profit at 3.20, stop at
+            # 0.8773). The market sell was submitted at 16:00 ET and filled
+            # ZERO, because the resting legs still reserved the shares. The
+            # position carried overnight.
+            #
+            # So the flatten now does per-symbol what the manual exit path
+            # already does and has been proven on: cancel the legs, verify
+            # they are gone, then close with retries. It also starts earlier,
+            # so there is room to retry while the market is still open.
             current_date_str = now_ny_dt.strftime("%Y-%m-%d")
-            eod_target_time = datetime.strptime("15:55", "%H:%M").time()
+            eod_target_time = datetime.strptime(EOD_FLATTEN_TIME, "%H:%M").time()
 
             if now_ny_dt.time() >= eod_target_time and eod_flatten_triggered_date != current_date_str:
-                send_alert("[EOD] Reached 15:55 ET. Flattening all positions and cancelling open orders.")
                 try:
-                    trading_client.close_all_positions(cancel_orders=True)
-                    send_alert("[EOD] Successfully closed all positions.")
-                    time.sleep(3)
-                    log_reject_summary()
-                    log_signal_summary()
-                    eod_flatten_triggered_date = current_date_str
+                    eod_positions = trading_client.get_all_positions()
                 except Exception as e:
+                    eod_positions = None
                     if time.time() - last_eod_failure_alert >= 60:
-                        send_alert(f"[CRIT] EOD Flatten failed: {e} — retrying every cycle until it succeeds.")
+                        send_alert(f"[CRIT] EOD could not list positions: {e} — retrying.")
+                        last_eod_failure_alert = time.time()
+
+                if eod_positions is not None:
+                    if eod_positions:
+                        send_alert(
+                            f"[EOD] Reached {EOD_FLATTEN_TIME} ET. Flattening "
+                            f"{len(eod_positions)} position(s): "
+                            f"{[p.symbol for p in eod_positions]}"
+                        )
+
+                    all_flat = True
+                    for p in eod_positions:
+                        sym = p.symbol
+                        cancelled = cancel_resting_legs(sym)
+                        clear, remaining = verify_legs_cancelled(sym)
+                        if not clear and remaining:
+                            send_alert(
+                                f"[EOD] {sym} — {len(remaining)} sell leg(s) still visible after "
+                                f"cancel; closing anyway. A live leg reserves the shares and the "
+                                f"market order fills ZERO."
+                            )
+                        if close_position_with_retry(sym, "eod_flatten"):
+                            send_alert(
+                                f"[EOD] {sym} — closed {p.qty} shares "
+                                f"(cancelled {cancelled} leg(s), legs_clear={clear})"
+                            )
+                        else:
+                            all_flat = False
+
+                    # Cancel anything still resting once the positions are out:
+                    # unfilled entries, orphaned legs.
+                    try:
+                        leftovers = flatten_orders(get_open_orders())
+                        for o in leftovers:
+                            try:
+                                retry_cancel_order(o.id)
+                            except Exception as e:
+                                logger.warning(f"[EOD] could not cancel {o.id} for {o.symbol}: {e}")
+                        if leftovers:
+                            send_alert(f"[EOD] Cancelled {len(leftovers)} remaining open order(s).")
+                    except Exception as e:
+                        logger.warning(f"[EOD] could not list open orders: {e}")
+
+                    # Only mark the day done when the account is actually flat,
+                    # so a failure keeps retrying instead of being forgotten.
+                    if all_flat and position_count_safe() == 0:
+                        send_alert("[EOD] Account is flat.")
+                        time.sleep(3)
+                        log_reject_summary()
+                        log_signal_summary()
+                        eod_flatten_triggered_date = current_date_str
+                    elif time.time() - last_eod_failure_alert >= 60:
+                        send_alert(
+                            "[CRIT] EOD flatten incomplete — still holding. Retrying every cycle. "
+                            "If this persists past the close the position carries overnight."
+                        )
                         last_eod_failure_alert = time.time()
 
             if now - last_equity_log >= 3600:
@@ -646,7 +781,7 @@ def position_manager_loop():
                         manual_reminder_sent.add(p.symbol)
                         send_alert(
                             f"[MANUAL] {p.symbol} filled premarket with NO protective stop (qty {p.qty}). "
-                            f"Set the stop and target by hand. EOD flatten at 15:55 ET is the only "
+                            f"Set the stop and target by hand. EOD flatten at {EOD_FLATTEN_TIME} ET is the only "
                             f"automated backstop."
                         )
                     continue
@@ -737,12 +872,23 @@ def log_startup_config():
         f"premarket_manual_window={PREMARKET_WINDOW_START}-{PREMARKET_WINDOW_END} ET | "
         f"equity_fraction={EQUITY_FRACTION} manual_fraction={MANUAL_EQUITY_FRACTION} | "
         f"max_concurrent={MAX_CONCURRENT_POSITIONS} | max_stop_dist={MAX_STOP_DISTANCE_PCT}% | "
-        f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | default_signal_tag={DEFAULT_SIGNAL_TAG}"
+        f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | eod_flatten={EOD_FLATTEN_TIME} ET | "
+        f"default_signal_tag={DEFAULT_SIGNAL_TAG}"
+    )
+    logger.info(
+        f"[CONFIG] signals allowed — manual/premarket: {', '.join(MANUAL_SIGNALS)} | "
+        f"bracket/RTH: {', '.join(BRACKET_SIGNALS)}. Anything else is rejected as "
+        f"SIGNAL_NOT_ALLOWED."
+    )
+    logger.info(
+        f"[CONFIG] exit/stop_update ownership check: "
+        f"{'ON' if ENFORCE_SIGNAL_OWNERSHIP else 'OFF'} — a tagged message is "
+        f"ignored unless it matches the signal that opened the position."
     )
     logger.info(
         "[CONFIG] Manual premarket entries carry NO protective stop — Alpaca rejects stop "
         "orders outside regular hours. The operator sets stop and target by hand; EOD "
-        "flatten at 15:55 ET is the only automated backstop."
+        f"flatten at {EOD_FLATTEN_TIME} ET is the only automated backstop."
     )
 
 
@@ -804,6 +950,17 @@ def handle_entry(data, symbol, signal_type, start_time):
     # Manual mode: explicitly requested, or implied by both legs being zero.
     managed = str(data.get("managed", "")).lower()
     manual_mode = managed == "manual" or (stop_loss == 0 and take_profit == 0)
+
+    # Whitelist first — a tag that is not being traded never reaches the broker.
+    if not signal_allowed(signal_type, manual_mode):
+        route = "manual/premarket" if manual_mode else "bracket/RTH"
+        allowed = MANUAL_SIGNALS if manual_mode else BRACKET_SIGNALS
+        return reject(
+            "SIGNAL_NOT_ALLOWED", symbol,
+            f"'{signal_type}' is not permitted on the {route} route "
+            f"(allowed: {', '.join(allowed)}) — check for a stale TradingView alert",
+            sig=signal_type,
+        )
 
     if manual_mode:
         if not within_premarket_window():
@@ -968,6 +1125,11 @@ def handle_stop_update(data, symbol):
         return reject("MALFORMED", symbol, f"malformed stop_update payload — {e}",
                       http_status=400, sig=sig)
 
+    owned, why = owns_position(symbol, data)
+    if not owned:
+        return reject("NOT_OWNER", symbol, f"stop_update to ${stop_price} ignored — {why}",
+                      sig=sig)
+
     if is_manual(symbol):
         return reject("MANUAL_POSITION", symbol,
                       f"stop_update to ${stop_price} ignored — {symbol} was entered manually "
@@ -1041,6 +1203,11 @@ def handle_exit(data, symbol):
     stray order."""
     reason = str(data.get("reason", "unspecified"))
     sig = pending_signal_types.get(symbol)
+
+    owned, why = owns_position(symbol, data)
+    if not owned:
+        return reject("NOT_OWNER", symbol, f"exit ({reason}) ignored — {why}",
+                      sig=str(data.get("signal", "")).upper() or sig)
 
     try:
         position = get_position(symbol)
