@@ -136,12 +136,27 @@ EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
 # applies to bracket entries, where a stop price is actually supplied.
 MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
 
+# Alpaca refuses a bracket whose stop is not at least one cent below the entry:
+#   "stop_loss.stop_price must be <= base_price - 0.01"
+# Confirmed live 24 Sep on DCX at $0.0553 — a 1.5% buffer is under a tenth of a
+# cent there, so the order was rejected four times and nothing traded.
+#
+# The bot widens the stop to meet the minimum rather than failing at the
+# broker. On a cheap enough stock one cent is a large percentage, so the
+# existing MAX_STOP_DISTANCE_PCT check then rejects it cleanly with a readable
+# reason instead of a [CRIT] submission error.
+MIN_STOP_GAP = float(os.getenv("MIN_STOP_GAP", "0.01"))
+
 # Manual premarket entries are unprotected by design. This caps how much
 # of the account can sit in one, independently of EQUITY_FRACTION, because
 # "full size with no stop" is a different risk from "full size with a stop".
 MANUAL_EQUITY_FRACTION = float(os.getenv("MANUAL_EQUITY_FRACTION", "0.50"))
 
 ORDERS_DEBUG_INTERVAL_SECONDS = int(os.getenv("ORDERS_DEBUG_INTERVAL_SECONDS", "30"))
+
+# The [ORDERS] snapshot prints when it CHANGES. This is only the fallback
+# heartbeat so a long quiet hold still shows the bot is watching.
+ORDERS_HEARTBEAT_SECONDS = int(os.getenv("ORDERS_HEARTBEAT_SECONDS", "600"))
 
 # Earlier than the old 15:55 so a failed close has room to retry while the
 # market is still open. A market order submitted at 16:00 does not fill.
@@ -563,6 +578,7 @@ def position_manager_loop():
     eod_flatten_triggered_date = None
     last_eod_failure_alert = 0.0
     last_orders_debug = 0.0
+    last_orders_snapshot = None
 
     open_positions_tracked = {}
     cancel_requested_order_ids = set()
@@ -802,16 +818,32 @@ def position_manager_loop():
                 if sym not in current_symbols:
                     naked_streak.pop(sym, None)
 
-            if positions and (now - last_orders_debug) >= ORDERS_DEBUG_INTERVAL_SECONDS:
+            # [ORDERS] only when something actually changes, plus a heartbeat
+            # every ORDERS_HEARTBEAT_SECONDS. Printing it every cycle buried
+            # the lines that matter under hundreds of identical snapshots.
+            if positions:
                 stop_orders = [o for o in all_open_orders if o.type == OrderType.STOP]
-                logger.info(
-                    f"[ORDERS] visible={[(o.symbol, str(o.type).split('.')[-1], str(o.status).split('.')[-1], str(o.stop_price)) for o in all_open_orders]} "
-                    f"| stop_legs={[(o.symbol, str(o.stop_price)) for o in stop_orders]} "
-                    f"| positions={[p.symbol for p in positions]} "
-                    f"| manual={sorted(manual_managed_symbols)} "
-                    f"| remembered_legs={dict(stop_leg_ids)}"
+                snapshot = (
+                    tuple(sorted((o.symbol, str(o.type).split('.')[-1], str(o.status).split('.')[-1], str(o.stop_price)) for o in all_open_orders)),
+                    tuple(sorted(p.symbol for p in positions)),
+                    tuple(sorted(manual_managed_symbols)),
+                    tuple(sorted((k, str(v)) for k, v in stop_leg_ids.items())),
                 )
-                last_orders_debug = now
+                changed = snapshot != last_orders_snapshot
+                stale = (now - last_orders_debug) >= ORDERS_HEARTBEAT_SECONDS
+                if changed or stale:
+                    logger.info(
+                        f"[ORDERS] visible={[(o.symbol, str(o.type).split('.')[-1], str(o.status).split('.')[-1], str(o.stop_price)) for o in all_open_orders]} "
+                        f"| stop_legs={[(o.symbol, str(o.stop_price)) for o in stop_orders]} "
+                        f"| positions={[p.symbol for p in positions]} "
+                        f"| manual={sorted(manual_managed_symbols)} "
+                        f"| remembered_legs={dict(stop_leg_ids)}"
+                        f"{'' if changed else '  (heartbeat — unchanged)'}"
+                    )
+                    last_orders_snapshot = snapshot
+                    last_orders_debug = now
+            else:
+                last_orders_snapshot = None
 
             cancel_requested_order_ids &= {o.id for o in all_open_orders}
 
@@ -873,6 +905,7 @@ def log_startup_config():
         f"equity_fraction={EQUITY_FRACTION} manual_fraction={MANUAL_EQUITY_FRACTION} | "
         f"max_concurrent={MAX_CONCURRENT_POSITIONS} | max_stop_dist={MAX_STOP_DISTANCE_PCT}% | "
         f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | eod_flatten={EOD_FLATTEN_TIME} ET | "
+        f"min_stop_gap=${MIN_STOP_GAP:.2f} | orders_heartbeat={ORDERS_HEARTBEAT_SECONDS}s | "
         f"default_signal_tag={DEFAULT_SIGNAL_TAG}"
     )
     logger.info(
@@ -995,6 +1028,22 @@ def handle_entry(data, symbol, signal_type, start_time):
             return reject("TP_LE_ENTRY", symbol, f"entry ({entry_limit}) must be below take_profit ({take_profit})",
                           sig=signal_type)
 
+        # Alpaca's absolute minimum gap. Widen rather than let the submit fail.
+        if entry_limit - stop_loss < MIN_STOP_GAP:
+            widened = round_tick(entry_limit - MIN_STOP_GAP)
+            if widened <= 0:
+                return reject(
+                    "PRICE_TOO_LOW", symbol,
+                    f"entry {entry_limit} is below the ${MIN_STOP_GAP:.2f} minimum stop gap — "
+                    f"a bracket cannot be placed on this price",
+                    sig=signal_type,
+                )
+            logger.info(
+                f"[STOP] {symbol} stop widened {stop_loss} -> {widened} to meet Alpaca's "
+                f"${MIN_STOP_GAP:.2f} minimum gap below entry {entry_limit}"
+            )
+            stop_loss = widened
+
         stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
         if stop_distance_pct > MAX_STOP_DISTANCE_PCT:
             return reject(
@@ -1069,8 +1118,12 @@ def handle_entry(data, symbol, signal_type, start_time):
                     stop_loss=StopLossRequest(stop_price=round_tick(stop_loss)),
                 )
 
-            submitted = trading_client.submit_order(order)
+            # Recorded BEFORE the call: a submission that fails at the broker
+            # used to leave the key unset, so the same alert retrying seconds
+            # later produced a fresh attempt and another [CRIT]. DCX logged
+            # four identical failures in 20 seconds on 24 Sep.
             recent_signals[dedupe_key] = now
+            submitted = trading_client.submit_order(order)
             pending_signal_types[symbol] = signal_type
 
             with signal_stats_lock:
