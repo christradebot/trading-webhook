@@ -130,7 +130,56 @@ PREMARKET_WINDOW_END = os.getenv("PREMARKET_WINDOW_END", "09:29")
 # routes into the opening auction.
 MAX_CONCURRENT_POSITIONS = int(os.getenv("MAX_CONCURRENT_POSITIONS", "1"))
 
+# ============================================================
+# POSITION SIZING
+#
+# RISK-BASED, not equity-fraction. This is the 28 Sep change and it is the
+# single most consequential setting in the file.
+#
+# The old behaviour threw a fixed fraction of the account at every entry:
+#   qty = equity * 0.98 / entry
+# The position was always the whole account, so the LOSS was whatever the
+# stop distance happened to be. A 2.5% stop cost 2.5% of everything; a 12%
+# stop cost 12%. The market set the stop distance, so the market set the
+# risk. Live examples on a $1,000 account, all ~98% deployed:
+#   GCTK  2.83 / stop 2.76  (2.5%)  346 sh = $979
+#   IPDN  6.41 / stop 6.14  (4.2%)  152 sh = $975  -> lost $38 = 3.8% of account
+#   WETO  1.82 / stop 1.72  (5.5%)  519 sh = $945
+#
+# Now the operator sets what a loss costs and the size follows:
+#   qty = (equity * RISK_PCT/100) / (entry - stop_reference)
+# At 1% risk IPDN is 37 shares and costs $10 instead of $38. Three losers in
+# a row is 3% of the account rather than 12%.
+#
+# TWO INDEPENDENT BRAKES. The formula alone hands you an enormous position
+# when the stop is very tight (GCTK's 2.5% stop wants 40% of the account),
+# and if that one gaps through the stop the realised loss is far more than
+# RISK_PCT. So the notional is capped as well. Whichever is smaller wins.
+RISK_SIZING = os.getenv("RISK_SIZING", "True") == "True"
+
+# Brake 1 — what a loss is allowed to cost, as a % of EQUITY.
+RISK_PCT = float(os.getenv("RISK_PCT", "1.0"))
+
+# Premarket carries a lower number on purpose. Those positions have NO
+# resting stop (Alpaca refuses them outside regular hours), the exit is
+# performed by hand, and premarket fills are thin and wide — so the realised
+# loss is routinely worse than the reference distance implies. In regular
+# hours a bad outcome is bounded by an order at the exchange; premarket it is
+# bounded by whether the operator is awake.
+MANUAL_RISK_PCT = float(os.getenv("MANUAL_RISK_PCT", "0.75"))
+
+# Brake 2 — the most of the account that may sit in one position, whatever
+# the risk maths asks for.
+MAX_POSITION_PCT = float(os.getenv("MAX_POSITION_PCT", "25.0"))
+MANUAL_MAX_POSITION_PCT = float(os.getenv("MANUAL_MAX_POSITION_PCT", "20.0"))
+
+# FALLBACK ONLY. Used when RISK_SIZING is off, or when a payload arrives
+# without a usable stop reference (an older script, or a stop_ref that is not
+# below the entry). Risk sizing needs a stop distance; with none available the
+# bot has no choice but a flat fraction, so these are deliberately modest
+# rather than the old near-full-size values.
 EQUITY_FRACTION = float(os.getenv("EQUITY_FRACTION", "0.98"))
+MANUAL_EQUITY_FRACTION = float(os.getenv("MANUAL_EQUITY_FRACTION", "0.25"))
 
 # Manual entries carry no stop, so this cap cannot protect them. It only
 # applies to bracket entries, where a stop price is actually supplied.
@@ -146,11 +195,6 @@ MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
 # existing MAX_STOP_DISTANCE_PCT check then rejects it cleanly with a readable
 # reason instead of a [CRIT] submission error.
 MIN_STOP_GAP = float(os.getenv("MIN_STOP_GAP", "0.01"))
-
-# Manual premarket entries are unprotected by design. This caps how much
-# of the account can sit in one, independently of EQUITY_FRACTION, because
-# "full size with no stop" is a different risk from "full size with a stop".
-MANUAL_EQUITY_FRACTION = float(os.getenv("MANUAL_EQUITY_FRACTION", "0.50"))
 
 ORDERS_DEBUG_INTERVAL_SECONDS = int(os.getenv("ORDERS_DEBUG_INTERVAL_SECONDS", "30"))
 
@@ -378,6 +422,69 @@ def round_tick(price):
     sub-penny increment, so the stop stayed frozen while the position ran."""
     tick = 0.01 if price >= 1.0 else 0.0001
     return round(round(price / tick) * tick, 4)
+
+
+def size_position(entry_limit, risk_ref, manual_mode, buying_power, equity):
+    """How many shares to buy.
+
+    Returns (qty, note) where note is a one-line explanation for the log, so
+    the reasoning behind every size is recoverable afterwards instead of
+    having to be reconstructed from the fill.
+
+    risk_ref is the price the loss is measured to:
+      bracket  -> stop_loss, the order actually resting at the exchange
+      manual   -> stop_ref, the signal candle's low sent by the Pine script
+                  purely for this calculation. NOTHING is submitted at that
+                  price — Alpaca refuses stops premarket. It is the level the
+                  operator has decided to defend by hand.
+
+    Falls back to the flat fraction when risk sizing is off or risk_ref is
+    unusable. It never returns a size larger than the fallback would have,
+    and never one that exceeds available buying power.
+    """
+    # The most that may be committed regardless of the risk maths: the
+    # notional cap, and whatever buying power actually exists.
+    max_pos_pct = MANUAL_MAX_POSITION_PCT if manual_mode else MAX_POSITION_PCT
+    fraction = MANUAL_EQUITY_FRACTION if manual_mode else EQUITY_FRACTION
+
+    bp_ceiling = buying_power * 0.98
+    risk_pct = MANUAL_RISK_PCT if manual_mode else RISK_PCT
+
+    usable_ref = (
+        risk_ref is not None
+        and risk_ref > 0
+        and risk_ref < entry_limit
+    )
+
+    if RISK_SIZING and usable_ref:
+        per_share = entry_limit - risk_ref
+        risk_dollars = equity * (risk_pct / 100.0)
+        qty_risk = int(risk_dollars // per_share)
+
+        cap_value = min(equity * (max_pos_pct / 100.0), bp_ceiling)
+        qty_cap = int(cap_value // entry_limit)
+
+        qty = min(qty_risk, qty_cap)
+        binding = "risk" if qty_risk <= qty_cap else f"{max_pos_pct:.0f}% position cap"
+        stop_dist_pct = (per_share / entry_limit) * 100
+        note = (
+            f"risk-sized: {risk_pct:.2f}% of ${equity:.2f} = ${risk_dollars:.2f} at risk, "
+            f"stop ref {risk_ref} ({stop_dist_pct:.2f}% away = ${per_share:.4f}/share) -> "
+            f"{qty_risk} sh; cap {qty_cap} sh; binding constraint: {binding}"
+        )
+        return qty, note
+
+    # Fallback. No stop reference, so risk cannot be bounded — only exposure.
+    allocation = min(buying_power * fraction, bp_ceiling)
+    if MAX_CONCURRENT_POSITIONS > 1:
+        allocation = min(allocation, (equity * fraction) / MAX_CONCURRENT_POSITIONS)
+    qty = int(allocation // entry_limit)
+    why = "RISK_SIZING off" if not RISK_SIZING else "no usable stop reference in payload"
+    note = (
+        f"FLAT-FRACTION fallback ({why}): fraction={fraction} of bp ${buying_power:.2f} "
+        f"= ${allocation:.2f} -> {qty} sh. Loss on this position is NOT bounded by RISK_PCT."
+    )
+    return qty, note
 
 
 def get_open_orders(symbol=None, nested=True):
@@ -902,12 +1009,29 @@ def log_startup_config():
     logger.info(
         f"[CONFIG] bracket_window={TRADING_WINDOW_START}-{TRADING_WINDOW_END} ET | "
         f"premarket_manual_window={PREMARKET_WINDOW_START}-{PREMARKET_WINDOW_END} ET | "
-        f"equity_fraction={EQUITY_FRACTION} manual_fraction={MANUAL_EQUITY_FRACTION} | "
         f"max_concurrent={MAX_CONCURRENT_POSITIONS} | max_stop_dist={MAX_STOP_DISTANCE_PCT}% | "
         f"entry_timeout={ENTRY_ORDER_TIMEOUT_SECONDS}s | eod_flatten={EOD_FLATTEN_TIME} ET | "
         f"min_stop_gap=${MIN_STOP_GAP:.2f} | orders_heartbeat={ORDERS_HEARTBEAT_SECONDS}s | "
         f"default_signal_tag={DEFAULT_SIGNAL_TAG}"
     )
+    if RISK_SIZING:
+        logger.info(
+            f"[CONFIG] sizing=RISK-BASED | RTH risk={RISK_PCT}% of equity, position cap "
+            f"{MAX_POSITION_PCT}% | premarket risk={MANUAL_RISK_PCT}% of equity, position cap "
+            f"{MANUAL_MAX_POSITION_PCT}% | qty = (equity x risk%) / (entry - stop reference), "
+            f"whichever is smaller against the cap"
+        )
+        logger.info(
+            f"[CONFIG] sizing fallback when no stop reference is supplied: flat "
+            f"{EQUITY_FRACTION} of bp (RTH) / {MANUAL_EQUITY_FRACTION} (premarket). "
+            f"Risk is NOT bounded on a fallback-sized position."
+        )
+    else:
+        logger.info(
+            f"[CONFIG] sizing=FLAT FRACTION (RISK_SIZING off) — equity_fraction={EQUITY_FRACTION} "
+            f"manual_fraction={MANUAL_EQUITY_FRACTION}. The loss on each trade is whatever the "
+            f"stop distance happens to be."
+        )
     logger.info(
         f"[CONFIG] signals allowed — manual/premarket: {', '.join(MANUAL_SIGNALS)} | "
         f"bracket/RTH: {', '.join(BRACKET_SIGNALS)}. Anything else is rejected as "
@@ -980,6 +1104,19 @@ def handle_entry(data, symbol, signal_type, start_time):
         return reject("MALFORMED", symbol, f"malformed tp/sl values — {e}",
                       http_status=400, sig=signal_type)
 
+    # stop_ref — SIZING ONLY, never submitted as an order.
+    #
+    # A premarket entry cannot carry a stop leg, so stop_loss is 0 and there
+    # is nothing to measure risk against. The PM Pine scripts send the signal
+    # candle's low here instead, which is the level the operator has decided
+    # to defend by hand and therefore the honest denominator for position
+    # size. Absent or malformed, sizing falls back to the flat fraction.
+    try:
+        stop_ref = float(data.get("stop_ref", 0) or 0)
+    except (ValueError, TypeError):
+        logger.warning(f"[SIZE] {symbol} malformed stop_ref in payload — ignoring it")
+        stop_ref = 0.0
+
     # Manual mode: explicitly requested, or implied by both legs being zero.
     managed = str(data.get("managed", "")).lower()
     manual_mode = managed == "manual" or (stop_loss == 0 and take_profit == 0)
@@ -1007,6 +1144,16 @@ def handle_entry(data, symbol, signal_type, start_time):
         if entry_limit <= 0:
             return reject("ENTRY_INVALID", symbol, f"entry_limit must be positive (got {entry_limit})",
                           sig=signal_type)
+        if RISK_SIZING and not (0 < stop_ref < entry_limit):
+            # Not fatal — the trade still goes on, at the smaller flat
+            # fraction — but it is worth saying out loud, because the
+            # operator believes risk is bounded and on this one it is not.
+            send_alert(
+                f"[SIZE] {symbol} [{signal_type}] manual entry has no usable stop_ref "
+                f"(got {stop_ref}, entry {entry_limit}) — falling back to the flat "
+                f"{MANUAL_EQUITY_FRACTION:.0%} fraction. Update the PM script to send stop_ref "
+                f"if you want this position risk-sized."
+            )
     else:
         if not within_trading_window():
             now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
@@ -1080,17 +1227,15 @@ def handle_entry(data, symbol, signal_type, start_time):
                           f"could not check buying power, rejecting for safety: {e}",
                           http_status=500, log_level="error", sig=signal_type)
 
-        # A manual entry has no stop, so it is sized off its own fraction.
-        fraction = MANUAL_EQUITY_FRACTION if manual_mode else EQUITY_FRACTION
-        allocation = buying_power * fraction
-        if MAX_CONCURRENT_POSITIONS > 1:
-            allocation = min(allocation, (equity * fraction) / MAX_CONCURRENT_POSITIONS)
+        # SIZING. A bracket entry is measured to its real stop leg; a manual
+        # entry to the stop_ref the Pine script sends for this purpose only.
+        risk_ref = stop_ref if manual_mode else stop_loss
+        qty, size_note = size_position(entry_limit, risk_ref, manual_mode, buying_power, equity)
+        logger.info(f"[SIZE] {symbol} [{signal_type}] {size_note}")
 
-        qty = int(allocation // entry_limit)
         if qty < 1:
             return reject("INSUFFICIENT_BP", symbol,
-                          f"allocation ${allocation:.2f} insufficient at entry={entry_limit} "
-                          f"(bp=${buying_power:.2f}, fraction={fraction})",
+                          f"computed size is 0 shares at entry={entry_limit} — {size_note}",
                           sig=signal_type)
 
         try:
@@ -1145,6 +1290,7 @@ def handle_entry(data, symbol, signal_type, start_time):
             if manual_mode:
                 send_alert(
                     f"[ENTRY-MANUAL] {symbol} [{signal_type}] qty={qty} limit={entry_limit} "
+                    f"stop_ref={stop_ref if stop_ref > 0 else 'none'} (SIZING ONLY — no order at that price) | "
                     f"extended_hours=True NO TP/SL — SET THEM BY HAND ONCE FILLED | "
                     f"equity=${equity:.2f} bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
                     f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
