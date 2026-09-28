@@ -218,8 +218,21 @@ DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "UNTAGGED")
 #
 # Prefix match, so LOW_TEST_1 and LOW_TEST_5 are both covered by LOW_TEST.
 # Set either list to "*" to accept anything on that route.
+#
+# BLUE covers the Blue Spike PM script's whole family of tags — BLUE_KST_5,
+# BLUE_CONF_KST_5, BLUE_CONF_LT_5, BLUE_CONF_REV_5 — because the match is on
+# the prefix. It was missing until 28 Sep, when two live premarket entries
+# (GYGY, SCYX) were refused at 07:35 ET: the script was new, the list was not
+# updated with it, and the guard correctly rejected what it did not recognise.
+# The lesson is that this list is a deploy step for every new strategy, not
+# a set-and-forget.
+#
+# BRACKET_SIGNALS is deliberately NOT widened to BLUE. The RTH route runs
+# unattended while the operator is asleep, so adding a strategy to it is a
+# trading decision rather than a config fix. Set BRACKET_SIGNALS=KST_X,BLUE
+# in the environment when that decision is actually made.
 MANUAL_SIGNALS = [t.strip().upper() for t in os.getenv(
-    "MANUAL_SIGNALS", "KST_X,LOW_TEST,HTF_REVERSAL").split(",") if t.strip()]
+    "MANUAL_SIGNALS", "KST_X,LOW_TEST,HTF_REVERSAL,BLUE").split(",") if t.strip()]
 BRACKET_SIGNALS = [t.strip().upper() for t in os.getenv(
     "BRACKET_SIGNALS", "KST_X").split(",") if t.strip()]
 
