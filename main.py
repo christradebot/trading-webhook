@@ -227,14 +227,27 @@ DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "UNTAGGED")
 # The lesson is that this list is a deploy step for every new strategy, not
 # a set-and-forget.
 #
-# BRACKET_SIGNALS is deliberately NOT widened to BLUE. The RTH route runs
-# unattended while the operator is asleep, so adding a strategy to it is a
-# trading decision rather than a config fix. Set BRACKET_SIGNALS=KST_X,BLUE
-# in the environment when that decision is actually made.
+# BLUE added to BRACKET_SIGNALS on 30 Sep, a deliberate trading decision
+# rather than a config fix. On 29 Sep a BLUE_CONF_REV_5 fired on SLND at
+# 10:20 ET inside the bracket window and was refused.
+#
+# Worth being clear about what this route does differently, because it is NOT
+# simply "the same strategy while asleep":
+#
+#   - A REAL stop rests at the exchange. Premarket cannot have one, so there
+#     the risk figure is a calculation the operator has to honour by hand —
+#     and on 29 Sep VVOS blew through its stop_ref and lost 2.5x the budget.
+#     Here the broker enforces it.
+#   - MAX_STOP_DISTANCE_PCT applies. A wide-stop chase (EVGN's 28%) is
+#     rejected outright, which the premarket path cannot do.
+#   - A take_profit is MANDATORY. take_profit=0 is rejected as TP_NOT_SET, so
+#     every ticker's target must be set on the RTH chart or nothing trades.
+#   - Sizing is RISK_PCT / MAX_POSITION_PCT (1.0% / 25%), not the premarket
+#     pair (0.75% / 20%), so these positions are larger.
 MANUAL_SIGNALS = [t.strip().upper() for t in os.getenv(
     "MANUAL_SIGNALS", "KST_X,LOW_TEST,HTF_REVERSAL,BLUE").split(",") if t.strip()]
 BRACKET_SIGNALS = [t.strip().upper() for t in os.getenv(
-    "BRACKET_SIGNALS", "KST_X").split(",") if t.strip()]
+    "BRACKET_SIGNALS", "KST_X,BLUE").split(",") if t.strip()]
 
 
 ENFORCE_SIGNAL_OWNERSHIP = os.getenv("ENFORCE_SIGNAL_OWNERSHIP", "True") == "True"
