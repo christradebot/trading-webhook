@@ -244,8 +244,13 @@ DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "UNTAGGED")
 #     every ticker's target must be set on the RTH chart or nothing trades.
 #   - Sizing is RISK_PCT / MAX_POSITION_PCT (1.0% / 25%), not the premarket
 #     pair (0.75% / 20%), so these positions are larger.
+# RETEST added 30 Sep for the new 1m retest script. Prefix match, so it covers
+# RETEST_1, RETEST_5 and anything else that timeframe suffix produces.
+# NOTE: this is only the FALLBACK. If MANUAL_SIGNALS is set as an env var in
+# Railway, that value wins and this line is never read — check the
+# "[CONFIG] signals allowed" boot line to see which one is actually live.
 MANUAL_SIGNALS = [t.strip().upper() for t in os.getenv(
-    "MANUAL_SIGNALS", "KST_X,LOW_TEST,HTF_REVERSAL,BLUE").split(",") if t.strip()]
+    "MANUAL_SIGNALS", "KST_X,LOW_TEST,HTF_REVERSAL,BLUE,RETEST").split(",") if t.strip()]
 BRACKET_SIGNALS = [t.strip().upper() for t in os.getenv(
     "BRACKET_SIGNALS", "KST_X,BLUE").split(",") if t.strip()]
 
