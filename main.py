@@ -57,6 +57,7 @@ from alpaca.trading.requests import (
     ReplaceOrderRequest,
     GetOrdersRequest,
     LimitOrderRequest,
+    StopOrderRequest,
     TakeProfitRequest,
     StopLossRequest,
 )
@@ -196,6 +197,32 @@ MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
 # reason instead of a [CRIT] submission error.
 MIN_STOP_GAP = float(os.getenv("MIN_STOP_GAP", "0.01"))
 
+# --- PREMARKET RESTING TARGET ------------------------------------------------
+# Alpaca refuses a STOP outside regular hours, which is why manual entries have
+# never carried protection. It does NOT refuse a SELL LIMIT: extended_hours with
+# TIF=DAY is accepted. So the profit half of the trade can be automated even
+# though the loss half cannot.
+#
+# Added 2 Oct after MEDS: a clear 4.90 target, filled at 4.40, exited 4.71
+# because the order was placed by hand and not fast enough. 16 shares x 19c
+# left on the table for no reason other than typing speed.
+#
+# This watches the buy order, and once it fills, rests a sell limit at the
+# target for the quantity actually filled. It then keeps watching: if the
+# position disappears (you sold by hand) the resting sell is CANCELLED, because
+# a sell that outlives its position fills into a SHORT.
+# --- STOP RE-ARM -------------------------------------------------------------
+# How hard the watchdog tries to put a missing stop back, and what it does when
+# price has ALREADY passed the level it is trying to restore.
+REARM_STOP = os.getenv("REARM_STOP", "True") == "True"
+MAX_REARM_ATTEMPTS = int(os.getenv("MAX_REARM_ATTEMPTS", "3"))
+REARM_BREACH_PAD_PCT = float(os.getenv("REARM_BREACH_PAD_PCT", "0.5"))
+REARM_FALLBACK_PCT = float(os.getenv("REARM_FALLBACK_PCT", "10.0"))
+
+MANUAL_TP = os.getenv("MANUAL_TP", "True") == "True"
+TP_ARM_TIMEOUT = int(os.getenv("TP_ARM_TIMEOUT", "300"))
+TP_GUARD_SECONDS = int(os.getenv("TP_GUARD_SECONDS", "21600"))
+
 ORDERS_DEBUG_INTERVAL_SECONDS = int(os.getenv("ORDERS_DEBUG_INTERVAL_SECONDS", "30"))
 
 # The [ORDERS] snapshot prints when it CHANGES. This is only the fallback
@@ -330,6 +357,43 @@ force_close_symbols = set()
 # id sidesteps the list endpoint entirely.
 stop_leg_lock = threading.Lock()
 stop_leg_ids = {}
+
+# --- THE PRICE THE STOP SHOULD BE AT ----------------------------------------
+# AMOD, 2 Oct: a bracket entry partially filled (3 of 20). 302s later the
+# stale-entry sweeper cancelled the unfilled parent, and Alpaca took the STOP
+# LEG WITH IT. Three shares then sat unprotected for fifteen minutes while two
+# ratchets bounced off NO_STOP_ORDER. It only cost $11 because the stock went
+# up; the same sequence on a full fill is the whole position naked, on the one
+# route that exists precisely because nobody is awake to watch it.
+#
+# The watchdog already SAW it — it printed [CRIT] and did nothing. So the leg
+# id is no longer enough; we also remember the PRICE, and the watchdog puts a
+# fresh standalone stop back. Remembering the price is what makes re-arming
+# possible at all: a cancelled leg takes its price with it.
+#
+# Deliberately NOT keyed to how the stop went missing. A cancelled bracket, a
+# leg rejected at the broker, a manual cancel in the Alpaca UI — the position
+# is equally naked and the response is the same.
+stop_price_lock = threading.Lock()
+last_known_stop = {}        # symbol -> the stop price that SHOULD be resting
+rearm_attempts = {}         # symbol -> tries so far, so a broken symbol cannot spam
+
+
+def remember_stop_price(symbol, price):
+    try:
+        price = float(price)
+    except (TypeError, ValueError):
+        return
+    if price <= 0:
+        return
+    with stop_price_lock:
+        last_known_stop[symbol] = price
+
+
+def forget_stop_price(symbol):
+    with stop_price_lock:
+        last_known_stop.pop(symbol, None)
+        rearm_attempts.pop(symbol, None)
 
 
 def mark_manual(symbol):
@@ -711,6 +775,110 @@ def close_position_with_retry(symbol, reason, attempts=3, delay=1.0):
 # ============================================================
 # Position manager — housekeeping only.
 # ============================================================
+def rearm_stop(position):
+    """Puts a standalone STOP back under a bracket position that has lost its leg.
+
+    Called by the naked-position watchdog, which until now only printed [CRIT]
+    and watched. It is deliberately indifferent to HOW the stop went missing —
+    a cancelled bracket parent (AMOD, 2 Oct), a leg rejected at the broker, a
+    manual cancel in the Alpaca UI. The position is equally naked in all three.
+
+    Three outcomes, and the alert says which:
+
+      RESTORED   the remembered level is still below price, so a plain stop
+                 goes back exactly where it was.
+
+      BREACHED   price has ALREADY passed the level while unprotected. The
+                 stop cannot be placed where it belonged — Alpaca refuses a
+                 sell stop above market — so one goes just under the current
+                 price instead. That books a worse exit than the stop would
+                 have, and it is still the better of the two available
+                 outcomes, because the alternative is no protection at all.
+
+      GAVE UP    MAX_REARM_ATTEMPTS exhausted. Keeps alerting; does not retry
+                 forever against a symbol the broker will not accept.
+
+    It never closes a position. Re-arming is a safety net, not a trading
+    decision, and an automatic market-out while the operator is asleep is a
+    bigger action than this should ever take on its own.
+    """
+    symbol = position.symbol
+    if not REARM_STOP:
+        return
+    tries = rearm_attempts.get(symbol, 0)
+    if tries >= MAX_REARM_ATTEMPTS:
+        send_alert(
+            f"[CRIT] {symbol} still has NO STOP after {tries} re-arm attempts — "
+            f"not retrying. CLOSE IT BY HAND or accept it is unprotected."
+        )
+        return
+
+    try:
+        qty = abs(int(float(position.qty)))
+        current = float(position.current_price)
+        entry = float(position.avg_entry_price)
+    except (TypeError, ValueError) as e:
+        send_alert(f"[CRIT] {symbol} re-arm could not read the position — {e}. Still unprotected.")
+        return
+
+    if qty < 1 or current <= 0:
+        return
+
+    with stop_price_lock:
+        want = last_known_stop.get(symbol)
+
+    source = "remembered"
+    if want is None or want <= 0:
+        # No remembered level — an entry from a previous boot, most likely.
+        # A stop at a sane distance beats no stop while someone is asleep.
+        want = entry * (1.0 - REARM_FALLBACK_PCT / 100.0)
+        source = f"fallback {REARM_FALLBACK_PCT:.0f}% under entry"
+
+    breached = want >= current
+    if breached:
+        want = current * (1.0 - REARM_BREACH_PAD_PCT / 100.0)
+
+    want = round_tick(want)
+    if want <= 0:
+        send_alert(f"[CRIT] {symbol} re-arm price computed as ${want} — cannot place a stop. Unprotected.")
+        return
+
+    rearm_attempts[symbol] = tries + 1
+    try:
+        placed = trading_client.submit_order(StopOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            stop_price=want,
+        ))
+    except Exception as e:
+        send_alert(
+            f"[CRIT] {symbol} re-arm FAILED (attempt {tries + 1}/{MAX_REARM_ATTEMPTS}) — {e}. "
+            f"Position of {qty} sh is UNPROTECTED."
+        )
+        return
+
+    with stop_leg_lock:
+        stop_leg_ids[symbol] = placed.id
+    remember_stop_price(symbol, want)
+    naked_streak.pop(symbol, None)
+    rearm_attempts.pop(symbol, None)
+
+    if breached:
+        send_alert(
+            f"[REARM] {symbol} stop RESTORED at ${want} for {qty} sh — but price "
+            f"${current:.4f} had ALREADY passed the intended level while unprotected, so this "
+            f"sits {REARM_BREACH_PAD_PCT}% under market, not where the stop belonged. "
+            f"Worse exit than intended; better than none. Order ID: {placed.id}"
+        )
+    else:
+        send_alert(
+            f"[REARM] {symbol} stop RESTORED at ${want} for {qty} sh ({source}) — "
+            f"position is protected again. Order ID: {placed.id}"
+        )
+
+
 def position_manager_loop():
     last_equity_log = 0.0
     eod_flatten_triggered_date = None
@@ -952,9 +1120,13 @@ def position_manager_loop():
                             f"[CRIT] {p.symbol} has an OPEN POSITION and NO LIVE STOP ORDER "
                             f"(qty {p.qty}) — position is unprotected."
                         )
+                        rearm_stop(p)
             for sym in list(naked_streak.keys()):
                 if sym not in current_symbols:
                     naked_streak.pop(sym, None)
+            for sym in list(last_known_stop.keys()):
+                if sym not in current_symbols:
+                    forget_stop_price(sym)
 
             # [ORDERS] only when something actually changes, plus a heartbeat
             # every ORDERS_HEARTBEAT_SECONDS. Printing it every cycle buried
@@ -990,18 +1162,38 @@ def position_manager_loop():
                 if o.side == OrderSide.BUY:
                     age = (datetime.now(timezone.utc) - o.created_at).total_seconds()
                     if age >= ENTRY_ORDER_TIMEOUT_SECONDS and o.id not in cancel_requested_order_ids:
+                        # A PARTIALLY filled bracket is the dangerous case:
+                        # cancelling the parent takes the stop leg with it and
+                        # leaves the filled shares naked (AMOD, 2 Oct). The
+                        # cancel still happens — leaving it open invites a late
+                        # fill at a stale price hours later — but the watchdog
+                        # is primed to re-arm on the very next cycle instead of
+                        # waiting for its usual second strike.
+                        try:
+                            part = int(float(getattr(o, "filled_qty", 0) or 0))
+                        except (TypeError, ValueError):
+                            part = 0
                         try:
                             retry_cancel_order(o.id)
                             cancel_requested_order_ids.add(o.id)
                             # An entry that never fills never closes, so
                             # without this the tag and the manual flag leak
                             # and mislabel the next trade on that symbol.
-                            pending_signal_types.pop(o.symbol, None)
-                            unmark_manual(o.symbol)
-                            send_alert(
-                                f"[TIMEOUT] Requested cancel for stale unfilled entry for {o.symbol} "
-                                f"after {age:.0f}s — slot frees once Alpaca confirms."
-                            )
+                            if part < 1:
+                                pending_signal_types.pop(o.symbol, None)
+                                unmark_manual(o.symbol)
+                                send_alert(
+                                    f"[TIMEOUT] Requested cancel for stale unfilled entry for {o.symbol} "
+                                    f"after {age:.0f}s — slot frees once Alpaca confirms."
+                                )
+                            else:
+                                naked_streak[o.symbol] = 1
+                                send_alert(
+                                    f"[TIMEOUT] {o.symbol} entry was PARTIALLY filled ({part} sh) and has been "
+                                    f"cancelled after {age:.0f}s — this also kills the bracket's stop leg. "
+                                    f"Re-arming the stop on the next cycle; the tag is kept because the "
+                                    f"position is real."
+                                )
                         except Exception as e:
                             send_alert(f"[CRIT] Failed to cancel stale entry {o.id} for {o.symbol}: {e}")
 
@@ -1115,6 +1307,111 @@ def reject_summary():
 def signal_summary():
     with signal_stats_lock:
         return {k: dict(v) for k, v in signal_stats.items()}, 200
+
+
+# ============================================================
+# PREMARKET RESTING TARGET
+# ============================================================
+def arm_manual_take_profit(symbol, buy_order_id, tp_price, signal_type):
+    """Waits for a premarket BUY to fill, then rests a SELL LIMIT at the target.
+
+    Runs on its own daemon thread so the webhook returns immediately. Nothing
+    here can affect the entry — if every part of this fails, the position is
+    exactly what it would have been before this existed, and the alerts say so.
+
+    Two phases:
+
+      ARM    poll the buy until it is terminal or TP_ARM_TIMEOUT elapses, then
+             submit a sell for the quantity ACTUALLY filled. Never the quantity
+             ordered — a partial fill followed by a full-size sell is a short.
+
+      GUARD  keep watching. If the position goes to zero while the sell is
+             still open, CANCEL IT. Selling by hand and leaving the target
+             resting is how you wake up short at 9am.
+    """
+    try:
+        tp_rounded = round_tick(tp_price)
+        deadline = time.time() + TP_ARM_TIMEOUT
+        filled_qty = 0
+
+        while time.time() < deadline:
+            time.sleep(2.0)
+            try:
+                o = trading_client.get_order_by_id(buy_order_id)
+            except Exception as e:
+                logger.warning(f"[TP] {symbol} could not read the buy order — {e}")
+                continue
+            try:
+                filled_qty = int(float(getattr(o, "filled_qty", 0) or 0))
+            except (TypeError, ValueError):
+                filled_qty = 0
+            status = str(getattr(o, "status", "")).lower()
+            if any(k in status for k in ("canceled", "cancelled", "expired", "rejected")):
+                break
+            if "filled" in status and "partially" not in status:
+                break
+
+        if filled_qty < 1:
+            send_alert(
+                f"[TP] {symbol} [{signal_type}] buy did not fill within {TP_ARM_TIMEOUT}s — "
+                f"no target placed. Nothing is resting."
+            )
+            return
+
+        try:
+            sell = LimitOrderRequest(
+                symbol=symbol,
+                qty=filled_qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                limit_price=tp_rounded,
+                extended_hours=True,
+            )
+            placed = trading_client.submit_order(sell)
+        except Exception as e:
+            send_alert(
+                f"[CRIT] {symbol} [{signal_type}] TARGET ORDER FAILED — {e}. "
+                f"You are holding {filled_qty} sh with NO target and NO stop. Manage it by hand."
+            )
+            return
+
+        send_alert(
+            f"[TP] {symbol} [{signal_type}] target RESTING at ${tp_rounded} for {filled_qty} sh "
+            f"(extended hours). If you exit by hand, CANCEL IT — or let this thread do it. "
+            f"Order ID: {placed.id}"
+        )
+
+        # --- GUARD ---------------------------------------------------------
+        guard_until = time.time() + TP_GUARD_SECONDS
+        while time.time() < guard_until:
+            time.sleep(10.0)
+            try:
+                st = str(getattr(trading_client.get_order_by_id(placed.id), "status", "")).lower()
+            except Exception:
+                continue
+            if any(k in st for k in ("filled", "canceled", "cancelled", "expired", "rejected")):
+                if "filled" in st and "partially" not in st:
+                    send_alert(f"[TP] {symbol} [{signal_type}] target FILLED at ${tp_rounded}.")
+                return
+            try:
+                held = {p.symbol for p in trading_client.get_all_positions()}
+            except Exception:
+                continue
+            if symbol not in held:
+                try:
+                    trading_client.cancel_order_by_id(placed.id)
+                    send_alert(
+                        f"[TP] {symbol} [{signal_type}] position is flat but the target was still "
+                        f"resting — CANCELLED it. A sell that outlives its position goes short."
+                    )
+                except Exception as e:
+                    send_alert(
+                        f"[CRIT] {symbol} could not cancel the orphaned target — {e}. "
+                        f"CANCEL IT BY HAND NOW or it will fill you short at ${tp_rounded}."
+                    )
+                return
+    except Exception as e:
+        send_alert(f"[CRIT] {symbol} take-profit watcher crashed — {e}. No target is resting.")
 
 
 # ============================================================
@@ -1309,6 +1606,10 @@ def handle_entry(data, symbol, signal_type, start_time):
                 mark_manual(symbol)
             else:
                 unmark_manual(symbol)
+                # Recorded BEFORE the leg can go missing — a cancelled leg
+                # takes its price with it, and without this the watchdog has
+                # nothing to re-arm at.
+                remember_stop_price(symbol, stop_loss)
                 captured = remember_stop_leg(symbol, submitted)
                 if captured is None:
                     logger.warning(
@@ -1319,13 +1620,31 @@ def handle_entry(data, symbol, signal_type, start_time):
             latency_ms = (time.time() - start_time) * 1000
             note = "" if abs(buying_power - equity) < 1.0 else f" [WARN: BP/equity {buying_power / equity:.2f}x]"
             if manual_mode:
+                # A target is OPTIONAL. No target still enters — you just
+                # manage the exit by hand, exactly as before.
+                tp_ok = MANUAL_TP and take_profit > 0 and take_profit > entry_limit
+                if take_profit > 0 and not tp_ok:
+                    logger.warning(
+                        f"[TP] {symbol} take_profit {take_profit} is not above entry {entry_limit} "
+                        f"(or MANUAL_TP is off) — ignoring it, no target will rest"
+                    )
+                tp_note = (
+                    f"target ${round_tick(take_profit)} will rest once filled"
+                    if tp_ok else "NO TP/SL — SET THEM BY HAND ONCE FILLED"
+                )
                 send_alert(
                     f"[ENTRY-MANUAL] {symbol} [{signal_type}] qty={qty} limit={entry_limit} "
                     f"stop_ref={stop_ref if stop_ref > 0 else 'none'} (SIZING ONLY — no order at that price) | "
-                    f"extended_hours=True NO TP/SL — SET THEM BY HAND ONCE FILLED | "
+                    f"extended_hours=True {tp_note} | "
                     f"equity=${equity:.2f} bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
                     f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
                 )
+                if tp_ok:
+                    threading.Thread(
+                        target=arm_manual_take_profit,
+                        args=(symbol, submitted.id, take_profit, signal_type),
+                        daemon=True,
+                    ).start()
             else:
                 stop_distance_pct = ((entry_limit - stop_loss) / entry_limit) * 100
                 send_alert(
@@ -1402,6 +1721,11 @@ def handle_stop_update(data, symbol):
             if new_id is not None:
                 with stop_leg_lock:
                     stop_leg_ids[symbol] = new_id
+            # Keep the re-arm price in step with the ratchet. If the leg
+            # vanishes after three trail moves, the watchdog must restore the
+            # CURRENT stop, not the one submitted at entry — restoring a stale
+            # entry-time stop would silently loosen it.
+            remember_stop_price(symbol, stop_price)
             accepted = getattr(replaced, "stop_price", None)
             accepted_str = f"${float(accepted):.4f}" if accepted is not None else "unconfirmed"
             logger.info(
