@@ -41,6 +41,7 @@ Inbound message types:
 
 import logging
 import os
+import re
 import signal
 import sys
 import threading
@@ -1821,7 +1822,24 @@ def webhook():
 
     data = request.get_json(force=True, silent=True)
     if not data:
-        return reject("NO_JSON", "-", "no/invalid JSON body received", http_status=400)
+        # Until now this discarded the body and said only "no/invalid JSON",
+        # which is why a week of these stayed unexplained. The body IS the
+        # diagnosis: an empty one means a TradingView alert whose message box
+        # is blank — i.e. its condition is not "Any alert() function call", so
+        # TradingView sends the box instead of the alert() payload. Anything
+        # else shows which sender is malformed.
+        raw = request.get_data(as_text=True) or ""
+        preview = " ".join(raw.split())[:200]
+        preview = re.sub(r'("secret"\s*:\s*")[^"]*(")', r"\1***\2", preview)
+        detail = (
+            f"body was EMPTY ({len(raw)} bytes, content-type={request.headers.get('Content-Type', 'none')}) "
+            f"— a TradingView alert with an empty message box, or one whose condition is not "
+            f"'Any alert() function call'"
+            if not preview else
+            f"unparseable body ({len(raw)} bytes, content-type={request.headers.get('Content-Type', 'none')}) "
+            f"— first 200 chars: {preview}"
+        )
+        return reject("NO_JSON", "-", detail, http_status=400)
 
     if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
         return reject("BAD_SECRET", data.get("symbol", "-"), "invalid webhook secret", http_status=401)
