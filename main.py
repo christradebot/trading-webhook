@@ -1,3 +1,9 @@
+
+
+
+
+
+
 """
 Trading bot backend — TradingView -> Flask -> Alpaca.
 
@@ -36,7 +42,19 @@ Inbound message types:
 
   entry        -> bracket order, or plain extended-hours limit if manual
   stop_update  -> replace the native stop leg's price (ratchet up only)
-  exit         -> cancel resting legs, then close the position at market
+  exit         -> cancel resting legs, then close. AT MARKET during the
+                  regular session; OUTSIDE it, a marketable SELL LIMIT at the
+                  "exit_limit" price the sender supplies, because Alpaca
+                  refuses market orders in extended hours. An exit sent
+                  premarket with no exit_limit is refused loudly rather than
+                  attempted and lost.
+
+                  This is what makes a premarket stop possible at all. Not a
+                  stop ORDER — Alpaca will not hold one before 09:30, which is
+                  why every attempt to pre-set one has failed. Nothing rests.
+                  The level lives in TradingView, and the instant it breaks a
+                  fresh sell is submitted, which is simply the order the
+                  operator would have placed by hand at that moment.
 """
 
 import logging
@@ -114,6 +132,27 @@ symbol_alert_cooldown = {}
 ERROR_ALERT_INTERVAL = 10
 
 ENTRY_ORDER_TIMEOUT_SECONDS = int(os.getenv("ENTRY_ORDER_TIMEOUT_SECONDS", "300"))
+
+# ---------------------------------------------------------------- EXITS ----
+# An exit OUTSIDE regular hours cannot use close_position(): that submits a
+# MARKET order, and Alpaca refuses market orders in extended hours exactly as
+# it refuses stops. Every premarket exit this bot has ever "done" was actually
+# the operator closing by hand at Alpaca — the log recorded it as
+# "exit: limit" and the bot never submitted one itself.
+#
+# So outside regular hours an exit is a marketable SELL LIMIT instead:
+# extended_hours=True, TIF=DAY, priced from a number TRADINGVIEW SENDS. The
+# bot does not look the price up. Alpaca's IEX feed is unreliable on exactly
+# these names (TNON $11.51 vs quote $4.55; RDAC $14.33 vs $7.84) and a limit
+# built on a bad quote is a limit that never fills.
+#
+# A sell limit priced BELOW the market is harmless — it executes at the best
+# bid, not at the limit. The only way to get hurt is pricing it too HIGH and
+# not filling at all, which is why the Pine script discounts it before
+# sending and why an unfilled exit raises a [CRIT] rather than going quiet.
+REGULAR_SESSION_START = os.getenv("REGULAR_SESSION_START", "09:30")
+REGULAR_SESSION_END = os.getenv("REGULAR_SESSION_END", "15:59")
+EXIT_FILL_TIMEOUT = int(os.getenv("EXIT_FILL_TIMEOUT", "60"))
 
 # Two windows, both ET.
 #
@@ -511,6 +550,16 @@ def within_premarket_window():
     return _in_window(PREMARKET_WINDOW_START, PREMARKET_WINDOW_END)
 
 
+def within_regular_session():
+    """True during the regular session, when market orders are accepted.
+
+    Distinct from within_trading_window(), which is the narrow 09:35-11:35
+    slice where this bot is allowed to OPEN bracket trades. Closing is allowed
+    across the whole session, so the two must not share a window.
+    """
+    return _in_window(REGULAR_SESSION_START, REGULAR_SESSION_END)
+
+
 def round_tick(price):
     """Alpaca requires whole-cent prices at or above $1; sub-penny is only
     valid below it. An unconditional 4-decimal round silently broke the
@@ -771,6 +820,96 @@ def close_position_with_retry(symbol, reason, attempts=3, delay=1.0):
             logger.warning(f"Close attempt {attempt}/{attempts} failed for {symbol}: {e}. Retrying...")
             time.sleep(delay)
     return False
+
+
+def watch_exit_fill(symbol, order_id, want_qty, reason):
+    """Follows an extended-hours exit until it fills, dies, or times out.
+
+    A LIMIT can rest unfilled. Without this the bot would report "exit sent"
+    and go quiet while the position was still open — the operator would
+    believe they were flat, which is worse than never having tried, because
+    they would stop watching.
+    """
+    deadline = time.time() + EXIT_FILL_TIMEOUT
+    while time.time() < deadline:
+        time.sleep(5)
+        try:
+            o = trading_client.get_order_by_id(order_id)
+        except Exception:
+            continue
+
+        status = str(getattr(o, "status", "")).lower()
+        try:
+            filled = int(float(getattr(o, "filled_qty", 0) or 0))
+        except (TypeError, ValueError):
+            filled = 0
+
+        if "filled" in status and "partially" not in status:
+            unmark_manual(symbol)
+            pending_signal_types.pop(symbol, None)
+            send_alert(f"[EXIT] {symbol} — FLAT. {filled} sh sold ({reason})")
+            return
+
+        if status in ("canceled", "cancelled", "rejected", "expired"):
+            send_alert(
+                f"[CRIT] {symbol} EXIT ORDER {status.upper()} ({reason}) — "
+                f"{filled} of {want_qty} sh sold. YOU ARE STILL LONG. Close it by hand."
+            )
+            return
+
+    try:
+        still = get_position(symbol)
+    except Exception:
+        still = None
+
+    if still is None:
+        unmark_manual(symbol)
+        pending_signal_types.pop(symbol, None)
+        send_alert(f"[EXIT] {symbol} — flat ({reason})")
+        return
+
+    send_alert(
+        f"[CRIT] {symbol} EXIT LIMIT STILL RESTING after {EXIT_FILL_TIMEOUT}s ({reason}) — "
+        f"you are STILL LONG {still.qty} sh. The limit is above the bid, or the book is "
+        f"too thin to take it. Close it by hand at Alpaca."
+    )
+
+
+def close_position_extended(symbol, qty, limit_price, reason):
+    """Closes a position outside regular hours with a marketable SELL LIMIT.
+
+    close_position() submits a MARKET order and Alpaca refuses those in
+    extended hours, so it cannot work here. limit_price is whatever the Pine
+    script sent — already discounted below the signal bar's close so it is
+    marketable. This function makes no price judgement of its own, in keeping
+    with the rest of the file.
+    """
+    try:
+        sell = LimitOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.SELL,
+            time_in_force=TimeInForce.DAY,
+            limit_price=round_tick(limit_price),
+            extended_hours=True,
+        )
+        placed = trading_client.submit_order(sell)
+    except Exception as e:
+        send_alert(
+            f"[CRIT] {symbol} EXTENDED-HOURS EXIT FAILED to submit ({reason}): {e} — "
+            f"you are STILL LONG {qty} sh and NOTHING is resting. Close it by hand."
+        )
+        return False
+
+    send_alert(
+        f"[EXIT] {symbol} — extended-hours SELL LIMIT {qty} sh @ ${round_tick(limit_price)} "
+        f"({reason}) | Order ID: {placed.id} | NOT a market order — watching it fill"
+    )
+
+    threading.Thread(
+        target=watch_exit_fill, args=(symbol, placed.id, qty, reason), daemon=True
+    ).start()
+    return True
 
 
 # ============================================================
@@ -1267,9 +1406,16 @@ def log_startup_config():
         f"ignored unless it matches the signal that opened the position."
     )
     logger.info(
-        "[CONFIG] Manual premarket entries carry NO protective stop — Alpaca rejects stop "
-        "orders outside regular hours. The operator sets stop and target by hand; EOD "
-        f"flatten at {EOD_FLATTEN_TIME} ET is the only automated backstop."
+        "[CONFIG] Manual premarket entries carry NO RESTING stop — Alpaca rejects stop "
+        "orders outside regular hours. Protection comes from an exit message instead: "
+        f"nothing rests, and a fresh marketable SELL LIMIT is sent the moment one arrives."
+    )
+    logger.info(
+        f"[CONFIG] exits: during {REGULAR_SESSION_START}-{REGULAR_SESSION_END} ET close at MARKET. "
+        f"Outside it, SELL LIMIT at the sender's exit_limit (extended_hours=True, TIF=DAY), "
+        f"watched for {EXIT_FILL_TIMEOUT}s and [CRIT] if it has not filled. An exit arriving "
+        f"outside regular hours with NO exit_limit is REFUSED, not guessed. EOD flatten at "
+        f"{EOD_FLATTEN_TIME} ET remains the last backstop."
     )
 
 
@@ -1798,12 +1944,46 @@ def handle_exit(data, symbol):
             f"({[str(o.id) for o in remaining]}); closing anyway rather than leaving the position open"
         )
 
-    if close_position_with_retry(symbol, reason):
-        unmark_manual(symbol)
+    # ---- REGULAR HOURS: market close, exactly as before -------------------
+    if within_regular_session():
+        if close_position_with_retry(symbol, reason):
+            unmark_manual(symbol)
+            send_alert(
+                f"[EXIT] {symbol} [{sig or '-'}] — closing {qty} shares at market ({reason}); "
+                f"cancelled {cancelled} resting leg(s), legs_clear={clear}"
+            )
+            return "Success", 200
+        return "Close failed", 500
+
+    # ---- OUTSIDE REGULAR HOURS: marketable sell limit ---------------------
+    # The price must come from the sender. The bot refuses to invent one: a
+    # sell limit priced from Alpaca's IEX quote on a thin small cap is how you
+    # end up with an order resting above the bid while you believe you are out.
+    try:
+        exit_limit = float(data.get("exit_limit", 0) or 0)
+    except (TypeError, ValueError):
+        exit_limit = 0.0
+
+    if exit_limit <= 0:
         send_alert(
-            f"[EXIT] {symbol} [{sig or '-'}] — closing {qty} shares at market ({reason}); "
-            f"cancelled {cancelled} resting leg(s), legs_clear={clear}"
+            f"[CRIT] {symbol} [{sig or '-'}] EXIT ({reason}) ARRIVED OUTSIDE REGULAR HOURS "
+            f"WITH NO exit_limit — Alpaca refuses market orders before 09:30, so nothing "
+            f"could be sent. YOU ARE STILL LONG {qty} sh. Close it by hand. "
+            f"(Update the Pine script to send exit_limit.)"
         )
+        return reject("NO_EXIT_LIMIT", symbol,
+                      f"exit ({reason}) outside regular hours needs an exit_limit price",
+                      sig=sig)
+
+    try:
+        want_qty = abs(int(float(qty)))
+    except (TypeError, ValueError):
+        want_qty = 0
+
+    if want_qty < 1:
+        return reject("BAD_QTY", symbol, f"position qty unreadable ({qty})", sig=sig)
+
+    if close_position_extended(symbol, want_qty, exit_limit, reason):
         return "Success", 200
 
     return "Close failed", 500
@@ -1861,13 +2041,6 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
-
-
-
-
-
-
 
 
 
