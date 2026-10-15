@@ -1,9 +1,3 @@
-
-
-
-
-
-
 """
 Trading bot backend — TradingView -> Flask -> Alpaca.
 
@@ -316,10 +310,33 @@ DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "UNTAGGED")
 # NOTE: this is only the FALLBACK. If MANUAL_SIGNALS is set as an env var in
 # Railway, that value wins and this line is never read — check the
 # "[CONFIG] signals allowed" boot line to see which one is actually live.
+#
+# 14 Oct cost a whole session to this list: five signals, five rejects, no
+# entries, and it went unnoticed for ten hours. The VSA scripts replaced the
+# blue RTH bot and send VSA_* tags that nothing here recognised.
+#
+# Matching is by PREFIX, so a tag below covers every variant that starts with
+# it. ADD NEW SCRIPT TAGS HERE WHEN YOU ADD A SCRIPT — and keep the two lists
+# separate. The whole point is catching an alert pointed at the wrong route,
+# which is exactly what happened to CIGL.
 MANUAL_SIGNALS = [t.strip().upper() for t in os.getenv(
-    "MANUAL_SIGNALS", "KST_X,LOW_TEST,HTF_REVERSAL,BLUE,RETEST").split(",") if t.strip()]
+    "MANUAL_SIGNALS",
+    "KST_X,LOW_TEST,HTF_REVERSAL,BLUE,RETEST,VSA_PM").split(",") if t.strip()]
 BRACKET_SIGNALS = [t.strip().upper() for t in os.getenv(
-    "BRACKET_SIGNALS", "KST_X,BLUE").split(",") if t.strip()]
+    "BRACKET_SIGNALS",
+    "KST_X,BLUE,VSA_2BLUE,VSA_2PURP").split(",") if t.strip()]
+
+# Alpaca cannot accept a bracket outside regular hours — no stop leg, no OCO,
+# nothing. So a premarket message carrying stop_loss and take_profit is not a
+# bracket request the broker could ever honour; it is a manual entry whose
+# author did not know that. CIGL, 14 Oct: VSA_PM_2BLUE_1 fired at 07:09 ET
+# with a real stop_loss, routed to brackets, and was refused twice.
+#
+# With this ON, any entry arriving inside the premarket window is handled as
+# manual whatever the payload says, and the stop_loss it carried becomes the
+# stop_ref that sizes the position — which is the only use it could have had.
+# Turn it off and premarket scripts must send "managed":"manual" themselves.
+PREMARKET_FORCE_MANUAL = os.getenv("PREMARKET_FORCE_MANUAL", "True") == "True"
 
 
 ENFORCE_SIGNAL_OWNERSHIP = os.getenv("ENFORCE_SIGNAL_OWNERSHIP", "True") == "True"
@@ -1401,6 +1418,13 @@ def log_startup_config():
         f"SIGNAL_NOT_ALLOWED."
     )
     logger.info(
+        f"[CONFIG] premarket routing: "
+        f"{'FORCED MANUAL' if PREMARKET_FORCE_MANUAL else 'payload decides'} — an entry inside "
+        f"{PREMARKET_WINDOW_START}-{PREMARKET_WINDOW_END} ET is handled as manual whatever legs it "
+        f"carries, because Alpaca cannot bracket before 09:30. Any stop_loss it sent becomes "
+        f"stop_ref for sizing."
+    )
+    logger.info(
         f"[CONFIG] exit/stop_update ownership check: "
         f"{'ON' if ENFORCE_SIGNAL_OWNERSHIP else 'OFF'} — a tagged message is "
         f"ignored unless it matches the signal that opened the position."
@@ -1595,6 +1619,25 @@ def handle_entry(data, symbol, signal_type, start_time):
     # Manual mode: explicitly requested, or implied by both legs being zero.
     managed = str(data.get("managed", "")).lower()
     manual_mode = managed == "manual" or (stop_loss == 0 and take_profit == 0)
+
+    # PREMARKET IS ALWAYS THE MANUAL ROUTE. A bracket cannot be submitted
+    # before 09:30 under any circumstances, so a premarket payload carrying
+    # legs is not a request the broker could honour — it is a manual entry
+    # written by someone who had not hit that wall yet. Rather than refuse it,
+    # convert it: the stop_loss becomes the stop_ref that sizes the position,
+    # which is the only job it could have done anyway. The take_profit is kept
+    # and still arms a real resting sell limit once the buy fills.
+    if PREMARKET_FORCE_MANUAL and not manual_mode and within_premarket_window():
+        if stop_ref <= 0 and 0 < stop_loss < entry_limit:
+            stop_ref = stop_loss
+        logger.info(
+            f"[ROUTE] {symbol} [{signal_type}] arrived premarket with bracket legs "
+            f"(sl={stop_loss}, tp={take_profit}) — Alpaca cannot bracket before 09:30, "
+            f"so this is being handled as a MANUAL entry. "
+            f"stop_ref={stop_ref if stop_ref > 0 else 'none'} (sizing only, no order at that price)."
+        )
+        stop_loss = 0.0
+        manual_mode = True
 
     # Whitelist first — a tag that is not being traded never reaches the broker.
     if not signal_allowed(signal_type, manual_mode):
