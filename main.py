@@ -152,7 +152,18 @@ EXIT_FILL_TIMEOUT = int(os.getenv("EXIT_FILL_TIMEOUT", "60"))
 #
 # BRACKET window: regular hours, where a protective stop can rest at the
 # exchange. This is the automated, walk-away path.
-TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:35")
+#
+# 09:30, not 09:35, from 16 Oct. The VSA RTH script fires from the bell and
+# the two windows disagreeing cost DRMA on 15 Oct — a 4.9% stop, correctly
+# sized at 250 shares, refused at 09:33 for arriving two minutes early. The
+# old 09:35 start existed to sit out the opening spread, which is a real cost
+# (the entry is a limit with a buffer, and a triggered stop becomes a market
+# order), but a signal refused for a reason that has nothing to do with the
+# setup is worse. One window, decided once, in the script and here.
+#
+# It also closes the 09:30-09:34 dead zone: premarket ends 09:29, brackets now
+# begin 09:30, so there is no minute where a signal belongs to neither route.
+TRADING_WINDOW_START = os.getenv("TRADING_WINDOW_START", "09:30")
 TRADING_WINDOW_END = os.getenv("TRADING_WINDOW_END", "11:35")
 
 # MANUAL window: premarket. Entries here carry NO protective legs, so the
@@ -1628,16 +1639,34 @@ def handle_entry(data, symbol, signal_type, start_time):
     # which is the only job it could have done anyway. The take_profit is kept
     # and still arms a real resting sell limit once the buy fills.
     if PREMARKET_FORCE_MANUAL and not manual_mode and within_premarket_window():
-        if stop_ref <= 0 and 0 < stop_loss < entry_limit:
-            stop_ref = stop_loss
         logger.info(
             f"[ROUTE] {symbol} [{signal_type}] arrived premarket with bracket legs "
             f"(sl={stop_loss}, tp={take_profit}) — Alpaca cannot bracket before 09:30, "
-            f"so this is being handled as a MANUAL entry. "
-            f"stop_ref={stop_ref if stop_ref > 0 else 'none'} (sizing only, no order at that price)."
+            f"so this is being handled as a MANUAL entry."
         )
-        stop_loss = 0.0
         manual_mode = True
+
+    # A MANUAL PAYLOAD'S stop_loss IS A SIZING REFERENCE. Nothing rests at the
+    # broker on this route, so a stop_loss in the message can only ever have
+    # been meant as the denominator for position size — which is what stop_ref
+    # is. Scripts that send one but not the other were silently falling through
+    # to the flat-fraction fallback.
+    #
+    # VBIO, 15 Oct: the PM script sent "managed":"manual" AND stop_loss, so the
+    # premarket conversion above never ran, stop_ref stayed 0, and the position
+    # was sized at a flat 25% of buying power — 135 shares, risk unbounded, on
+    # a trade budgeted for 0.75%. It closed +3.24% and looked like a win.
+    if manual_mode and stop_ref <= 0 and 0 < stop_loss < entry_limit:
+        stop_ref = stop_loss
+        logger.info(
+            f"[SIZE] {symbol} [{signal_type}] no stop_ref in payload — using the stop_loss "
+            f"it sent ({stop_loss}) as the sizing reference instead. Risk-sized, not "
+            f"flat-fraction. No order rests at that price."
+        )
+
+    if manual_mode:
+        # Never submitted on this route; zeroed so it cannot read as an order.
+        stop_loss = 0.0
 
     # Whitelist first — a tag that is not being traded never reaches the broker.
     if not signal_allowed(signal_type, manual_mode):
