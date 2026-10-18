@@ -335,7 +335,7 @@ MANUAL_SIGNALS = [t.strip().upper() for t in os.getenv(
     "KST_X,LOW_TEST,HTF_REVERSAL,BLUE,RETEST,VSA_PM").split(",") if t.strip()]
 BRACKET_SIGNALS = [t.strip().upper() for t in os.getenv(
     "BRACKET_SIGNALS",
-    "KST_X,BLUE,VSA_2BLUE,VSA_2PURP").split(",") if t.strip()]
+    "KST_X,BLUE,VSA_2BLUE,VSA_2PURP,PMR").split(",") if t.strip()]
 
 # Alpaca cannot accept a bracket outside regular hours — no stop leg, no OCO,
 # nothing. So a premarket message carrying stop_loss and take_profit is not a
