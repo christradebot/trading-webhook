@@ -32,6 +32,30 @@ TWO ENTRY MODES
    warns once at entry rather than screaming every cycle — but the
    exposure is real and belongs to whoever is awake.
 
+ENTRY-BAR VOLUME FLOOR (22-26 Oct)
+----------------------------------
+The Pine scripts have a minimum-volume gate on the reclaim bar. A TradingView
+alert runs a FROZEN copy of the script and its inputs from the moment it was
+created, so an alert built from an older copy simply never had the gate: NCPL
+and XLAB, 22 Oct, were entered on 93.7K and 264K volume against a 300K floor
+because both alerts predate the input. The gate in the script cannot be
+trusted to be in the alert.
+
+So the floor is enforced HERE as well. Every entry must carry "vol" (the
+reclaim bar's share volume). If a floor is configured for the route and the
+payload has no vol, or vol is under the floor, the entry is refused. An alert
+built from an old script sends no vol at all, so it is refused automatically
+and cannot trade ungated.
+
+  MIN_ENTRY_VOLUME          bracket / RTH route, shares. Default 300000.
+  MANUAL_MIN_ENTRY_VOLUME   manual / premarket route, shares. Default 0 (off):
+                            premarket volume is far lower than RTH volume and
+                            the right floor has not been measured yet.
+
+A floor of 0 turns the check off for that route. The payload's own "min_vol"
+and "ver" are logged on every entry so the log shows exactly what each alert
+believed it was running.
+
 Inbound message types:
 
   entry        -> bracket order, or plain extended-hours limit if manual
@@ -230,6 +254,24 @@ MANUAL_EQUITY_FRACTION = float(os.getenv("MANUAL_EQUITY_FRACTION", "0.25"))
 # Manual entries carry no stop, so this cap cannot protect them. It only
 # applies to bracket entries, where a stop price is actually supplied.
 MAX_STOP_DISTANCE_PCT = float(os.getenv("MAX_STOP_DISTANCE_PCT", "15.0"))
+
+# --- ENTRY-BAR VOLUME FLOOR (server-side) -----------------------------------
+# The Pine scripts carry the same gate, but a TradingView alert freezes its own
+# copy of the script when it is created, so the gate in the script says nothing
+# about the gate in a running alert. NCPL and XLAB, 22 Oct: alerts created
+# before the volume input existed sent entries on 93.7K and 264K against a
+# 300K floor, and the chart label said BLOCKED the whole time.
+#
+# This is the copy that cannot go stale. The entry must carry "vol"; if a floor
+# is set for the route and vol is missing or under it, the entry is refused.
+# An alert from an old script sends no vol, so it is refused outright and has
+# to be recreated — which is the point.
+#
+# Shares, per BAR, so it scales with the chart timeframe. 0 = off for that
+# route. The manual/premarket floor defaults to OFF: premarket volume is a
+# fraction of RTH volume and the right number has not been measured.
+MIN_ENTRY_VOLUME = float(os.getenv("MIN_ENTRY_VOLUME", "300000"))
+MANUAL_MIN_ENTRY_VOLUME = float(os.getenv("MANUAL_MIN_ENTRY_VOLUME", "0"))
 
 # Alpaca refuses a bracket whose stop is not at least one cent below the entry:
 #   "stop_loss.stop_price must be <= base_price - 0.01"
@@ -1429,6 +1471,13 @@ def log_startup_config():
         f"SIGNAL_NOT_ALLOWED."
     )
     logger.info(
+        f"[CONFIG] entry-bar volume floor (server-side): bracket/RTH "
+        f"{'OFF' if MIN_ENTRY_VOLUME <= 0 else f'{MIN_ENTRY_VOLUME:,.0f} sh'} | manual/premarket "
+        f"{'OFF' if MANUAL_MIN_ENTRY_VOLUME <= 0 else f'{MANUAL_MIN_ENTRY_VOLUME:,.0f} sh'}. "
+        f"With a floor set, an entry that carries no 'vol' (an alert built from an old script) "
+        f"is rejected as VOL_MISSING."
+    )
+    logger.info(
         f"[CONFIG] premarket routing: "
         f"{'FORCED MANUAL' if PREMARKET_FORCE_MANUAL else 'payload decides'} — an entry inside "
         f"{PREMARKET_WINDOW_START}-{PREMARKET_WINDOW_END} ET is handled as manual whatever legs it "
@@ -1679,6 +1728,63 @@ def handle_entry(data, symbol, signal_type, start_time):
             sig=signal_type,
         )
 
+    # ---- ENTRY-BAR VOLUME FLOOR ---------------------------------------------
+    # Enforced HERE as well as in the Pine script, because a running TradingView
+    # alert holds a frozen copy of the script and may never have had the gate
+    # (NCPL and XLAB, 22 Oct). The reclaim bar's volume must arrive in the
+    # payload as "vol". With a floor set for this route, a missing vol is
+    # refused the same as a low one: an alert from an old script sends none,
+    # and the whole point is that it cannot trade ungated.
+    route_label = "manual/premarket" if manual_mode else "bracket/RTH"
+    vol_floor = MANUAL_MIN_ENTRY_VOLUME if manual_mode else MIN_ENTRY_VOLUME
+
+    bar_vol = None
+    raw_vol = data.get("vol")
+    if raw_vol is not None:
+        try:
+            bar_vol = float(raw_vol)
+        except (ValueError, TypeError):
+            bar_vol = None
+
+    alert_min_vol = data.get("min_vol")
+    script_ver = str(data.get("ver", "none"))
+
+    if bar_vol is None:
+        vol_txt = "not sent"
+    else:
+        vol_txt = f"{bar_vol:,.0f}"
+    vol_note = (
+        f" | vol={vol_txt} alert_floor={alert_min_vol if alert_min_vol is not None else 'not sent'} "
+        f"server_floor={vol_floor:,.0f} ver={script_ver}"
+    )
+
+    if vol_floor > 0:
+        if bar_vol is None:
+            return reject(
+                "VOL_MISSING", symbol,
+                f"no usable 'vol' in the entry payload (ver={script_ver}) and the {route_label} "
+                f"floor is {vol_floor:,.0f} sh — this alert was built from a script that does not "
+                f"send entry-bar volume. Delete it and recreate it from the current saved script",
+                sig=signal_type,
+            )
+        if bar_vol < vol_floor:
+            return reject(
+                "VOLUME_TOO_LOW", symbol,
+                f"entry bar volume {bar_vol:,.0f} is under the {route_label} floor of "
+                f"{vol_floor:,.0f} sh (alert's own floor: "
+                f"{alert_min_vol if alert_min_vol is not None else 'not sent'}, ver={script_ver})",
+                sig=signal_type,
+            )
+        try:
+            if alert_min_vol is not None and float(alert_min_vol) < vol_floor:
+                logger.warning(
+                    f"[VOL] {symbol} [{signal_type}] this alert's own floor ({alert_min_vol}) is "
+                    f"lower than the server floor ({vol_floor:,.0f}) — the server floor is what "
+                    f"applied. Recreate the alert if the lower number was not intended."
+                )
+        except (ValueError, TypeError):
+            pass
+
     if manual_mode:
         if not within_premarket_window():
             now_ny_str = datetime.now(NY_TZ).strftime("%H:%M:%S")
@@ -1855,7 +1961,7 @@ def handle_entry(data, symbol, signal_type, start_time):
                     f"[ENTRY-MANUAL] {symbol} [{signal_type}] qty={qty} limit={entry_limit} "
                     f"stop_ref={stop_ref if stop_ref > 0 else 'none'} (SIZING ONLY — no order at that price) | "
                     f"extended_hours=True {tp_note} | "
-                    f"equity=${equity:.2f} bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
+                    f"equity=${equity:.2f} bp=${buying_power:.2f}{note}{vol_note} | Order ID: {submitted.id} | "
                     f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
                 )
                 if tp_ok:
@@ -1869,7 +1975,7 @@ def handle_entry(data, symbol, signal_type, start_time):
                 send_alert(
                     f"[ENTRY] {symbol} [{signal_type}] qty={qty} limit={entry_limit} TP={take_profit} "
                     f"SL={stop_loss} (stop dist {stop_distance_pct:.2f}%) | equity=${equity:.2f} "
-                    f"bp=${buying_power:.2f}{note} | Order ID: {submitted.id} | "
+                    f"bp=${buying_power:.2f}{note}{vol_note} | Order ID: {submitted.id} | "
                     f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
                 )
         except Exception as e:
