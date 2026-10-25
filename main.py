@@ -1,3 +1,9 @@
+
+
+
+
+
+
 """
 Trading bot backend — TradingView -> Flask -> Alpaca.
 
@@ -487,6 +493,14 @@ stop_leg_ids = {}
 stop_price_lock = threading.Lock()
 last_known_stop = {}        # symbol -> the stop price that SHOULD be resting
 rearm_attempts = {}         # symbol -> tries so far, so a broken symbol cannot spam
+
+# symbol -> consecutive watchdog cycles with an open position and no live stop.
+# MODULE-LEVEL ON PURPOSE. It used to be a local inside position_manager_loop(),
+# so rearm_stop() — a separate module-level function — hit a NameError on its
+# naked_streak.pop(...) AFTER the replacement stop had already been submitted.
+# The stop was placed, the exception was swallowed as a 'transient error', and
+# no [REARM] confirmation was ever logged.
+naked_streak = {}
 
 
 def remember_stop_price(symbol, price):
@@ -1098,7 +1112,6 @@ def position_manager_loop():
 
     open_positions_tracked = {}
     cancel_requested_order_ids = set()
-    naked_streak = {}
     manual_reminder_sent = set()
 
     while True:
@@ -2219,12 +2232,6 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
-
-
-
-
-
 
 
 
