@@ -1,9 +1,3 @@
-
-
-
-
-
-
 """
 Trading bot backend — TradingView -> Flask -> Alpaca.
 
