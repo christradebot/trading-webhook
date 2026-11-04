@@ -368,16 +368,20 @@ DEFAULT_SIGNAL_TAG = os.getenv("DEFAULT_SIGNAL_TAG", "UNTAGGED")
 # entries, and it went unnoticed for ten hours. The VSA scripts replaced the
 # blue RTH bot and send VSA_* tags that nothing here recognised.
 #
+# CHRISBOT added 4 Nov for the CHRISBOT1501 scripts (tags CHRISBOT1501_RTH on
+# the bracket route, CHRISBOT1501_PM on the manual route). Same caveat as
+# above: if either list is set as an env var in Railway, add CHRISBOT THERE.
+#
 # Matching is by PREFIX, so a tag below covers every variant that starts with
 # it. ADD NEW SCRIPT TAGS HERE WHEN YOU ADD A SCRIPT — and keep the two lists
 # separate. The whole point is catching an alert pointed at the wrong route,
 # which is exactly what happened to CIGL.
 MANUAL_SIGNALS = [t.strip().upper() for t in os.getenv(
     "MANUAL_SIGNALS",
-    "KST_X,LOW_TEST,HTF_REVERSAL,BLUE,RETEST,VSA_PM").split(",") if t.strip()]
+    "KST_X,LOW_TEST,HTF_REVERSAL,BLUE,RETEST,VSA_PM,CHRISBOT").split(",") if t.strip()]
 BRACKET_SIGNALS = [t.strip().upper() for t in os.getenv(
     "BRACKET_SIGNALS",
-    "KST_X,BLUE,VSA_2BLUE,VSA_2PURP,PMR").split(",") if t.strip()]
+    "KST_X,BLUE,VSA_2BLUE,VSA_2PURP,PMR,CHRISBOT").split(",") if t.strip()]
 
 # Alpaca cannot accept a bracket outside regular hours — no stop leg, no OCO,
 # nothing. So a premarket message carrying stop_loss and take_profit is not a
@@ -614,7 +618,17 @@ def emergency_flatten():
 
 
 def _in_window(start_str, end_str):
-    now_ny = datetime.now(NY_TZ).time()
+    """True if now (New York) falls inside start..end, END MINUTE INCLUSIVE.
+
+    The comparison is made at MINUTE resolution. The window strings are HH:MM,
+    which parse to a time with zero seconds, so comparing the raw clock against
+    them made the end boundary 'HH:MM:00' exactly: a premarket window ending
+    09:29 refused an alert arriving at 09:29:01, and the bracket window ending
+    11:35 refused one at 11:35:01. Pine alerts fire on BAR CLOSE, which lands a
+    second or two past the minute, so the last bar of every window was lost.
+    Truncating the clock to the minute makes 09:29 mean 09:29:00-09:29:59.
+    """
+    now_ny = datetime.now(NY_TZ).time().replace(second=0, microsecond=0)
     start = datetime.strptime(start_str, "%H:%M").time()
     end = datetime.strptime(end_str, "%H:%M").time()
     return start <= now_ny <= end
@@ -1508,6 +1522,10 @@ def log_startup_config():
         f"outside regular hours with NO exit_limit is REFUSED, not guessed. EOD flatten at "
         f"{EOD_FLATTEN_TIME} ET remains the last backstop."
     )
+    logger.info(
+        "[CONFIG] window boundaries are compared at MINUTE resolution, end minute inclusive "
+        "(an end of 09:29 accepts an alert arriving at 09:29:59)."
+    )
 
 
 log_startup_config()
@@ -2226,109 +2244,3 @@ def webhook():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
