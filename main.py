@@ -284,6 +284,20 @@ MANUAL_MIN_ENTRY_VOLUME = float(os.getenv("MANUAL_MIN_ENTRY_VOLUME", "0"))
 # reason instead of a [CRIT] submission error.
 MIN_STOP_GAP = float(os.getenv("MIN_STOP_GAP", "0.01"))
 
+# --- ADD (scale-in), ONCE PER POSITION -----------------------------------------
+# A second buy signal while a position is open can ADD to it, exactly once. The Pine script marks the message
+# "add":true; the bot is the judge of whether an add is possible, because only the bot knows the real position:
+#   - add flagged but NO position (the script thought it was in a trade that is not real) -> handled as a NORMAL entry
+#   - add flagged, position open, not yet added                                          -> ADD
+#   - add flagged, position open, already added                                          -> refused (ADD_ALREADY)
+# The add is a plain limit BUY for ADD_SIZE_FRACTION of the normal risk-based size, capped so the COMBINED position
+# never exceeds the route's position cap. On the bracket route it is protected afterwards with its own OCO (target +
+# stop) for just the added shares, so the original bracket and the add together reserve exactly the position.
+# Anything other than a clean fill of the add leaves the original position exactly as it was.
+ADD_ENABLED = os.getenv("ADD_ENABLED", "True") == "True"
+ADD_SIZE_FRACTION = float(os.getenv("ADD_SIZE_FRACTION", "1.0"))
+ADD_FILL_TIMEOUT = int(os.getenv("ADD_FILL_TIMEOUT", "120"))
+
 # --- PREMARKET RESTING TARGET ------------------------------------------------
 # Alpaca refuses a STOP outside regular hours, which is why manual entries have
 # never carried protection. It does NOT refuse a SELL LIMIT: extended_hours with
@@ -459,6 +473,12 @@ signal_stats = defaultdict(lambda: {"entries": 0, "wins": 0, "losses": 0, "pl": 
 
 force_close_lock = threading.Lock()
 force_close_symbols = set()
+
+# Symbols that have already been added to once while their position is open.
+added_lock = threading.Lock()
+added_symbols = set()
+# symbol -> ids of the STOP legs belonging to ADD protection (the original bracket's leg is in stop_leg_ids).
+add_stop_leg_ids = {}
 
 # symbol -> order id of the bracket's STOP leg, captured from the submit
 # response at entry time.
@@ -765,7 +785,7 @@ def _is_live(order):
     return str(getattr(order, "status", "")).lower().split(".")[-1] not in DEAD_STATUSES
 
 
-def get_stop_orders(symbol):
+def _get_primary_stop_orders(symbol):
     """The live STOP order(s) for a symbol. Tries the remembered leg id
     FIRST, because the list endpoint drops the stop sibling once the entry
     fills."""
@@ -792,6 +812,27 @@ def get_stop_orders(symbol):
     if stops:
         with stop_leg_lock:
             stop_leg_ids[symbol] = stops[0].id
+    return stops
+
+
+def get_stop_orders(symbol):
+    """Every live STOP for the symbol: the original bracket's leg plus any leg created to protect an ADD.
+    A stop_update ratchets all of them, so the whole position trails together."""
+    stops = list(_get_primary_stop_orders(symbol))
+    seen = {str(o.id) for o in stops}
+    with stop_leg_lock:
+        extra = list(add_stop_leg_ids.get(symbol, []))
+    for lid in extra:
+        if str(lid) in seen:
+            continue
+        try:
+            o = trading_client.get_order_by_id(lid)
+        except Exception as e:
+            logger.warning(f"[ADD] {symbol} could not read add stop leg {lid}: {e}")
+            continue
+        if o is not None and _is_live(o) and getattr(o, "stop_price", None) is not None:
+            stops.append(o)
+            seen.add(str(o.id))
     return stops
 
 
@@ -1307,6 +1348,10 @@ def position_manager_loop():
                 manual_reminder_sent.discard(symbol)
                 unmark_manual(symbol)
                 forget_stop_leg(symbol)
+                with added_lock:
+                    added_symbols.discard(symbol)
+                with stop_leg_lock:
+                    add_stop_leg_ids.pop(symbol, None)
 
             for p in positions:
                 if p.symbol not in open_positions_tracked:
@@ -1529,6 +1574,12 @@ def log_startup_config():
 
 
 log_startup_config()
+logger.info(
+    f"[CONFIG] add-once: {'ON' if ADD_ENABLED else 'OFF'} — a second buy signal while in a position adds ONCE "
+    f"(size = {ADD_SIZE_FRACTION:g} x normal, capped so the combined position stays inside the position cap). "
+    f"An add flagged with no open position is handled as a normal entry. Bracket-route adds are protected by their own "
+    f"OCO after the fill (fill timeout {ADD_FILL_TIMEOUT}s)."
+)
 
 
 @app.route("/health", methods=["GET"])
@@ -1668,6 +1719,154 @@ def arm_manual_take_profit(symbol, buy_order_id, tp_price, signal_type):
                 return
     except Exception as e:
         send_alert(f"[CRIT] {symbol} take-profit watcher crashed — {e}. No target is resting.")
+
+
+# ============================================================
+# ADD (scale-in)
+# ============================================================
+def adjust_add_size(qty, position, entry_limit, manual_mode, equity):
+    """Sizes an ADD: ADD_SIZE_FRACTION of the normal size, capped so the combined position stays inside the route's
+    position cap. Returns (qty, note)."""
+    max_pos_pct = MANUAL_MAX_POSITION_PCT if manual_mode else MAX_POSITION_PCT
+    try:
+        existing_qty = abs(int(float(position.qty)))
+    except (TypeError, ValueError):
+        existing_qty = 0
+    existing_value = 0.0
+    try:
+        existing_value = abs(float(getattr(position, "market_value", 0) or 0))
+    except (TypeError, ValueError):
+        existing_value = 0.0
+    if existing_value <= 0:
+        try:
+            existing_value = existing_qty * float(position.current_price)
+        except (TypeError, ValueError):
+            existing_value = existing_qty * entry_limit
+    scaled = int(qty * ADD_SIZE_FRACTION)
+    room_value = equity * (max_pos_pct / 100.0) - existing_value
+    qty_room = int(room_value // entry_limit) if room_value > 0 else 0
+    final = max(0, min(scaled, qty_room))
+    note = (
+        f"ADD: normal size {qty} x {ADD_SIZE_FRACTION:g} = {scaled} sh; position holds {existing_qty} sh "
+        f"(${existing_value:.2f}); cap {max_pos_pct:.0f}% of ${equity:.2f} leaves room for {qty_room} sh -> {final} sh"
+    )
+    return final, note
+
+
+def arm_add_protection(symbol, buy_order_id, tp_price, stop_price, signal_type):
+    """Bracket-route ADD: waits for the add BUY to fill, then protects JUST the added shares.
+
+    The original bracket keeps protecting the original shares. The added shares get their own OCO (target + stop), so
+    the two together reserve exactly the position and neither starves the other of shares. If the OCO is refused, a
+    plain stop goes on instead. If that fails too, the alert says so and the Pine exit (which closes the WHOLE
+    position) and the EOD flatten are what protect the added shares.
+    """
+    try:
+        deadline = time.time() + ADD_FILL_TIMEOUT
+        filled_qty = 0
+        terminal = False
+        while time.time() < deadline:
+            time.sleep(2.0)
+            try:
+                o = trading_client.get_order_by_id(buy_order_id)
+            except Exception as e:
+                logger.warning(f"[ADD] {symbol} could not read the add buy — {e}")
+                continue
+            try:
+                filled_qty = int(float(getattr(o, "filled_qty", 0) or 0))
+            except (TypeError, ValueError):
+                filled_qty = 0
+            status = str(getattr(o, "status", "")).lower()
+            if any(k in status for k in ("canceled", "cancelled", "expired", "rejected")):
+                terminal = True
+                break
+            if "filled" in status and "partially" not in status:
+                terminal = True
+                break
+
+        if not terminal:
+            # Still resting after the timeout: stop it from filling later at a stale price, then protect what filled.
+            try:
+                retry_cancel_order(buy_order_id)
+            except Exception as e:
+                logger.warning(f"[ADD] {symbol} could not cancel the unfilled add buy — {e}")
+            time.sleep(1.0)
+            try:
+                o = trading_client.get_order_by_id(buy_order_id)
+                filled_qty = int(float(getattr(o, "filled_qty", 0) or 0))
+            except Exception:
+                pass
+
+        if filled_qty < 1:
+            with added_lock:
+                added_symbols.discard(symbol)
+            send_alert(
+                f"[ADD] {symbol} [{signal_type}] the add did not fill within {ADD_FILL_TIMEOUT}s — nothing was added. "
+                f"The original position is unchanged."
+            )
+            return
+
+        if position_gone(symbol):
+            send_alert(
+                f"[ADD] {symbol} [{signal_type}] the position closed while the add was filling — {filled_qty} sh may "
+                f"have been bought after the exit. CHECK ALPACA."
+            )
+            return
+
+        stop_rounded = round_tick(stop_price)
+        tp_rounded = round_tick(tp_price) if tp_price and tp_price > 0 else None
+        placed = None
+        kind = ""
+        if tp_rounded:
+            try:
+                placed = trading_client.submit_order(LimitOrderRequest(
+                    symbol=symbol,
+                    qty=filled_qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=tp_rounded,
+                    order_class=OrderClass.OCO,
+                    take_profit=TakeProfitRequest(limit_price=tp_rounded),
+                    stop_loss=StopLossRequest(stop_price=stop_rounded),
+                ))
+                kind = f"OCO target ${tp_rounded} / stop ${stop_rounded}"
+            except Exception as e:
+                logger.warning(f"[ADD] {symbol} OCO protection refused ({e}) — falling back to a plain stop")
+                placed = None
+        if placed is None:
+            try:
+                placed = trading_client.submit_order(StopOrderRequest(
+                    symbol=symbol,
+                    qty=filled_qty,
+                    side=OrderSide.SELL,
+                    time_in_force=TimeInForce.DAY,
+                    stop_price=stop_rounded,
+                ))
+                kind = f"plain STOP ${stop_rounded} (no target on the added shares)"
+            except Exception as e:
+                send_alert(
+                    f"[CRIT] {symbol} [{signal_type}] ADD FILLED ({filled_qty} sh) but its protection FAILED — {e}. "
+                    f"The added shares have NO resting stop. The script's exit (closes the whole position) and the "
+                    f"EOD flatten still cover them. Consider closing by hand."
+                )
+                return
+
+        stop_id = None
+        for leg in (getattr(placed, "legs", None) or []):
+            if leg.type == OrderType.STOP:
+                stop_id = leg.id
+        if stop_id is None and getattr(placed, "type", None) == OrderType.STOP:
+            stop_id = placed.id
+        if stop_id is not None:
+            with stop_leg_lock:
+                add_stop_leg_ids.setdefault(symbol, []).append(stop_id)
+
+        send_alert(
+            f"[ADD] {symbol} [{signal_type}] add FILLED {filled_qty} sh; protected with {kind}. "
+            f"Order ID: {placed.id} — stop_update now ratchets both stops."
+        )
+    except Exception as e:
+        send_alert(f"[CRIT] {symbol} add-protection watcher crashed — {e}. Check the added shares by hand.")
 
 
 # ============================================================
@@ -1877,17 +2076,42 @@ def handle_entry(data, symbol, signal_type, start_time):
                 sig=signal_type,
             )
 
+    # ---- ADD (scale-in): is this message an add to a real, open position? --------
+    is_add = False
+    add_position = None
+    if ADD_ENABLED and str(data.get("add", "")).lower() in ("true", "1", "yes"):
+        try:
+            add_position = get_position(symbol)
+        except Exception as e:
+            return reject("POSITION_CHECK_FAILED", symbol, f"could not verify position for an add: {e}",
+                          http_status=500, log_level="error", sig=signal_type)
+        if add_position is None:
+            logger.info(
+                f"[ADD] {symbol} [{signal_type}] add requested but there is NO open position — the script "
+                f"believed it was in a trade that is not real. Handling as a NORMAL entry."
+            )
+        else:
+            owned, why = owns_position(symbol, data)
+            if not owned:
+                return reject("NOT_OWNER", symbol, f"add ignored — {why}", sig=signal_type)
+            with added_lock:
+                already = symbol in added_symbols
+            if already:
+                return reject("ADD_ALREADY", symbol,
+                              "this position has already been added to once — no further adds", sig=signal_type)
+            is_add = True
+
     with order_lock:
         now = time.time()
         global recent_signals
         recent_signals = {k: t for k, t in recent_signals.items() if now - t < SIGNAL_DEDUPE_WINDOW_SECONDS}
-        dedupe_key = (symbol, signal_type)
+        dedupe_key = (symbol, signal_type + ("_ADD" if is_add else ""))
         if recent_signals.get(dedupe_key) is not None:
             return reject("DUPLICATE", symbol, f"duplicate entry within {SIGNAL_DEDUPE_WINDOW_SECONDS}s",
                           sig=signal_type)
 
         try:
-            in_use = open_exposure_count()
+            in_use = 0 if is_add else open_exposure_count()   # an add uses the slot it already holds
             if in_use >= MAX_CONCURRENT_POSITIONS:
                 return reject("CONCURRENCY_CAP", symbol,
                               f"{in_use}/{MAX_CONCURRENT_POSITIONS} slots in use", sig=signal_type)
@@ -1910,6 +2134,10 @@ def handle_entry(data, symbol, signal_type, start_time):
         risk_ref = stop_ref if manual_mode else stop_loss
         qty, size_note = size_position(entry_limit, risk_ref, manual_mode, buying_power, equity)
         logger.info(f"[SIZE] {symbol} [{signal_type}] {size_note}")
+        if is_add:
+            qty, add_note = adjust_add_size(qty, add_position, entry_limit, manual_mode, equity)
+            size_note = add_note
+            logger.info(f"[SIZE] {symbol} [{signal_type}] {add_note}")
 
         if qty < 1:
             return reject("INSUFFICIENT_BP", symbol,
@@ -1917,7 +2145,17 @@ def handle_entry(data, symbol, signal_type, start_time):
                           sig=signal_type)
 
         try:
-            if manual_mode:
+            if is_add:
+                # An ADD is always a plain limit BUY. Protection for the added shares is attached after the fill.
+                order = LimitOrderRequest(
+                    symbol=symbol,
+                    qty=qty,
+                    side=OrderSide.BUY,
+                    time_in_force=TimeInForce.DAY,
+                    limit_price=round_tick(entry_limit),
+                    extended_hours=manual_mode,
+                )
+            elif manual_mode:
                 # PLAIN LIMIT, extended hours. Alpaca requires TIF=DAY for
                 # extended-hours orders and refuses bracket/OCO entirely
                 # outside regular hours, which is why there are no legs.
@@ -1947,6 +2185,35 @@ def handle_entry(data, symbol, signal_type, start_time):
             # four identical failures in 20 seconds on 24 Sep.
             recent_signals[dedupe_key] = now
             submitted = trading_client.submit_order(order)
+
+            if is_add:
+                # Deliberately NOT touching pending_signal_types, the manual flag, the remembered stop leg/price or the
+                # entry stats: the position, its owner and its stops are the original ones.
+                with added_lock:
+                    added_symbols.add(symbol)
+                latency_ms = (time.time() - start_time) * 1000
+                send_alert(
+                    f"[ADD] {symbol} [{signal_type}] qty={qty} limit={entry_limit} "
+                    f"{'(extended hours, no resting legs) ' if manual_mode else ''}| {size_note} | "
+                    f"equity=${equity:.2f} bp=${buying_power:.2f}{vol_note} | Order ID: {submitted.id} | "
+                    f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
+                )
+                if manual_mode:
+                    tp_ok_add = MANUAL_TP and take_profit > 0 and take_profit > entry_limit
+                    if tp_ok_add:
+                        threading.Thread(
+                            target=arm_manual_take_profit,
+                            args=(symbol, submitted.id, take_profit, signal_type),
+                            daemon=True,
+                        ).start()
+                else:
+                    threading.Thread(
+                        target=arm_add_protection,
+                        args=(symbol, submitted.id, take_profit, stop_loss, signal_type),
+                        daemon=True,
+                    ).start()
+                return "Success", 200
+
             pending_signal_types[symbol] = signal_type
 
             with signal_stats_lock:
@@ -2069,8 +2336,15 @@ def handle_stop_update(data, symbol):
             replaced = retry_replace_order(o.id, ReplaceOrderRequest(stop_price=stop_price))
             new_id = getattr(replaced, "id", None)
             if new_id is not None:
+                # A replace creates a NEW order id. Keep each stop's id in its own slot: the original bracket's leg, or
+                # one of the add-protection legs. Overwriting the wrong one would orphan a stop.
                 with stop_leg_lock:
-                    stop_leg_ids[symbol] = new_id
+                    adds = add_stop_leg_ids.get(symbol, [])
+                    idx = next((i for i, x in enumerate(adds) if str(x) == str(o.id)), None)
+                    if idx is not None:
+                        adds[idx] = new_id
+                    else:
+                        stop_leg_ids[symbol] = new_id
             # Keep the re-arm price in step with the ratchet. If the leg
             # vanishes after three trail moves, the watchdog must restore the
             # CURRENT stop, not the one submitted at entry — restoring a stale
