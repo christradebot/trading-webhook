@@ -901,6 +901,17 @@ def cancel_resting_legs(symbol):
                 logger.warning(f"Could not cancel {o.id} for {symbol}: {e}")
     except Exception as e:
         logger.warning(f"Could not list open orders for {symbol}: {e}")
+
+    # The list endpoint can drop a stop sibling once its parent has filled, so also cancel any stop legs created to
+    # protect an ADD by their remembered ids. A leg that is already gone just raises and is ignored.
+    with stop_leg_lock:
+        add_ids = list(add_stop_leg_ids.get(symbol, []))
+    for lid in add_ids:
+        try:
+            trading_client.cancel_order_by_id(lid)
+            cancelled += 1
+        except Exception as e:
+            logger.debug(f"[ADD] {symbol} add stop leg {lid} not cancelled (probably already gone): {e}")
     return cancelled
 
 
@@ -1455,7 +1466,17 @@ def position_manager_loop():
                             # An entry that never fills never closes, so
                             # without this the tag and the manual flag leak
                             # and mislabel the next trade on that symbol.
-                            if part < 1:
+                            if part < 1 and o.symbol in current_symbols:
+                                # A stale unfilled ADD on a position that IS open. The position, its owner tag and its
+                                # manual flag are real and must stay; only the add is abandoned, and a new add may be
+                                # attempted later.
+                                with added_lock:
+                                    added_symbols.discard(o.symbol)
+                                send_alert(
+                                    f"[TIMEOUT] Requested cancel for stale unfilled ADD on {o.symbol} after "
+                                    f"{age:.0f}s — the open position is unchanged."
+                                )
+                            elif part < 1:
                                 pending_signal_types.pop(o.symbol, None)
                                 unmark_manual(o.symbol)
                                 send_alert(
