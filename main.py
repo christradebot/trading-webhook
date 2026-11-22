@@ -73,8 +73,50 @@ Inbound message types:
                   The level lives in TradingView, and the instant it breaks a
                   fresh sell is submitted, which is simply the order the
                   operator would have placed by hand at that moment.
+
+NOT-TRADABLE RETRY (21 Nov)
+---------------------------
+AKAN, 20 Nov 06:55 ET: Alpaca refused the entry with
+{"code":42210000,"message":"asset \"AKAN\" is not tradable"}. The repeat alert
+10s later was blocked as a DUPLICATE (the dedupe key is recorded before the
+submit), and the next signal came 40 minutes later at a price ~12% higher.
+
+That specific error is now retried in a background thread: every
+NOT_TRADABLE_RETRY_INTERVAL seconds, for up to NOT_TRADABLE_RETRY_SECONDS.
+Each attempt is a full pass through handle_entry, so the window, volume floor,
+concurrency cap, sizing and duplicate checks are all re-run from scratch — the
+retry can never enter a trade that a fresh alert would have been refused. The
+entry price is still the one the script sent; nothing here looks a price up.
+An exit message for the symbol cancels a pending retry. Set
+NOT_TRADABLE_RETRY_SECONDS=0 to turn the retry off.
+
+EXIT HANDLING AUDIT (21 Nov)
+----------------------------
+Found by reading the 20 Nov VWAV log:
+
+  * The Pine script sent the same exit 3-4 times within a second. Each copy
+    cancelled the previous copy's resting sell and sent its own, sized from a
+    position quantity read BEFORE the cancel. One copy asked to sell 51 sh with
+    12 left and failed. Exits are now serialised per symbol, an exit that is
+    already working is left alone (it keeps working through partial fills), and
+    the quantity is re-read after the cancel.
+  * The [WIN]/[LOSS] line and the daily P/L summary counted ONE exit order. VWAV
+    #1 logged -$0.58 (7 sh) when the account actually lost $4.32 (52 sh); VWAV
+    #2 logged -$1.92 (12 sh) against a real -$8.39. All sell fills are now
+    summed.
+  * watch_exit_fill compared the status to 'canceled' etc. exactly, but str() of
+    an Alpaca status is 'OrderStatus.CANCELED', so a cancelled exit was never
+    recognised. Status is now normalised.
+  * The take-profit guard treated PARTIALLY_FILLED as terminal and stopped
+    watching, so an orphaned target could outlive its position.
+  * The 401/403 auth check was a substring test, so any error text containing
+    those digits (Alpaca's own insufficient-qty code is 40310000) could trigger
+    emergency_flatten. It now looks at the HTTP status.
+  * A missing WEBHOOK_SECRET env var made `None != None` False, i.e. every
+    request authenticated. The webhook now fails closed.
 """
 
+import hmac
 import logging
 import os
 import re
@@ -298,6 +340,18 @@ ADD_ENABLED = os.getenv("ADD_ENABLED", "True") == "True"
 ADD_SIZE_FRACTION = float(os.getenv("ADD_SIZE_FRACTION", "1.0"))
 ADD_FILL_TIMEOUT = int(os.getenv("ADD_FILL_TIMEOUT", "120"))
 
+# --- NOT-TRADABLE RETRY --------------------------------------------------------
+# Alpaca answered an entry with code 42210000 ('asset "X" is not tradable'). AKAN, 20 Nov 06:55 ET: the first alert was
+# refused, the repeat 10s later was blocked as a DUPLICATE, and the next signal arrived 40 minutes later ~12% higher.
+#
+# That one error is retried in a background thread every NOT_TRADABLE_RETRY_INTERVAL seconds for up to
+# NOT_TRADABLE_RETRY_SECONDS. Capped short on purpose: the entry is a limit at the price the script sent, so a retry
+# that lands minutes later is a different trade from the one that was approved. 0 turns the retry off (the failure is
+# then just logged as a NOT_TRADABLE reject).
+NOT_TRADABLE_RETRY_SECONDS = int(os.getenv("NOT_TRADABLE_RETRY_SECONDS", "30"))
+NOT_TRADABLE_RETRY_INTERVAL = float(os.getenv("NOT_TRADABLE_RETRY_INTERVAL", "5"))
+NOT_TRADABLE_MSG = "Asset not tradable"
+
 # --- PREMARKET RESTING TARGET ------------------------------------------------
 # Alpaca refuses a STOP outside regular hours, which is why manual entries have
 # never carried protection. It does NOT refuse a SELL LIMIT: extended_hours with
@@ -458,6 +512,22 @@ recent_signals = {}
 SIGNAL_DEDUPE_WINDOW_SECONDS = 15
 
 pending_signal_types = {}
+
+# Symbols with a not-tradable retry thread running. One thread per symbol; an
+# exit message for the symbol removes it from here, which is how the retry is
+# told to stop.
+not_tradable_lock = threading.Lock()
+not_tradable_retrying = set()
+
+# EXIT STATE. exit_locks serialises exit messages per symbol (the same exit can
+# arrive 3-4 times within a second); active_exit remembers the extended-hours
+# SELL LIMIT currently working so a repeat can be recognised and left alone.
+exit_state_lock = threading.Lock()
+active_exit = {}            # symbol -> (order_id, limit_price)
+exit_locks_guard = threading.Lock()
+exit_locks = {}             # symbol -> threading.Lock
+EXIT_REPLACING = "REPLACING"
+EXIT_FILL_LOOKBACK_GRACE_SECONDS = 30
 
 # Symbols entered via the manual path. Their positions have no stop leg BY
 # DESIGN, so the naked-position watchdog must not treat them as an
@@ -621,6 +691,38 @@ def is_transient_error(e):
     err_str = str(e)
     transient = ["429", "500", "502", "503", "504", "timeout", "reset", "temporarily unavailable"]
     return any(i in err_str for i in transient)
+
+
+def is_not_tradable_error(e):
+    """True for Alpaca's 'asset is not tradable' refusal (code 42210000).
+
+    Matched on the code OR the message text, since the SDK wraps the broker's
+    JSON body in an exception string and either part may survive the wrapping."""
+    err_str = str(e)
+    return "42210000" in err_str or "is not tradable" in err_str.lower()
+
+
+def is_auth_error(e):
+    """True only for a genuine authentication/authorisation failure.
+
+    The old test was `"401" in str(e)`, which also matches prices, quantities,
+    UUIDs and Alpaca's own business codes — 40310000 (insufficient qty) contains
+    '403'. A false positive here calls emergency_flatten. Prefer the HTTP status
+    the SDK attaches; fall back to the digits only alongside the words."""
+    code = getattr(e, "status_code", None)
+    if code in (401, 403):
+        # Alpaca also answers 403 for order-level refusals (insufficient qty /
+        # buying power) that carry a 4031xxxx business code. Those are not auth.
+        return not re.search(r'"code"\s*:\s*403\d{5}', str(e))
+    s = str(e).lower()
+    return bool(re.search(r"\b(401|403)\b", s)) and ("unauthorized" in s or "forbidden" in s) \
+        and not re.search(r'"code"\s*:\s*403\d{5}', s)
+
+
+def _status_name(order):
+    """Order status as a bare lowercase word. str() of an Alpaca status enum is
+    'OrderStatus.CANCELED', which never equals 'canceled'."""
+    return str(getattr(order, "status", "")).lower().split(".")[-1]
 
 
 def send_alert(message):
@@ -966,6 +1068,93 @@ def close_position_with_retry(symbol, reason, attempts=3, delay=1.0):
     return False
 
 
+def set_active_exit(symbol, order_id, limit_price):
+    with exit_state_lock:
+        active_exit[symbol] = (order_id, limit_price)
+
+
+def clear_active_exit(symbol, order_id=None):
+    """Forget the working exit. With order_id, only if it is still THAT order."""
+    with exit_state_lock:
+        cur = active_exit.get(symbol)
+        if cur is not None and (order_id is None or cur[0] == order_id):
+            active_exit.pop(symbol, None)
+
+
+def exit_superseded(symbol, order_id):
+    """True if a newer exit has replaced this one (a replace cancels the old)."""
+    with exit_state_lock:
+        cur = active_exit.get(symbol)
+    return cur is not None and cur[0] != order_id
+
+
+def get_working_exit(symbol):
+    """(order_id, limit) of the extended-hours exit still resting for the
+    symbol, or None. A partially filled exit is still working: it keeps its
+    unfilled remainder resting."""
+    with exit_state_lock:
+        cur = active_exit.get(symbol)
+    if not cur or cur[0] == EXIT_REPLACING:
+        return None
+    try:
+        o = trading_client.get_order_by_id(cur[0])
+    except Exception as e:
+        logger.warning(f"[EXIT] {symbol} could not read the working exit {cur[0]}: {e}")
+        return None
+    if _is_live(o):
+        return cur
+    clear_active_exit(symbol, cur[0])
+    return None
+
+
+def exit_lock_for(symbol):
+    with exit_locks_guard:
+        lock = exit_locks.get(symbol)
+        if lock is None:
+            lock = exit_locks[symbol] = threading.Lock()
+        return lock
+
+
+def summarize_exit_fills(orders, opened_at):
+    """Sums EVERY sell fill since the position opened.
+
+    A close can be several orders: partial fills, a cancelled-and-replaced exit,
+    duplicate exits. Counting one of them is how VWAV logged -$0.58 for a trade
+    that lost $4.32. Returns (qty, avg_price, n_orders, order_types, last_fill_time).
+    """
+    total_qty = 0.0
+    total_val = 0.0
+    n = 0
+    types = set()
+    last = None
+    floor = opened_at - timedelta(seconds=EXIT_FILL_LOOKBACK_GRACE_SECONDS)
+    for o in orders:
+        if o.side != OrderSide.SELL:
+            continue
+        try:
+            fq = float(getattr(o, "filled_qty", 0) or 0)
+            fp = float(getattr(o, "filled_avg_price", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if fq <= 0 or fp <= 0:
+            continue
+        ts = getattr(o, "submitted_at", None) or getattr(o, "created_at", None)
+        try:
+            if ts is not None and ts < floor:
+                continue
+        except TypeError:
+            pass
+        total_qty += fq
+        total_val += fq * fp
+        n += 1
+        types.add(str(getattr(o, "type", "")).lower().split(".")[-1])
+        ft = getattr(o, "filled_at", None)
+        if ft is not None and (last is None or ft > last):
+            last = ft
+    avg = (total_val / total_qty) if total_qty > 0 else 0.0
+    return total_qty, avg, n, types, last
+
+
 def watch_exit_fill(symbol, order_id, want_qty, reason):
     """Follows an extended-hours exit until it fills, dies, or times out.
 
@@ -977,29 +1166,43 @@ def watch_exit_fill(symbol, order_id, want_qty, reason):
     deadline = time.time() + EXIT_FILL_TIMEOUT
     while time.time() < deadline:
         time.sleep(5)
+        if exit_superseded(symbol, order_id):
+            return
         try:
             o = trading_client.get_order_by_id(order_id)
         except Exception:
             continue
 
-        status = str(getattr(o, "status", "")).lower()
+        status = _status_name(o)
         try:
             filled = int(float(getattr(o, "filled_qty", 0) or 0))
         except (TypeError, ValueError):
             filled = 0
 
-        if "filled" in status and "partially" not in status:
+        if status == "filled":
+            clear_active_exit(symbol, order_id)
             unmark_manual(symbol)
             pending_signal_types.pop(symbol, None)
             send_alert(f"[EXIT] {symbol} — FLAT. {filled} sh sold ({reason})")
             return
 
         if status in ("canceled", "cancelled", "rejected", "expired"):
+            if exit_superseded(symbol, order_id):
+                return          # replaced by a more aggressive exit; that one has its own watcher
+            clear_active_exit(symbol, order_id)
+            if position_gone(symbol):
+                unmark_manual(symbol)
+                pending_signal_types.pop(symbol, None)
+                send_alert(f"[EXIT] {symbol} — flat ({reason}); exit order ended {status.upper()}")
+                return
             send_alert(
                 f"[CRIT] {symbol} EXIT ORDER {status.upper()} ({reason}) — "
                 f"{filled} of {want_qty} sh sold. YOU ARE STILL LONG. Close it by hand."
             )
             return
+
+    if exit_superseded(symbol, order_id):
+        return
 
     try:
         still = get_position(symbol)
@@ -1007,6 +1210,7 @@ def watch_exit_fill(symbol, order_id, want_qty, reason):
         still = None
 
     if still is None:
+        clear_active_exit(symbol, order_id)
         unmark_manual(symbol)
         pending_signal_types.pop(symbol, None)
         send_alert(f"[EXIT] {symbol} — flat ({reason})")
@@ -1045,6 +1249,7 @@ def close_position_extended(symbol, qty, limit_price, reason):
         )
         return False
 
+    set_active_exit(symbol, placed.id, round_tick(limit_price))
     send_alert(
         f"[EXIT] {symbol} — extended-hours SELL LIMIT {qty} sh @ ${round_tick(limit_price)} "
         f"({reason}) | Order ID: {placed.id} | NOT a market order — watching it fill"
@@ -1303,40 +1508,41 @@ def position_manager_loop():
                 sig = info.get("signal", DEFAULT_SIGNAL_TAG)
                 try:
                     lookback_start = info["opened_at"] - timedelta(minutes=5)
+                    peak = info.get("peak_qty", info["qty"])
 
-                    exit_order = None
+                    exit_qty, exit_avg, exit_n, exit_types, exit_last = 0.0, 0.0, 0, set(), None
                     for attempt in range(3):
                         recent = trading_client.get_orders(
                             filter=GetOrdersRequest(
                                 status=QueryOrderStatus.CLOSED,
                                 symbols=[symbol],
-                                limit=10,
+                                limit=50,
                                 after=lookback_start,
                                 nested=False,
                             )
                         )
-                        exit_order = next(
-                            (o for o in recent if o.side == OrderSide.SELL and o.filled_avg_price), None
+                        exit_qty, exit_avg, exit_n, exit_types, exit_last = summarize_exit_fills(
+                            recent, info["opened_at"]
                         )
-                        if exit_order or attempt == 2:
+                        # Done once everything that was held is accounted for.
+                        if exit_qty >= peak - 0.5 or attempt == 2:
                             break
                         time.sleep(1.5)
 
-                    if exit_order:
-                        exit_price = float(exit_order.filled_avg_price)
-                        qty = float(exit_order.filled_qty or info["qty"])
+                    if exit_n:
+                        exit_price = exit_avg
+                        qty = exit_qty
                         pl = (exit_price - info["entry_price"]) * qty
                         pl_pct = ((exit_price / info["entry_price"]) - 1) * 100
-                        exit_time = (
-                            exit_order.filled_at.astimezone(NY_TZ).strftime("%H:%M:%S")
-                            if exit_order.filled_at
-                            else "?"
-                        )
+                        exit_time = exit_last.astimezone(NY_TZ).strftime("%H:%M:%S") if exit_last else "?"
                         tag = "[WIN]" if pl >= 0 else "[LOSS]"
+                        short = f" | WARNING: sold {qty:.0f} of {peak:.0f} sh — fills not all visible yet" \
+                            if qty < peak - 0.5 else ""
                         logger.info(
                             f"{tag} {symbol} [{sig}] entry ${info['entry_price']:.4f} -> "
                             f"exit ${exit_price:.4f} @ {exit_time} ET | qty {qty:.0f} | "
-                            f"P/L: ${pl:.2f} ({pl_pct:+.2f}%) | exit: {exit_order.type}"
+                            f"P/L: ${pl:.2f} ({pl_pct:+.2f}%) | exit: {'/'.join(sorted(exit_types))} "
+                            f"({exit_n} order(s)){short}"
                         )
                         with signal_stats_lock:
                             s = signal_stats[sig]
@@ -1371,8 +1577,12 @@ def position_manager_loop():
                         "entry_price": float(p.avg_entry_price),
                         "opened_at": datetime.now(timezone.utc),
                         "signal": pending_signal_types.get(p.symbol, DEFAULT_SIGNAL_TAG),
+                        "peak_qty": float(p.qty),
                     }
                 else:
+                    open_positions_tracked[p.symbol]["peak_qty"] = max(
+                        open_positions_tracked[p.symbol].get("peak_qty", 0.0), float(p.qty)
+                    )
                     open_positions_tracked[p.symbol]["qty"] = float(p.qty)
                     open_positions_tracked[p.symbol]["entry_price"] = float(p.avg_entry_price)
 
@@ -1483,6 +1693,12 @@ def position_manager_loop():
                                     f"[TIMEOUT] Requested cancel for stale unfilled entry for {o.symbol} "
                                     f"after {age:.0f}s — slot frees once Alpaca confirms."
                                 )
+                            elif is_manual(o.symbol):
+                                send_alert(
+                                    f"[TIMEOUT] {o.symbol} manual entry was PARTIALLY filled ({part} sh); the "
+                                    f"unfilled remainder was cancelled after {age:.0f}s. The {part} sh are real "
+                                    f"and have NO stop — manage them by hand."
+                                )
                             else:
                                 naked_streak[o.symbol] = 1
                                 send_alert(
@@ -1495,7 +1711,7 @@ def position_manager_loop():
                             send_alert(f"[CRIT] Failed to cancel stale entry {o.id} for {o.symbol}: {e}")
 
         except Exception as e:
-            if any(code in str(e) for code in ["401", "403"]):
+            if is_auth_error(e):
                 emergency_flatten()
                 break
             logger.warning(f"Transient error in position manager: {e}. Retrying...")
@@ -1592,6 +1808,23 @@ def log_startup_config():
         "[CONFIG] window boundaries are compared at MINUTE resolution, end minute inclusive "
         "(an end of 09:29 accepts an alert arriving at 09:29:59)."
     )
+    if NOT_TRADABLE_RETRY_SECONDS > 0:
+        logger.info(
+            f"[CONFIG] not-tradable retry: ON — an entry refused with 'asset is not tradable' is retried "
+            f"every {NOT_TRADABLE_RETRY_INTERVAL:g}s for up to {NOT_TRADABLE_RETRY_SECONDS}s, each attempt a "
+            f"full re-run of every entry check at the ORIGINAL limit price. An exit for the symbol cancels it."
+        )
+    else:
+        logger.info("[CONFIG] not-tradable retry: OFF — a refused entry is logged as NOT_TRADABLE and dropped.")
+    logger.info(
+        "[CONFIG] exit handling: exits are serialised per symbol; an extended-hours exit that is already "
+        "working is left alone (EXIT_ALREADY_WORKING) unless a LOWER exit_limit arrives; the close P/L sums "
+        "every sell fill."
+    )
+    if os.getenv("WEBHOOK_SECRET"):
+        logger.info("[CONFIG] webhook secret: SET")
+    else:
+        logger.error("[CONFIG] webhook secret: NOT SET — every webhook will be refused until WEBHOOK_SECRET is configured")
 
 
 log_startup_config()
@@ -1714,11 +1947,14 @@ def arm_manual_take_profit(symbol, buy_order_id, tp_price, signal_type):
         while time.time() < guard_until:
             time.sleep(10.0)
             try:
-                st = str(getattr(trading_client.get_order_by_id(placed.id), "status", "")).lower()
+                st = _status_name(trading_client.get_order_by_id(placed.id))
             except Exception:
                 continue
-            if any(k in st for k in ("filled", "canceled", "cancelled", "expired", "rejected")):
-                if "filled" in st and "partially" not in st:
+            # TERMINAL statuses only. A substring test treated PARTIALLY_FILLED
+            # as terminal and stopped the guard while the target was still
+            # resting — the orphaned-target protection then no longer ran.
+            if st in ("filled", "canceled", "cancelled", "expired", "rejected"):
+                if st == "filled":
                     send_alert(f"[TP] {symbol} [{signal_type}] target FILLED at ${tp_rounded}.")
                 return
             try:
@@ -1891,9 +2127,119 @@ def arm_add_protection(symbol, buy_order_id, tp_price, stop_price, signal_type):
 
 
 # ============================================================
+# NOT-TRADABLE RETRY
+# ============================================================
+def cancel_not_tradable_retry(symbol):
+    """Tells a pending not-tradable retry for this symbol to stop. True if one
+    was pending. Called by handle_exit: if the script has already given up on
+    the trade, a late retry must not open it."""
+    with not_tradable_lock:
+        if symbol in not_tradable_retrying:
+            not_tradable_retrying.discard(symbol)
+            return True
+    return False
+
+
+def not_tradable_retry_loop(data, symbol, signal_type):
+    """Background retry for an entry Alpaca refused as 'not tradable'.
+
+    Runs OUTSIDE order_lock and sleeps between attempts, so it never holds up
+    other webhooks. Each attempt is a complete pass through handle_entry, which
+    re-checks the window, volume floor, concurrency slot, position/add state,
+    duplicate guard and sizing — the retry cannot enter anything a fresh alert
+    would have been refused. It stops on the first outcome that is not
+    'still not tradable': success, or any other reject (window closed, slot
+    taken, position already open, duplicate from a re-fired alert, ...).
+    """
+    deadline = time.time() + NOT_TRADABLE_RETRY_SECONDS
+    attempt = 0
+    try:
+        while time.time() < deadline:
+            time.sleep(NOT_TRADABLE_RETRY_INTERVAL)
+
+            with not_tradable_lock:
+                still_wanted = symbol in not_tradable_retrying
+            if not still_wanted:
+                logger.info(f"[RETRY] {symbol} [{signal_type}] not-tradable retry cancelled (exit received)")
+                return
+
+            attempt += 1
+            try:
+                msg, status = handle_entry(data, symbol, signal_type, time.time(), in_retry=True)
+            except Exception as e:
+                send_alert(f"[CRIT] {symbol} [{signal_type}] not-tradable retry crashed on attempt {attempt}: {e}")
+                return
+
+            if msg == NOT_TRADABLE_MSG:
+                continue
+
+            if msg == "Success":
+                send_alert(
+                    f"[RETRY] {symbol} [{signal_type}] entry went through on retry attempt {attempt} "
+                    f"(Alpaca accepted the symbol again)."
+                )
+            else:
+                logger.info(
+                    f"[RETRY] {symbol} [{signal_type}] retry stopped on attempt {attempt} — "
+                    f"entry was not placed: {msg}"
+                )
+            return
+
+        send_alert(
+            f"[CRIT] {symbol} [{signal_type}] still NOT TRADABLE after {NOT_TRADABLE_RETRY_SECONDS}s of retries — "
+            f"giving up. No entry was placed. Check Alpaca's asset status and the exchange halt list."
+        )
+    finally:
+        with not_tradable_lock:
+            not_tradable_retrying.discard(symbol)
+
+
+def handle_not_tradable(data, symbol, signal_type, err, in_retry):
+    """What to do when Alpaca refuses an entry as 'not tradable'.
+
+    First failure: record it as its own reject (NOT_TRADABLE, so it shows in
+    the daily summary instead of hiding in the generic [CRIT] pile) and start
+    the background retry. Failures inside the retry are quiet — the loop
+    reports the outcome once, at the end."""
+    if in_retry:
+        logger.info(f"[RETRY] {symbol} [{signal_type}] still not tradable — {err}")
+        return NOT_TRADABLE_MSG, 503
+
+    if NOT_TRADABLE_RETRY_SECONDS <= 0:
+        return reject(
+            "NOT_TRADABLE", symbol,
+            f"Alpaca refused the entry as not tradable ({err}) — retry is OFF, nothing was placed",
+            http_status=503, log_level="error", sig=signal_type,
+        )
+
+    with not_tradable_lock:
+        already = symbol in not_tradable_retrying
+        if not already:
+            not_tradable_retrying.add(symbol)
+
+    if already:
+        return reject(
+            "NOT_TRADABLE", symbol,
+            f"Alpaca refused the entry as not tradable ({err}) — a retry for this symbol is already running",
+            http_status=503, sig=signal_type,
+        )
+
+    result = reject(
+        "NOT_TRADABLE", symbol,
+        f"Alpaca refused the entry as not tradable ({err}) — retrying every "
+        f"{NOT_TRADABLE_RETRY_INTERVAL:g}s for up to {NOT_TRADABLE_RETRY_SECONDS}s",
+        http_status=503, sig=signal_type,
+    )
+    threading.Thread(
+        target=not_tradable_retry_loop, args=(data, symbol, signal_type), daemon=True
+    ).start()
+    return result
+
+
+# ============================================================
 # ENTRY
 # ============================================================
-def handle_entry(data, symbol, signal_type, start_time):
+def handle_entry(data, symbol, signal_type, start_time, in_retry=False):
     try:
         entry_limit = float(data["entry_limit"])
     except (KeyError, ValueError, TypeError) as e:
@@ -2292,6 +2638,13 @@ def handle_entry(data, symbol, signal_type, start_time):
                     f"Status: {submitted.status} | Latency: {latency_ms:.1f}ms"
                 )
         except Exception as e:
+            if is_not_tradable_error(e):
+                # The broker refused the SYMBOL, not the order. Release the
+                # dedupe key that was recorded before the submit, so neither a
+                # re-fired alert nor the retry thread is blocked as a
+                # DUPLICATE (which is what happened to the second AKAN alert).
+                recent_signals.pop(dedupe_key, None)
+                return handle_not_tradable(data, symbol, signal_type, e, in_retry)
             send_alert(f"[CRIT] Failed to submit entry order for {symbol}: {e}")
             return "Order submission failed", 500
 
@@ -2397,6 +2750,15 @@ def handle_stop_update(data, symbol):
 # EXIT
 # ============================================================
 def handle_exit(data, symbol):
+    """Closes the position. Exit messages for one symbol are SERIALISED: the
+    Pine script can send the same exit several times within a second (VWAV,
+    20 Nov), and concurrent copies cancelled each other's resting sells and
+    sized orders from a stale quantity."""
+    with exit_lock_for(symbol):
+        return _handle_exit_locked(data, symbol)
+
+
+def _handle_exit_locked(data, symbol):
     """Closes the position at market. Legs are cancelled BEFORE the close —
     closing while a bracket sibling still rests is what produced the AMIX
     stray order."""
@@ -2407,6 +2769,16 @@ def handle_exit(data, symbol):
     if not owned:
         return reject("NOT_OWNER", symbol, f"exit ({reason}) ignored — {why}",
                       sig=str(data.get("signal", "")).upper() or sig)
+
+    # The script has given up on this trade. If an entry for the symbol is
+    # still being retried after a 'not tradable' refusal, stop it now — a late
+    # retry would otherwise open a position the script already believes is
+    # closed, and nothing would ever send it an exit.
+    if cancel_not_tradable_retry(symbol):
+        send_alert(
+            f"[RETRY] {symbol} exit ({reason}) received while an entry was being retried after a "
+            f"'not tradable' refusal — retry cancelled, no entry will be placed."
+        )
 
     try:
         position = get_position(symbol)
@@ -2432,6 +2804,36 @@ def handle_exit(data, symbol):
         return reject("NO_POSITION", symbol, f"exit ({reason}) ignored — nothing open",
                       log_level="debug", sig=sig)
 
+    in_regular = within_regular_session()
+
+    try:
+        exit_limit = float(data.get("exit_limit", 0) or 0)
+    except (TypeError, ValueError):
+        exit_limit = 0.0
+
+    # ---- AN EXIT IS ALREADY WORKING (extended hours) ----------------------
+    # A resting sell limit keeps working through partial fills, so a repeat of
+    # the same exit changes nothing and must NOT cancel it. Only a MORE
+    # AGGRESSIVE (lower) limit is worth replacing it for.
+    replacing = False
+    if not in_regular:
+        working = get_working_exit(symbol)
+        if working is not None:
+            w_id, w_limit = working
+            if exit_limit <= 0 or round_tick(exit_limit) >= w_limit:
+                return reject(
+                    "EXIT_ALREADY_WORKING", symbol,
+                    f"exit ({reason}) ignored — a SELL LIMIT @ ${w_limit} (order {w_id}) is already "
+                    f"working and keeps working through partial fills",
+                    sig=sig,
+                )
+            replacing = True
+            set_active_exit(symbol, EXIT_REPLACING, w_limit)
+            send_alert(
+                f"[EXIT] {symbol} — new exit limit ${round_tick(exit_limit)} is lower than the working "
+                f"${w_limit}; replacing it ({reason})"
+            )
+
     qty = position.qty
     cancelled = cancel_resting_legs(symbol)
 
@@ -2443,7 +2845,7 @@ def handle_exit(data, symbol):
         )
 
     # ---- REGULAR HOURS: market close, exactly as before -------------------
-    if within_regular_session():
+    if in_regular:
         if close_position_with_retry(symbol, reason):
             unmark_manual(symbol)
             send_alert(
@@ -2457,11 +2859,6 @@ def handle_exit(data, symbol):
     # The price must come from the sender. The bot refuses to invent one: a
     # sell limit priced from Alpaca's IEX quote on a thin small cap is how you
     # end up with an order resting above the bid while you believe you are out.
-    try:
-        exit_limit = float(data.get("exit_limit", 0) or 0)
-    except (TypeError, ValueError):
-        exit_limit = 0.0
-
     if exit_limit <= 0:
         send_alert(
             f"[CRIT] {symbol} [{sig or '-'}] EXIT ({reason}) ARRIVED OUTSIDE REGULAR HOURS "
@@ -2473,17 +2870,37 @@ def handle_exit(data, symbol):
                       f"exit ({reason}) outside regular hours needs an exit_limit price",
                       sig=sig)
 
+    # Re-read the quantity AFTER the cancel. Cancelling a partly filled exit can
+    # change what is left, and selling a stale quantity is what produced
+    # "requested 51, available 12" on VWAV.
+    try:
+        fresh = get_position(symbol)
+    except Exception as e:
+        logger.warning(f"[EXIT] {symbol} could not re-read the position after cancelling ({e}); using the earlier quantity")
+        fresh = position
+    if fresh is None:
+        clear_active_exit(symbol)
+        unmark_manual(symbol)
+        pending_signal_types.pop(symbol, None)
+        send_alert(f"[EXIT] {symbol} — flat once the earlier exit was cancelled ({reason}); nothing more to sell")
+        return "Success", 200
+    qty = fresh.qty
+
     try:
         want_qty = abs(int(float(qty)))
     except (TypeError, ValueError):
         want_qty = 0
 
     if want_qty < 1:
+        if replacing:
+            clear_active_exit(symbol, EXIT_REPLACING)
         return reject("BAD_QTY", symbol, f"position qty unreadable ({qty})", sig=sig)
 
     if close_position_extended(symbol, want_qty, exit_limit, reason):
         return "Success", 200
 
+    if replacing:
+        clear_active_exit(symbol, EXIT_REPLACING)
     return "Close failed", 500
 
 
@@ -2519,7 +2936,14 @@ def webhook():
         )
         return reject("NO_JSON", "-", detail, http_status=400)
 
-    if data.get("secret") != os.getenv("WEBHOOK_SECRET"):
+    # FAIL CLOSED. `data.get("secret") != os.getenv("WEBHOOK_SECRET")` is False
+    # when BOTH are None, so an unset env var let every request in.
+    expected_secret = os.getenv("WEBHOOK_SECRET") or ""
+    if not expected_secret:
+        return reject("BAD_SECRET", data.get("symbol", "-"),
+                      "WEBHOOK_SECRET is not configured on the server — refusing every request",
+                      http_status=503, log_level="error")
+    if not hmac.compare_digest(str(data.get("secret", "")).encode("utf-8"), expected_secret.encode("utf-8")):
         return reject("BAD_SECRET", data.get("symbol", "-"), "invalid webhook secret", http_status=401)
 
     symbol = str(data.get("symbol", "UNKNOWN")).upper()
